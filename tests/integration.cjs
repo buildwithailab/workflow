@@ -346,6 +346,22 @@ async function test() {
   const started = Date.now();
   await start();
   console.log("PASS native UI ready", Date.now() - started, "ms");
+  const language = page.locator("#language-select");
+  const settings = page.locator("#app-settings");
+  const changeLanguage = async (value) => {
+    await settings.click();
+    await language.selectOption(value);
+    await page.waitForFunction(
+      (expected) => document.documentElement.lang === expected && !!window.workflow,
+      value,
+    );
+    assert.equal(await language.count(), 0);
+  };
+  assert.equal(await page.evaluate(() => localStorage.getItem("workflow-language")), null);
+  await page.getByRole("button", { name: "+ New session", exact: true }).waitFor();
+  await changeLanguage("tr");
+  await page.getByRole("button", { name: "+ Yeni oturum", exact: true }).waitFor();
+  console.log("PASS English on first launch, Turkish available in Settings");
   assert.equal(
     await page
       .locator(".sidebar")
@@ -1947,18 +1963,7 @@ async function test() {
   }), /varsayılan giriş/);
   fs.writeFileSync(changedAuth, originalAuth);
   console.log("PASS independent provider accounts, logins, quotas and terminals");
-  const language = page.locator("#language-select");
-  const settings = page.locator("#app-settings");
   const activeBeforeLanguageChange = (await api("app", "state")).active;
-  const changeLanguage = async (value) => {
-    await settings.click();
-    await language.selectOption(value);
-    await page.waitForFunction(
-      (expected) => document.documentElement.lang === expected && !!window.workflow,
-      value,
-    );
-    assert.equal(await language.count(), 0);
-  };
   await changeLanguage("en");
   await page.getByRole("button", { name: "+ New session", exact: true }).click();
   await dialog.getByRole("heading", { name: "New session", exact: true }).waitFor();
@@ -2007,6 +2012,7 @@ async function test() {
     assert(!alive, "provider remains after exit " + pid);
   }
   await start();
+  await page.getByRole("button", { name: "+ Yeni oturum", exact: true }).waitFor();
   assert.equal((await api("app", "state")).active.length, 0);
   for (const { id, accounts } of await api("app", "providers")) {
     assert.equal(accounts[0].id, "default");

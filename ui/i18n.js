@@ -645,7 +645,7 @@ const english = {
   "{url} sayfasındaki {selector} öğesini incele. HTML ve stil bağlamı {contextFile} dosyasında, ekran görüntüsü ise {screenshot} dosyasında.": "Inspect {selector} on {url}. Read the HTML and style context in {contextFile} and see the screenshot at {screenshot}."
 };
 
-const uiLanguage = localStorage.getItem("workflow-language") === "en" ? "en" : "tr";
+const uiLanguage = localStorage.getItem("workflow-language") === "tr" ? "tr" : "en";
 const uiLocale = uiLanguage === "en" ? "en-US" : "tr-TR";
 
 function tr(source, values) {
