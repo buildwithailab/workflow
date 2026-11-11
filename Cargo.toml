@@ -1,0 +1,44 @@
+[package]
+name = "workflow"
+version = "0.1.0"
+edition = "2021"
+description = "Local agent workbench"
+license = "MIT"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["unstable", "devtools"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-notification = "2"
+portable-pty = "0.9"
+vt100 = "0.16"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+ignore = "0.4"
+similar = "2"
+sha2 = "0.10"
+base64 = "0.22"
+tokio = { version = "1", features = ["sync", "time"] }
+tungstenite = "0.30"
+url = "2"
+anyhow = "1"
+dunce = "1"
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "native-tls", "system-proxy"] }
+
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
+windows = { version = "0.62", features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_Foundation", "Win32_Security", "Win32_UI_WindowsAndMessaging", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 8
+

@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Workflow</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div id="layout">
+      <aside class="sidebar">
+        <button class="brand" id="app-settings" type="button" title="Ayarlar" aria-label="Ayarlar" aria-haspopup="dialog">
+          <svg viewBox="0 0 64 70" aria-hidden="true">
+            <path
+              d="M6 17 16 54 28 27 39 54 50 17M55 50h3"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+          <span>
+            <strong>workflow</strong><small>YOUR AGENTS, CONNECTED</small>
+          </span>
+        </button>
+        <div class="sidebar-actions">
+          <button class="primary" id="new-session">+ Yeni oturum</button
+          ><button class="icon" id="refresh" title="Yenile">↻</button>
+        </div>
+        <div class="project-heading">
+          <span class="grow">PROJELER</span
+          ><button class="icon quiet" id="addons" title="Eklentiler">◇</button
+          ><button class="icon quiet" id="archive" title="Geçmiş oturumlar">
+            ◷</button
+          ><button class="icon quiet" id="add-project" title="Proje ekle">
+            +
+          </button>
+        </div>
+        <div class="project-list" id="projects"></div>
+      </aside>
+      <div
+        class="v-resizer"
+        id="left-resizer"
+        role="separator"
+        aria-label="Sol panel genişliği"
+        tabindex="0"
+      ></div>
+      <main class="main">
+        <div class="main-header">
+          <h1 id="project-title">Çalışma alanı</h1>
+          <span class="badge" id="session-count">0 oturum</span>
+          <div class="grow"></div>
+          <button
+            class="quiet"
+            id="show-providers"
+            title="Sağlayıcıları göster/gizle"
+          >
+            ◎
+          </button>
+          <div class="view-switch">
+            <button id="view-map" class="selected" title="Çalışma haritası">
+              ⌘</button
+            ><button id="view-grid" title="Yan yana">▦</button
+            ><button id="view-focus" title="Odaklan">▣</button>
+          </div>
+          <div class="panel-toggles">
+            <button id="toggle-left" class="icon" title="Sol panel">
+              <svg viewBox="0 0 24 24">
+                <rect x="3" y="4" width="18" height="16" rx="2" />
+                <path d="M9 4v16" />
+              </svg></button
+            ><button id="toggle-right" class="icon" title="Sağ panel">
+              <svg viewBox="0 0 24 24">
+                <rect x="3" y="4" width="18" height="16" rx="2" />
+                <path d="M15 4v16" />
+              </svg>
+            </button>
+          </div>
+        </div>
+        <section id="provider-cards" hidden></section>
+        <div id="viewport">
+          <div class="canvas-hint">
+            Boş alandan sürükle · Ctrl + tekerlek ile yakınlaştır
+          </div>
+          <div id="world">
+            <svg id="edges">
+              <defs>
+                <marker
+                  id="arrow"
+                  markerWidth="7"
+                  markerHeight="7"
+                  refX="6"
+                  refY="3.5"
+                  orient="auto"
+                >
+                  <path d="M0 0 7 3.5 0 7Z" fill="#a5c679" />
+                </marker>
+              </defs>
+              <g id="edge-lines"></g>
+            </svg>
+            <div id="cards"></div>
+          </div>
+          <div id="empty" class="empty" hidden>
+            <h2>Bir sonraki işine yer aç.</h2>
+            <p>Proje ekle, bir sağlayıcı seç ve ilk oturumunu başlat.</p>
+          </div>
+        </div>
+        <footer class="footer">
+          <span class="row" id="running-status"
+            ><i class="dot"></i><span>Çalışan oturum yok</span></span
+          >
+          <div class="map-tools">
+            <button id="zoom-out" title="Uzaklaştır">−</button
+            ><span id="zoom">100%</span
+            ><button id="zoom-in" title="Yakınlaştır">+</button
+            ><button id="fit">Tümünü göster</button
+            ><button id="focus-card">Odaklan</button>
+          </div>
+        </footer>
+      </main>
+      <div
+        class="v-resizer"
+        id="right-resizer"
+        role="separator"
+        aria-label="Sağ panel genişliği"
+        tabindex="0"
+      ></div>
+      <aside class="inspector">
+        <header class="inspector-header">
+          <strong id="panel-title">Tarayıcı</strong
+          ><small id="panel-context"></small
+          ><button class="icon quiet" id="panel-refresh" title="Yenile">
+            ↻</button
+          ><button class="icon quiet" id="panel-expand" title="Genişlet">
+            ⛶</button
+          ><button class="icon quiet" id="panel-close" title="Kapat">×</button>
+        </header>
+        <nav class="tabs" id="panel-tabs">
+          <button class="selected" data-tab="browser">◎ Tarayıcı</button
+          ><button data-tab="files">▱ Dosyalar</button
+          ><button data-tab="changes">± Değişiklikler</button
+          ><button data-tab="git">⑂ Git</button
+          ><button data-tab="links">Oturum Bağlantıları</button
+          ><button data-tab="summary">Oturum Özeti</button>
+        </nav>
+        <section class="panel session-summary" id="panel-summary" hidden>
+          <p class="help" id="summary-empty">Bir çalışma oturumu seç.</p>
+          <div id="summary-content" hidden>
+            <header class="summary-heading">
+              <h2 id="summary-name"></h2>
+              <p id="summary-meta" class="muted"></p>
+            </header>
+            <section class="summary-section">
+              <h3 id="summary-file-count">Dosya farkı</h3>
+              <p class="help" id="summary-file-note">Oturumun ilk açıldığı andan bugüne kalan net fark.</p>
+              <div id="summary-files"></div>
+              <div id="summary-diff" class="summary-diff" hidden></div>
+            </section>
+            <section class="summary-section">
+              <h3>Tarayıcı doğrulamaları</h3>
+              <p id="summary-trace-count" class="muted"></p>
+              <ol id="summary-trace" class="trace-list"></ol>
+              <button class="quiet" id="summary-all-trace">Tüm tarayıcı adımları</button>
+            </section>
+            <section class="summary-section">
+              <h3>Oturum bağlantıları</h3>
+              <div id="summary-links"></div>
+            </section>
+          </div>
+        </section>
+        <section class="panel" id="panel-browser">
+          <div class="browser-upper" id="browser-upper">
+            <div class="browser-session">
+              <select
+                id="browser-session"
+                aria-label="Tarayıcı oturumu"
+              ></select
+              ><select id="browser-mode" aria-label="Tarayıcı türü">
+                <option value="embedded">Workflow içinde</option>
+                <option value="chrome">Google Chrome</option></select
+              ><button
+                id="browser-access"
+                class="selected"
+                title="Bu oturumun tarayıcı araçlarına erişimini değiştir"
+              >
+                Ajan erişimi açık
+              </button>
+            </div>
+            <div class="browser-tabs" id="browser-tabs"></div>
+            <div class="browser-address">
+              <div class="row">
+                <button class="icon" id="browser-back" title="Geri">←</button
+                ><button class="icon" id="browser-forward" title="İleri">
+                  →</button
+                ><input
+                  id="address"
+                  placeholder="Adres gir · localhost:5173 veya https://…"
+                  spellcheck="false"
+                /><button id="browser-open">Aç ↗</button>
+              </div>
+              <div class="row actions">
+                <button id="browser-reload">↻ Yenile</button
+                ><button id="browser-pick">✧ Öğe seç</button
+                ><button id="browser-chrome">Chrome’da aç ↗</button
+                ><button id="browser-trace">Test adımları</button>
+              </div>
+            </div>
+            <div id="picked" class="picked" hidden>
+              <code id="picked-label"></code
+              ><button id="attach-pick">İsteğe ekle ↵</button
+              ><button
+                id="clear-pick"
+                class="clear"
+                title="Seçili öğeyi temizle"
+                aria-label="Seçili öğeyi temizle"
+              >
+                ×
+              </button>
+            </div>
+            <p id="browser-notice" class="browser-notice">Bir sayfa aç.</p>
+          </div>
+          <div
+            class="splitter"
+            data-resize="browser-upper"
+            role="separator"
+            tabindex="0"
+            aria-label="Tarayıcı bölümlerinin yüksekliği"
+          ></div>
+          <div class="browser-lower">
+            <div id="json-toolbar" class="toolbar" hidden>
+              <strong class="grow">JSON</strong
+              ><button id="json-pretty" class="selected">Biçimli</button
+              ><button id="json-raw">Ham</button
+              ><button id="json-copy">Kopyala</button
+              ><button id="json-page">Sayfa</button>
+            </div>
+            <pre id="json-view" hidden></pre>
+            <div id="browser-surface">
+              <div class="empty">Bir web adresi aç.</div>
+            </div>
+          </div>
+        </section>
+        <section class="panel" id="panel-files" hidden>
+          <div class="toolbar">
+            <button id="files-up">↑</button
+            ><button id="files-root">Proje</button
+            ><code class="grow" id="file-path"></code
+            ><button id="files-reveal">Klasörde göster ↗</button>
+          </div>
+          <div id="file-list" class="section" style="height: 260px"></div>
+          <div
+            class="splitter"
+            data-resize="file-list"
+            role="separator"
+            tabindex="0"
+            aria-label="Dosya listesi yüksekliği"
+          ></div>
+          <div class="section auto">
+            <div class="section-title">
+              <span class="grow" id="file-title">Bir dosya seç</span>
+              <button id="file-edit" hidden>Düzenle</button>
+            </div>
+            <div class="code-preview" id="file-preview"></div>
+          </div>
+        </section>
+        <section class="panel" id="panel-changes" hidden>
+          <div class="toolbar">
+            <button id="transfer-open">Ana projeye aktar ↗</button
+            ><button id="transfer-undo" disabled>Son aktarımı geri al</button
+            ><span class="grow"></span><button id="changes-refresh">↻</button>
+          </div>
+          <div id="change-list" class="section" style="height: 230px"></div>
+          <div
+            class="splitter"
+            data-resize="change-list"
+            role="separator"
+            tabindex="0"
+            aria-label="Değişen dosyalar yüksekliği"
+          ></div>
+          <div class="toolbar">
+            <code class="grow" id="change-file"></code
+            ><button id="restore-file" disabled>Dosyayı geri al</button
+            ><button id="restore-lines" disabled>Seçilenleri geri al</button
+            ><button id="restore-undo" disabled>Geri almayı geri al</button>
+          </div>
+          <div class="diff-view section auto" id="change-diff"></div>
+        </section>
+        <section class="panel" id="panel-git" hidden>
+          <div class="toolbar">
+            <div class="grow">
+              <strong id="git-branch"></strong
+              ><small
+                id="git-target"
+                style="display: block; margin-top: 4px"
+              ></small>
+            </div>
+            <button id="git-fetch">↓ Fetch</button
+            ><button id="git-push">↑ Push</button
+            ><button id="git-more">⋯</button>
+          </div>
+          <div id="git-empty" class="empty" hidden>
+            Bu çalışma alanında Git kullanılmıyor. Dosyalar ve Değişiklikler
+            üzerinden çalışabilirsin.
+          </div>
+          <div id="git-sections">
+            <div class="section" id="git-commit-section" style="height: 153px">
+              <div class="section-title">▾ Commit</div>
+              <div class="section-body">
+                <textarea
+                  class="commit-input"
+                  id="commit-message"
+                  placeholder="Commit mesajı (ne değişti?)"
+                ></textarea>
+                <div class="commit-actions">
+                  <button id="git-commit" class="primary">
+                    ✓ Commit oluştur</button
+                  ><label class="check"
+                    ><input type="checkbox" id="suggest-after-stage" />Toplu
+                    hazırlama sonrası ajan mesaj önersin</label
+                  ><button id="git-suggest" class="quiet">✧ Ajana öner</button>
+                </div>
+              </div>
+            </div>
+            <div
+              class="splitter"
+              data-resize="git-commit-section"
+              role="separator"
+              tabindex="0"
+              aria-label="Commit alanı yüksekliği"
+            ></div>
+            <div class="section" id="git-staged-section" style="height: 160px">
+              <div class="section-title">
+                ▾ Hazırlananlar<span class="count" id="staged-count">0</span
+                ><button class="quiet" id="unstage-all">− Tümü</button>
+              </div>
+              <div id="git-staged"></div>
+            </div>
+            <div
+              class="splitter"
+              data-resize="git-staged-section"
+              role="separator"
+              tabindex="0"
+              aria-label="Hazırlanan dosyalar yüksekliği"
+            ></div>
+            <div class="section" id="git-working-section" style="height: 230px">
+              <div class="section-title">
+                ▾ Değişiklikler<span class="count" id="working-count">0</span
+                ><button class="quiet" id="stage-selected">
+                  Seçilenleri hazırla</button
+                ><button class="quiet" id="stage-all">+ Tümü</button>
+              </div>
+              <div id="git-working"></div>
+            </div>
+            <div
+              class="splitter"
+              data-resize="git-working-section"
+              role="separator"
+              tabindex="0"
+              aria-label="Değişiklikler yüksekliği"
+            ></div>
+            <div class="section" id="git-diff-section" style="height: 220px">
+              <div class="section-title" id="git-diff-title">Dosya farkı</div>
+              <div id="git-diff"></div>
+            </div>
+            <div
+              class="splitter"
+              data-resize="git-diff-section"
+              role="separator"
+              tabindex="0"
+              aria-label="Git dosya farkı yüksekliği"
+            ></div>
+            <div class="section" id="git-history-section" style="height: 350px">
+              <div class="section-title">▾ Commit geçmişi</div>
+              <div class="toolbar">
+                <select id="history-branch" class="grow">
+                  <option value="--all">Tüm dallar</option></select
+                ><button id="history-refresh">↻</button>
+              </div>
+              <div class="help">
+                Bir commit seç. İki commit karşılaştırmak için Ctrl ile ikinci
+                kaydı seç.
+              </div>
+              <div id="git-history"></div>
+            </div>
+          </div>
+        </section>
+        <section class="panel" id="panel-links" hidden>
+          <div class="toolbar">
+            <strong class="grow">Bağlı oturumlar</strong
+            ><button id="link-add">+ Bağlantı</button>
+          </div>
+          <p class="help">
+            Haritada oturumun bağlantı ikonundan diğer oturuma çizgi çek. Ok
+            yönündeki oturumdan izin verdiğin içerik okunabilir. Bağlantı
+            oluşturmak iş başlatmaz.
+          </p>
+          <div id="links-list"></div>
+          <div class="section-title">Görev istekleri</div>
+          <div id="jobs-list"></div>
+        </section>
+      </aside>
+    </div>
+    <dialog id="dialog">
+      <header class="dialog-header">
+        <h2 id="dialog-title"></h2>
+        <button class="icon quiet" id="dialog-close" aria-label="Kapat">
+          ×
+        </button>
+      </header>
+      <div class="dialog-body" id="dialog-body"></div>
+      <footer class="dialog-footer" id="dialog-footer"></footer>
+    </dialog>
+    <div id="toast" hidden>
+      <span></span><button aria-label="Uyarıyı kapat">×</button>
+    </div>
+    <script src="vendor/xterm.js"></script>
+    <script src="vendor/addon-fit.js"></script>
+    <script src="i18n.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

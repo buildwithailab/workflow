@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="790" viewBox="0 0 1200 790" role="img" aria-labelledby="title desc">
+  <title id="title">Example workflow for building an issue status filter</title>
+  <desc id="desc">Implementation reads Requirements, requests work from API Review, Browser QA and Release Notes, and owns the code and preview. API Review has a separate link for reading Implementation files. Arrows point from the caller to the target.</desc>
+  <defs>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="1.5" cy="1.5" r="1" fill="#26313e"/>
+    </pattern>
+    <marker id="arrow" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M1 1 11 6 1 11z" fill="#beec91"/>
+    </marker>
+    <linearGradient id="back" x2="1" y2="1">
+      <stop stop-color="#1c2925"/>
+      <stop offset="1" stop-color="#11161d"/>
+    </linearGradient>
+  </defs>
+  <g font-family="Segoe UI, system-ui, sans-serif">
+  <rect x="0" y="0" width="1200" height="790" rx="22" fill="#101419" stroke="#334252"/>
+  <rect x="1" y="1" width="1198" height="788" rx="21" fill="url(#back)" stroke="none"/>
+  <rect x="1" y="1" width="1198" height="788" rx="21" fill="url(#dots)" stroke="none"/>
+  <rect x="46" y="32" width="44" height="44" rx="11" fill="#25372a" stroke="#456348"/>
+  <path d="M57 44 63 64 68 52 74 64 80 44" fill="none" stroke="#beec91" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="105" y="65" fill="#e7ebf0" font-size="36" font-weight="720">Workflow</text>
+  <path d="M46 101 H1154" stroke="#334252" stroke-opacity=".7"/>
+  <text x="46" y="133" fill="#beec91" font-size="13" font-weight="700" letter-spacing="1.7">EXAMPLE WORKFLOW</text>
+  <text x="46" y="170" fill="#e7ebf0" font-size="33" font-weight="680">Build an issue status filter</text>
+  <text x="47" y="203" fill="#b6c5d3" font-size="20" font-weight="400">Start with one session and add more as needed. This example uses five.</text>
+  <g transform="translate(0 64)">
+  <path d="M457 359 H325" fill="none" stroke="#beec91" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <path d="M325 427 H457" fill="none" stroke="#beec91" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <path d="M741 347 C815 347 823 238 874 238" fill="none" stroke="#beec91" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <path d="M741 399 H874" fill="none" stroke="#beec91" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <path d="M741 451 C815 451 823 561 874 561" fill="none" stroke="#beec91" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <rect x="46" y="314" width="278" height="153" rx="16" fill="#181f27" stroke="#334252"/>
+  <rect x="64" y="332" width="8" height="8" rx="4" fill="#8dc8ff" stroke="none"/>
+  <text x="80" y="341" fill="#8dc8ff" font-size="15" font-weight="700">CODEX</text>
+  <text x="64" y="375" fill="#e7ebf0" font-size="27" font-weight="700">API Review</text>
+  <text x="64" y="405" fill="#b6c5d3" font-size="17" font-weight="400">Reviews input validation</text>
+  <text x="64" y="427" fill="#b6c5d3" font-size="17" font-weight="400">and the API contract.</text>
+  <rect x="459" y="304" width="280" height="176" rx="16" fill="#181f27" stroke="#78986b"/>
+  <rect x="477" y="322" width="8" height="8" rx="4" fill="#beec91" stroke="none"/>
+  <text x="493" y="331" fill="#beec91" font-size="15" font-weight="700">CODEX</text>
+  <text x="477" y="365" fill="#e7ebf0" font-size="27" font-weight="700">Implementation</text>
+  <text x="477" y="395" fill="#b6c5d3" font-size="17" font-weight="400">Builds the Open / Closed / All</text>
+  <text x="477" y="417" fill="#b6c5d3" font-size="17" font-weight="400">filter and serves the preview.</text>
+  <rect x="476" y="431" width="246" height="32" rx="8" fill="#11171e" stroke="#334252"/>
+  <text x="489" y="452" fill="#beec91" font-size="15" font-weight="650">Owns the code and preview</text>
+  <rect x="876" y="178" width="278" height="133" rx="16" fill="#181f27" stroke="#334252"/>
+  <rect x="894" y="196" width="8" height="8" rx="4" fill="#ffc79a" stroke="none"/>
+  <text x="910" y="205" fill="#ffc79a" font-size="15" font-weight="700">CLAUDE CODE</text>
+  <text x="894" y="239" fill="#e7ebf0" font-size="27" font-weight="700">Requirements</text>
+  <text x="894" y="269" fill="#b6c5d3" font-size="17" font-weight="400">Defines URL persistence</text>
+  <text x="894" y="291" fill="#b6c5d3" font-size="17" font-weight="400">and empty-state behavior.</text>
+  <rect x="876" y="340" width="278" height="133" rx="16" fill="#181f27" stroke="#334252"/>
+  <rect x="894" y="358" width="8" height="8" rx="4" fill="#c8b8ff" stroke="none"/>
+  <text x="910" y="367" fill="#c8b8ff" font-size="15" font-weight="700">GITHUB COPILOT</text>
+  <text x="894" y="401" fill="#e7ebf0" font-size="27" font-weight="700">Browser QA</text>
+  <text x="894" y="431" fill="#b6c5d3" font-size="17" font-weight="400">Tests the running preview</text>
+  <text x="894" y="453" fill="#b6c5d3" font-size="17" font-weight="400">in the built-in browser.</text>
+  <rect x="876" y="502" width="278" height="133" rx="16" fill="#181f27" stroke="#334252"/>
+  <rect x="894" y="520" width="8" height="8" rx="4" fill="#ffc79a" stroke="none"/>
+  <text x="910" y="529" fill="#ffc79a" font-size="15" font-weight="700">CLAUDE CODE</text>
+  <text x="894" y="563" fill="#e7ebf0" font-size="27" font-weight="700">Release Notes</text>
+  <text x="894" y="593" fill="#b6c5d3" font-size="17" font-weight="400">Turns verified behavior</text>
+  <text x="894" y="615" fill="#b6c5d3" font-size="17" font-weight="400">into a user-facing note.</text>
+  <rect x="334.5" y="323" width="113" height="29" rx="8" fill="#24302a" stroke="#425541"/>
+  <text x="391" y="342" fill="#beec91" font-size="14" font-weight="650" text-anchor="middle">Request work</text>
+  <rect x="344" y="436" width="94" height="29" rx="8" fill="#24302a" stroke="#425541"/>
+  <text x="391" y="455" fill="#beec91" font-size="14" font-weight="650" text-anchor="middle">Read files</text>
+  <rect x="747" y="258" width="126" height="29" rx="8" fill="#24302a" stroke="#425541"/>
+  <text x="810" y="277" fill="#beec91" font-size="14" font-weight="650" text-anchor="middle">Read conversation</text>
+  <rect x="752.5" y="361" width="111" height="29" rx="8" fill="#24302a" stroke="#425541"/>
+  <text x="808" y="380" fill="#beec91" font-size="14" font-weight="650" text-anchor="middle">Request work</text>
+  <rect x="754.5" y="525" width="111" height="29" rx="8" fill="#24302a" stroke="#425541"/>
+  <text x="810" y="544" fill="#beec91" font-size="14" font-weight="650" text-anchor="middle">Request work</text>
+  <rect x="46" y="659" width="1108" height="44" rx="11" fill="#18241f" stroke="#3d5442"/>
+  <text x="65" y="687" fill="#beec91" font-size="14" font-weight="700">ARROW DIRECTION</text>
+  <text x="241" y="687" fill="#e7ebf0" font-size="19" font-weight="400">Caller → target. The two API Review arrows grant different permissions.</text>
+  </g>
+  </g>
+</svg>

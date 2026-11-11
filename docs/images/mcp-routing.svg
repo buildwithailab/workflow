@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="574" viewBox="0 0 1200 574" role="img" aria-labelledby="title desc">
+  <title id="title">How Workflow routes MCP calls</title>
+  <desc id="desc">A provider CLI calls the Workflow stdio adapter. The running Workflow desktop app verifies the caller and checks the relevant permission before accessing a connected session or the caller's browser.</desc>
+  <defs>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="1.5" cy="1.5" r="1" fill="#26313e"/>
+    </pattern>
+    <marker id="arrow" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M1 1 11 6 1 11z" fill="#beec91"/>
+    </marker>
+    <linearGradient id="back" x2="1" y2="1">
+      <stop stop-color="#1c2925"/>
+      <stop offset="1" stop-color="#11161d"/>
+    </linearGradient>
+  </defs>
+  <g font-family="Segoe UI, system-ui, sans-serif">
+  <rect x="0" y="0" width="1200" height="574" rx="22" fill="#101419" stroke="#334252"/>
+  <rect x="1" y="1" width="1198" height="572" rx="21" fill="url(#back)" stroke="none"/>
+  <rect x="1" y="1" width="1198" height="572" rx="21" fill="url(#dots)" stroke="none"/>
+  <text x="47" y="62" fill="#e7ebf0" font-size="37" font-weight="710">How a Workflow tool call travels</text>
+  <text x="48" y="101" fill="#b6c5d3" font-size="22" font-weight="400">The CLI supplies the agent. The running desktop app supplies the tools.</text>
+  <rect x="46" y="152" width="308" height="127" rx="14" fill="#181f27" stroke="#334252"/>
+  <text x="65" y="181" fill="#8dc8ff" font-size="15" font-weight="700" letter-spacing="1.2">01  /  CALLER</text>
+  <text x="65" y="218" fill="#e7ebf0" font-size="25" font-weight="680">Provider CLI</text>
+  <text x="65" y="249" fill="#b6c5d3" font-size="17" font-weight="400">Codex, Claude Code, or Copilot</text>
+  <rect x="446" y="152" width="308" height="127" rx="14" fill="#181f27" stroke="#334252"/>
+  <text x="465" y="181" fill="#c8b8ff" font-size="15" font-weight="700" letter-spacing="1.2">02  /  TRANSPORT</text>
+  <text x="465" y="218" fill="#e7ebf0" font-size="25" font-weight="680">Workflow MCP</text>
+  <text x="465" y="249" fill="#b6c5d3" font-size="17" font-weight="400">Local stdio adapter</text>
+  <rect x="846" y="152" width="308" height="127" rx="14" fill="#181f27" stroke="#334252"/>
+  <text x="865" y="181" fill="#beec91" font-size="15" font-weight="700" letter-spacing="1.2">03  /  AUTHORIZATION</text>
+  <text x="865" y="218" fill="#e7ebf0" font-size="25" font-weight="680">Workflow desktop</text>
+  <text x="865" y="249" fill="#b6c5d3" font-size="17" font-weight="400">Verifies the session and its run</text>
+  <path d="M356 217 H444" fill="none" stroke="#beec91" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <path d="M756 217 H844" fill="none" stroke="#beec91" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <path d="M1000 279 V321 H317 V367" fill="none" stroke="#beec91" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <path d="M885 321 V367" fill="none" stroke="#beec91" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+  <rect x="46" y="370" width="540" height="151" rx="14" fill="#181f27" stroke="#334252"/>
+  <text x="67" y="408" fill="#ffc79a" font-size="24" font-weight="680">Connected session</text>
+  <text x="67" y="439" fill="#b6c5d3" font-size="18" font-weight="400">Requires the matching permission on the link.</text>
+  <rect x="64" y="461" width="504" height="41" rx="9" fill="#11171e" stroke="#334252"/>
+  <text x="77" y="487" fill="#e7ebf0" font-size="17" font-weight="400" font-family="Consolas, monospace">read_context · read_files · request_work</text>
+  <rect x="614" y="370" width="540" height="151" rx="14" fill="#181f27" stroke="#334252"/>
+  <text x="635" y="408" fill="#8dc8ff" font-size="24" font-weight="680">The caller’s browser</text>
+  <text x="635" y="439" fill="#b6c5d3" font-size="18" font-weight="400">Requires browser access for the calling session.</text>
+  <rect x="632" y="461" width="504" height="41" rx="9" fill="#11171e" stroke="#334252"/>
+  <text x="645" y="487" fill="#e7ebf0" font-size="17" font-weight="400" font-family="Consolas, monospace">browser_open · browser_action · browser_assert</text>
+  <text x="48" y="552" fill="#b6c5d3" font-size="18" font-weight="400">Tool results return to the calling CLI. A work request also requires user acceptance.</text>
+  </g>
+</svg>

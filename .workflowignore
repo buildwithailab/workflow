@@ -1,0 +1,8 @@
+target/
+dist/
+test-results/
+Workflow.exe
+*.zip
+.env*
+node_modules/
+.git/
