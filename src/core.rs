@@ -23,6 +23,14 @@ pub fn hash(b: &[u8]) -> String {
 pub fn string<'a>(v: &'a Value, k: &str) -> Result<&'a str> {
     v[k].as_str().ok_or_else(|| anyhow!("Eksik alan: {k}"))
 }
+pub(crate) fn link_needs_reapproval(link: &Value, source: &Value, target: &Value) -> bool {
+    [
+        (&link["sourceConversation"], &source["conversationId"]),
+        (&link["targetConversation"], &target["conversationId"]),
+    ]
+    .into_iter()
+    .any(|(pinned, current)| !pinned.is_null() && pinned != current)
+}
 pub fn atomic(file: &Path, bytes: &[u8]) -> Result<()> {
     fs::create_dir_all(file.parent().context("Klasör yok")?)?;
     let tmp = file.with_extension(format!("{}.tmp", id()));
@@ -215,6 +223,22 @@ impl Core {
     }
     pub fn snapshot(&self) -> Value {
         let mut v = self.db.lock().unwrap().clone();
+        let mut links = v["links"].take();
+        if let (Some(sessions), Some(links)) = (v["sessions"].as_array(), links.as_array_mut()) {
+            let sessions: HashMap<_, _> = sessions
+                .iter()
+                .filter_map(|s| Some((s["id"].as_str()?, s)))
+                .collect();
+            for link in links {
+                if let (Some(source), Some(target)) = (
+                    link["source"].as_str().and_then(|id| sessions.get(id)),
+                    link["target"].as_str().and_then(|id| sessions.get(id)),
+                ) {
+                    link["needsReapproval"] = json!(link_needs_reapproval(link, source, target));
+                }
+            }
+        }
+        v["links"] = links;
         if let Some(providers) = v["providers"].as_object_mut() {
             for provider in providers.values_mut() {
                 if let Some(accounts) = provider.get_mut("accounts").and_then(Value::as_object_mut)
@@ -361,6 +385,18 @@ pub fn git_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_reapproval_requires_a_changed_pinned_conversation() {
+        let original = json!({"conversationId":"first"});
+        let changed = json!({"conversationId":"second"});
+        let unbound = json!({});
+        let link = json!({"sourceConversation":"first","targetConversation":"first"});
+        assert!(!link_needs_reapproval(&link, &original, &original));
+        assert!(link_needs_reapproval(&link, &changed, &original));
+        assert!(link_needs_reapproval(&link, &original, &unbound));
+        assert!(!link_needs_reapproval(&json!({}), &original, &changed));
+    }
     #[cfg(windows)]
     #[test]
     fn external_paths_keep_windows_identity() {

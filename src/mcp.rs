@@ -259,40 +259,49 @@ pub fn serve_stdio(file: PathBuf) -> Result<()> {
     }
     Ok(())
 }
-fn link(core: &Core, source: &str, target: &str, permission: &str) -> Result<Value> {
-    let source_session = core.session(source)?;
-    let target_session = core.session(target)?;
+fn link(core: &Core, source: &str, target: &str, permission: &str) -> Result<()> {
+    let mut db = core.db.lock().unwrap();
+    let sessions = db["sessions"].as_array().unwrap();
+    let source_session = sessions
+        .iter()
+        .find(|s| s["id"] == source)
+        .context("Oturum bulunamadı")?;
+    let target_session = sessions
+        .iter()
+        .find(|s| s["id"] == target)
+        .context("Oturum bulunamadı")?;
     if source_session["archived"] == true || target_session["archived"] == true {
         bail!("Arşivlenmiş oturuma bağlantı kapalı")
     }
-    let mut changed = false;
-    let out;
-    {
-        let mut db = core.db.lock().unwrap();
-        let l = db["links"]
-            .as_array_mut()
-            .unwrap()
-            .iter_mut()
-            .find(|l| l["source"] == source && l["target"] == target && l[permission] == true)
-            .context("Bu oturuma istenen erişim için bağlantı izni yok")?;
-        for (key, current) in [
-            ("sourceConversation", &source_session["conversationId"]),
-            ("targetConversation", &target_session["conversationId"]),
-        ] {
-            if !l[key].is_null() && l[key] != *current {
-                bail!("Bağlı oturumun konuşması değişti; bağlantı izinlerini yeniden kaydet")
-            };
-            if l[key].is_null() && !current.is_null() {
-                l[key] = current.clone();
-                changed = true;
-            }
+    let index = db["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|l| l["source"] == source && l["target"] == target && l[permission] == true)
+        .context("Bu oturuma istenen erişim için bağlantı izni yok")?;
+    let previous = &db["links"][index];
+    if link_needs_reapproval(previous, source_session, target_session) {
+        bail!("Bağlı oturumun konuşması değişti; bağlantı izinlerini yeniden kaydet")
+    }
+    let mut updated = previous.clone();
+    for (key, current) in [
+        ("sourceConversation", &source_session["conversationId"]),
+        ("targetConversation", &target_session["conversationId"]),
+    ] {
+        if updated[key].is_null() && !current.is_null() {
+            updated[key] = current.clone();
         }
-        out = l.clone();
     }
-    if changed {
-        core.save()?
+    if updated != *previous {
+        let previous = std::mem::replace(&mut db["links"][index], updated);
+        if let Err(error) = core.save_workspace(&db) {
+            db["links"][index] = previous;
+            return Err(error);
+        }
+        drop(db);
+        core.emit("workspace", core.snapshot());
     }
-    Ok(out)
+    Ok(())
 }
 async fn call(core: &Arc<Core>, source: &str, method: &str, mut args: Value) -> Result<Value> {
     if method.starts_with("browser_") {
@@ -320,7 +329,25 @@ async fn call(core: &Arc<Core>, source: &str, method: &str, mut args: Value) -> 
         "teams_send_message" => crate::teams::send_for_session(core, source, &args).await,
         "session_catalog" => {
             let db = core.db.lock().unwrap();
-            Ok(json!(db["links"].as_array().unwrap().iter().filter(|l|l["source"]==source).filter_map(|l|db["sessions"].as_array().unwrap().iter().find(|s|s["id"]==l["target"]&&s["archived"]!=true).map(|s|json!({"id":s["id"],"name":s["name"],"provider":s["provider"],"permissions":l}))).collect::<Vec<_>>()))
+            let sessions = db["sessions"].as_array().unwrap();
+            let source_session = sessions
+                .iter()
+                .find(|s| s["id"] == source)
+                .context("Oturum bulunamadı")?;
+            let entries: Vec<_> = db["links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|link| link["source"] == source)
+                .filter_map(|link| {
+                    let target = sessions.iter().find(|s| s["id"] == link["target"] && s["archived"] != true)?;
+                    Some(json!({
+                        "id":target["id"], "name":target["name"], "provider":target["provider"],
+                        "permissions":link, "needsReapproval":link_needs_reapproval(link, source_session, target),
+                    }))
+                })
+                .collect();
+            Ok(json!(entries))
         }
         "read_context" => {
             let target = string(&args, "target")?;

@@ -107,22 +107,35 @@
             Boş alandan sürükle · Ctrl + tekerlek ile yakınlaştır
           </div>
           <div id="world">
-            <svg id="edges">
+            <svg id="edges" aria-hidden="true">
               <defs>
                 <marker
                   id="arrow"
+                  class="edge-arrow"
                   markerWidth="7"
                   markerHeight="7"
                   refX="6"
                   refY="3.5"
                   orient="auto"
                 >
-                  <path d="M0 0 7 3.5 0 7Z" fill="#a5c679" />
+                  <path d="M0 0 7 3.5 0 7Z" />
+                </marker>
+                <marker
+                  id="arrow-reapproval"
+                  class="edge-arrow edge-reapproval"
+                  markerWidth="7"
+                  markerHeight="7"
+                  refX="6"
+                  refY="3.5"
+                  orient="auto"
+                >
+                  <path d="M0 0 7 3.5 0 7Z" />
                 </marker>
               </defs>
               <g id="edge-lines"></g>
             </svg>
             <div id="cards"></div>
+            <div id="edge-labels"></div>
           </div>
           <div id="empty" class="empty" hidden>
             <h2>Bir sonraki işine yer aç.</h2>

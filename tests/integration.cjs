@@ -1421,9 +1421,75 @@ async function test() {
   const bound = (await api("app", "state")).sessions.find((item) => item.id === direct.id);
   assert.equal(bound.conversationId, "conversation-a");
   assert.equal(bound.runId, directRun.runId);
+  const linkArgs = { source: gs.id, target: direct.id, read: true, files: true, work: true };
+  const outgoing = await api("app", "link", linkArgs);
+  const incoming = await api("app", "link", { source: direct.id, target: gs.id, read: true, files: true, work: true });
+  await api("app", "session_patch", { id: gs.id, position: { x: 40, y: 50 } });
+  await api("app", "session_patch", { id: direct.id, position: { x: 40, y: 630 } });
+  await page.locator("#view-map").click();
+  await page.locator("#fit").click();
+  const outgoingBadge = page.locator(`[data-link-id="${outgoing.id}"]`);
+  const incomingBadge = page.locator(`[data-link-id="${incoming.id}"]`);
+  await outgoingBadge.waitFor({ state: "visible" });
+  await incomingBadge.waitFor({ state: "visible" });
+  const linkTooltip = page.locator(".link-tooltip");
+  await linkTooltip.waitFor({ state: "hidden" });
+  await outgoingBadge.hover();
+  await linkTooltip.getByText("Konuşma · Dosya · İş", { exact: true }).waitFor();
+  await page.locator("#fit").hover();
+  await linkTooltip.waitFor({ state: "hidden" });
+  await outgoingBadge.click();
+  await dialog.getByText("Oturum bağlantısı").waitFor();
+  await dialog.getByRole("button", { name: "Vazgeç" }).click();
+  await dialog.waitFor({ state: "hidden" });
+  async function assertSeparateBadges() {
+    const one = await outgoingBadge.boundingBox(), two = await incomingBadge.boundingBox();
+    assert(one.x + one.width <= two.x || two.x + two.width <= one.x ||
+      one.y + one.height <= two.y || two.y + two.height <= one.y, "reciprocal permission labels have separate hit areas");
+  }
+  await assertSeparateBadges();
+  assert(!(await outgoingBadge.getAttribute("aria-label")).includes("Yeniden onay"));
+  const mapLinkRun = await api("terminal", "start", { id: gs.id });
+  pids.push(mapLinkRun.pid);
+  const readLinkedFile = () => mcp(gs.id, "read_files", { target: direct.id, paths: ["a.txt"] });
+  assert((await readLinkedFile()).result?.[0]?.content?.text);
   await api("terminal", "stop", { id: direct.id, runId: directRun.runId });
   await until(async () => !(await api("app", "state")).active.some((item) => item.id === direct.id), "direct session stop");
   assert.equal((await bindDirect("conversation-b")).conversationId, "conversation-b");
+  const staleCatalog = await mcp(gs.id, "session_catalog");
+  assert.equal(staleCatalog.result[0].needsReapproval, true);
+  assert.match((await readLinkedFile()).error, /bağlantı izinlerini yeniden kaydet/);
+  await outgoingBadge.locator(".link-warning-mark").waitFor();
+  await incomingBadge.locator(".link-warning-mark").waitFor();
+  while (parseInt(await page.locator("#zoom").textContent(), 10) > 40) {
+    await page.locator("#zoom-out").click();
+  }
+  await assertSeparateBadges();
+  await changeLanguage("en");
+  await outgoingBadge.locator(".link-warning-mark").waitFor();
+  await outgoingBadge.hover();
+  await linkTooltip.getByText("Conversation · Files · Work", { exact: true }).waitFor();
+  await linkTooltip.getByText("Reapproval required", { exact: true }).waitFor();
+  assert.match(await outgoingBadge.getAttribute("aria-label"), /Reapproval required/);
+  await page.keyboard.press("Escape");
+  await linkTooltip.waitFor({ state: "hidden" });
+  await assertSeparateBadges();
+  await changeLanguage("tr");
+  await outgoingBadge.locator(".link-warning-mark").waitFor();
+  await outgoingBadge.press("Enter");
+  await dialog.getByText(/bir oturumun konuşması değişti/).waitFor();
+  await dialog.getByRole("button", { name: "Yeniden onayla" }).click();
+  await dialog.waitFor({ state: "hidden" });
+  const newLink = (await api("app", "state")).links.find((link) => link.source === gs.id && link.target === direct.id);
+  assert.equal(newLink.needsReapproval, false);
+  await until(async () => await page.evaluate(() => document.activeElement?.dataset.linkId) === newLink.id, "focus returns to the reapproved map link");
+  assert.equal((await mcp(gs.id, "session_catalog")).result[0].needsReapproval, false);
+  assert((await readLinkedFile()).result?.[0]?.content?.text);
+  await incomingBadge.locator(".link-warning-mark").waitFor();
+  await api("app", "unlink", { id: newLink.id });
+  await api("app", "unlink", { id: incoming.id });
+  await api("terminal", "stop", { id: gs.id, runId: mapLinkRun.runId });
+  console.log("PASS directional map permissions, reapproval marker, MCP rejection and reapproval");
   console.log("PASS direct session UI, terminal, commit, checkout safety and conversation binding");
 
   await page.evaluate((id) => window.workflow.selectSession(id), s.id);

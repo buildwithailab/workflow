@@ -1459,8 +1459,11 @@ async function openModels(id) {
 }
 
 function applyCamera() {
-  $("#world").style.transform =
+  const world = $("#world");
+  world.style.transform =
     `translate(${camera.x}px,${camera.y}px) scale(${camera.z})`;
+  world.style.setProperty("--edge-node-scale", Math.max(1, 0.6 / camera.z));
+  linkTooltip.hidden = true;
   $("#zoom").textContent = Math.round(camera.z * 100) + "%";
 }
 function saveCard(id, patch) {
@@ -1536,50 +1539,125 @@ function focusCard() {
   applyCamera();
   remember();
 }
+function linkPermissionNames(link) {
+  const names = [];
+  if (link.read) names.push(tr("Konuşma"));
+  if (link.files) names.push(tr("Dosya"));
+  if (link.work) names.push(tr("İş"));
+  return names.length ? names : [tr("İzin yok")];
+}
+
+const linkTooltip = el("div", "link-tooltip");
+linkTooltip.hidden = true;
+linkTooltip.setAttribute("aria-hidden", "true");
+document.body.append(linkTooltip);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") linkTooltip.hidden = true;
+});
+
+function showLinkTooltip(node, direction, permissions, needsReapproval) {
+  const rect = node.getBoundingClientRect();
+  linkTooltip.replaceChildren(
+    el("strong", "", direction),
+    el("span", "", permissions.join(" · ")),
+  );
+  if (needsReapproval)
+    linkTooltip.append(el("span", "link-reapproval", tr("Yeniden onay gerekli")));
+  linkTooltip.hidden = false;
+  const left = rect.left + (rect.width - linkTooltip.offsetWidth) / 2;
+  const below = rect.bottom + 6;
+  const top = below + linkTooltip.offsetHeight <= innerHeight - 8
+    ? below : rect.top - linkTooltip.offsetHeight - 6;
+  linkTooltip.style.left = Math.max(8, Math.min(left, innerWidth - linkTooltip.offsetWidth - 8)) + "px";
+  linkTooltip.style.top = Math.max(8, top) + "px";
+}
+
+function edgeRoute(a, b, reciprocal) {
+  const ax = a.offsetLeft, ay = a.offsetTop, bx = b.offsetLeft, by = b.offsetTop;
+  const aw = a.offsetWidth, ah = a.offsetHeight, bw = b.offsetWidth, bh = b.offsetHeight;
+  const dx = bx + bw / 2 - (ax + aw / 2), dy = by + bh / 2 - (ay + ah / 2);
+  const horizontalGap = Math.max(bx - (ax + aw), ax - (bx + bw));
+  const verticalGap = Math.max(by - (ay + ah), ay - (by + bh));
+  const horizontal = horizontalGap >= 0 || (verticalGap < 0 && Math.abs(dx) >= Math.abs(dy));
+  const direction = (horizontal ? dx : dy) >= 0 ? 1 : -1;
+  // Keep reciprocal links and their nodes separately clickable.
+  const lane = reciprocal ? direction * (horizontal ? 46 : 58) : 0;
+  const x1 = horizontal ? ax + (direction > 0 ? aw : 0) : ax + aw / 2 + lane;
+  const x2 = horizontal ? bx + (direction < 0 ? bw : 0) : bx + bw / 2 + lane;
+  const spread = horizontal && horizontalGap < 100 ? 36 : 0;
+  const y1 = horizontal ? ay + 132 + lane - spread : ay + (direction > 0 ? ah : 0);
+  const y2 = horizontal ? by + 132 + lane + spread : by + (direction < 0 ? bh : 0);
+  const bend = direction * Math.max(12, Math.abs(horizontal ? x2 - x1 : y2 - y1) / 2);
+  const controlX = horizontal ? bend : 0, controlY = horizontal ? 0 : bend;
+  return {
+    d: `M${x1} ${y1}C${x1 + controlX} ${y1 + controlY},${x2 - controlX} ${y2 - controlY},${x2} ${y2}`,
+    x: (x1 + x2) / 2,
+    y: (y1 + y2) / 2,
+  };
+}
+
 function drawEdges() {
   const group = $("#edge-lines");
+  const labels = $("#edge-labels");
+  const focusedNode = document.activeElement?.dataset.linkDirection;
+  linkTooltip.hidden = true;
   group.replaceChildren();
+  labels.replaceChildren();
   for (const { card } of views.values()) card.classList.remove("linked-focus");
   if (mode !== "map") return;
   const highlight = panel === "summary" && focusId;
+  const directions = new Set(db.links.map(({ source, target }) => source + ":" + target));
   for (const link of db.links) {
     const a = views.get(link.source)?.card,
       b = views.get(link.target)?.card;
     if (!a || !b || a.hidden || b.hidden) continue;
-    const ax = parseFloat(a.style.left),
-      ay = parseFloat(a.style.top),
-      bx = parseFloat(b.style.left),
-      by = parseFloat(b.style.top);
-    const x1 = ax + a.offsetWidth,
-      y1 = ay + 35,
-      x2 = bx,
-      y2 = by + 35;
-    const bend = Math.max(70, Math.abs(x2 - x1) / 2);
+    const route = edgeRoute(a, b, directions.has(link.target + ":" + link.source));
     const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    path.setAttribute(
-      "d",
-      `M${x1} ${y1}C${x1 + bend} ${y1},${x2 - bend} ${y2},${x2} ${y2}`,
-    );
+    path.setAttribute("d", route.d);
     const focused =
       highlight && (link.source === focusId || link.target === focusId);
     const emphasis = focused ? " edge-focused" : highlight ? " edge-muted" : "";
+    const reapproval = link.needsReapproval ? " edge-reapproval" : "";
     if (focused) (link.source === focusId ? b : a).classList.add("linked-focus");
-    path.setAttribute("class", "edge" + emphasis);
-    path.setAttribute("marker-end", "url(#arrow)");
-    path.onclick = () => openLink(link.source, link.target);
-    const icon = document.createElementNS("http://www.w3.org/2000/svg", "g");
-    icon.setAttribute("class", "link-icon" + emphasis);
-    icon.setAttribute(
-      "transform",
-      `translate(${(x1 + x2) / 2},${(y1 + y2) / 2})`,
-    );
-    const circle = document.createElementNS(icon.namespaceURI, "circle");
-    circle.setAttribute("r", "16");
-    const t = document.createElementNS(icon.namespaceURI, "text");
-    t.textContent = "⛓";
-    icon.append(circle, t);
-    icon.onclick = () => openLink(link.source, link.target);
-    group.append(path, icon);
+    const direction = link.source + ":" + link.target;
+    const edit = () => openLink(link.source, link.target);
+    path.setAttribute("class", "edge" + emphasis + reapproval);
+    path.setAttribute("marker-end", link.needsReapproval ? "url(#arrow-reapproval)" : "url(#arrow)");
+    path.onclick = () => edit().catch(error);
+    const permissions = linkPermissionNames(link);
+    const description = session(link.source).name + " → " + session(link.target).name;
+    const accessibleLabel = [description, ...permissions];
+    if (link.needsReapproval) accessibleLabel.push(tr("Yeniden onay gerekli"));
+    const node = button("", async () => {
+      linkTooltip.hidden = true;
+      await edit();
+      $("#dialog").addEventListener("close", () => {
+        [...labels.children].find((b) => b.dataset.linkDirection === direction)
+          ?.focus({ preventScroll: true });
+      }, { once: true });
+    }, "link-node" + emphasis + reapproval);
+    node.setAttribute("aria-label", accessibleLabel.join(" · "));
+    node.dataset.linkId = link.id;
+    node.dataset.linkDirection = direction;
+    node.style.left = route.x + "px";
+    node.style.top = route.y + "px";
+    const icon = el("span", link.needsReapproval ? "link-warning-mark" : "", link.needsReapproval ? "!" : "⛓\uFE0E");
+    icon.setAttribute("aria-hidden", "true");
+    node.append(icon);
+    const showPermissions = () => showLinkTooltip(node, description, permissions, link.needsReapproval);
+    node.onpointerenter = showPermissions;
+    node.onpointerleave = () => {
+      if (!node.matches(":focus-visible")) linkTooltip.hidden = true;
+    };
+    node.onfocus = () => {
+      if (node.matches(":focus-visible")) showPermissions();
+    };
+    node.onblur = () => {
+      if (!node.matches(":hover")) linkTooltip.hidden = true;
+    };
+    group.append(path);
+    labels.append(node);
+    if (direction === focusedNode && !$("#dialog").open) node.focus({ preventScroll: true });
   }
 }
 $("#viewport").addEventListener("pointerdown", (e) => {
@@ -1587,7 +1665,7 @@ $("#viewport").addEventListener("pointerdown", (e) => {
     mode !== "map" ||
     e.button !== 0 ||
     e.target.closest(".session-card") ||
-    e.target.closest(".link-icon")
+    e.target.closest(".edge, .link-node")
   )
     return;
   e.preventDefault();
@@ -1639,9 +1717,9 @@ window.addEventListener("pointerup", (e) => {
     const source = connecting.source;
     connecting = null;
     drawConnectionPreview();
-    const target = document
-      .elementFromPoint(e.clientX, e.clientY)
-      ?.closest(".session-card")?.dataset.id;
+    const target = document.elementsFromPoint(e.clientX, e.clientY)
+      .map((element) => element.closest(".session-card"))
+      .find(Boolean)?.dataset.id;
     if (target && target !== source) openLink(source, target).catch(error);
     return;
   }
@@ -3179,19 +3257,33 @@ async function openLink(source, target) {
   }
   const candidates = visibleSessions().filter((s) => s.id !== source),
     choice = select(
-      candidates.map((s) => ({
-        id: s.id,
-        label: s.name + " · " + names[s.provider],
-      })),
+      [
+        { id: "", label: tr("Hedef oturum seç") },
+        ...candidates.map((s) => ({
+          id: s.id,
+          label: s.name + " · " + names[s.provider],
+        })),
+      ],
       target,
     ),
-    existing = db.links.find(
-      (l) => l.source === source && l.target === (target || choice.value),
+    existing = db.links.find((l) => l.source === source && l.target === target),
+    read = check(tr("Konuşma geçmişini okuyabilsin")),
+    files = check(tr("Dosyalarını okuyabilsin")),
+    work = check(tr("Bu oturumdan iş isteyebilsin")),
+    status = el("p", "link-reapproval"),
+    unlink = button(
+      tr("Bağlantıyı kes"),
+      async () => {
+        await api("app", "unlink", { id: current.id });
+        closeModal();
+        await sync();
+      },
+      "danger",
     ),
-    read = check(tr("Konuşma geçmişini okuyabilsin"), existing?.read ?? true),
-    files = check(tr("Dosyalarını okuyabilsin"), existing?.files ?? false),
-    work = check(tr("Bu oturumdan iş isteyebilsin"), existing?.work ?? false),
     box = el("div");
+  let current = existing;
+  choice.disabled = Boolean(existing);
+  status.textContent = tr("Bu bağlantıdaki bir oturumun konuşması değişti. İzinleri yeniden onayla.");
   box.append(
     el(
       "p",
@@ -3200,22 +3292,12 @@ async function openLink(source, target) {
         tr(" → seçilen oturum. İzin tek yönlüdür; dosyalar ortak hale gelmez."),
     ),
     field(tr("Hedef oturum"), choice),
+    status,
     read.label,
     files.label,
     work.label,
+    unlink,
   );
-  if (existing)
-    box.append(
-      button(
-        tr("Bağlantıyı kes"),
-        async () => {
-          await api("app", "unlink", { id: existing.id });
-          closeModal();
-          await sync();
-        },
-        "danger",
-      ),
-    );
   modal(tr("Oturum bağlantısı"), box, async () => {
     await api("app", "link", {
       source,
@@ -3226,6 +3308,19 @@ async function openLink(source, target) {
     });
     await sync();
   });
+  const save = $("#dialog-footer .primary");
+  function updateTarget() {
+    current = db.links.find((l) => l.source === source && l.target === choice.value);
+    read.input.checked = current?.read ?? true;
+    files.input.checked = current?.files ?? false;
+    work.input.checked = current?.work ?? false;
+    status.hidden = !current?.needsReapproval;
+    unlink.hidden = !current;
+    save.disabled = !choice.value;
+    save.textContent = tr(current?.needsReapproval ? "Yeniden onayla" : "Kaydet");
+  }
+  choice.onchange = updateTarget;
+  updateTarget();
 }
 function renderLinks() {
   const box = $("#links-list");
@@ -3248,6 +3343,7 @@ function renderLinks() {
           .join(" · "),
       ),
     );
+    if (l.needsReapproval) card.append(el("p", "link-reapproval", tr("Yeniden onay gerekli")));
     const row = el("div", "row");
     row.append(
       button(tr("İzinler"), () => openLink(l.source, l.target)),

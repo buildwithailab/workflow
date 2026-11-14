@@ -961,20 +961,70 @@ body.no-left .sidebar {
 #edges .edge-muted {
   opacity: 0.45;
 }
-#edges g.link-icon {
-  pointer-events: all;
-  cursor: pointer;
+#edges path.edge-reapproval {
+  stroke: var(--amber);
+  stroke-dasharray: 7 5;
 }
-.link-icon circle {
-  fill: #293321;
-  stroke: #a5c679;
-  stroke-width: 2;
+.edge-arrow {
+  fill: #a5c679;
 }
-.link-icon text {
-  fill: #d0e4aa;
-  font-size: 17px;
-  dominant-baseline: central;
-  text-anchor: middle;
+.edge-arrow.edge-reapproval {
+  fill: var(--amber);
+}
+#edge-labels {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.link-node {
+  position: absolute;
+  transform: translate(-50%, -50%) scale(var(--edge-node-scale, 1));
+  pointer-events: auto;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 50%;
+  border-color: #587346;
+  background: #202b21;
+  color: #e4f5d6;
+  box-shadow: 0 2px 5px #0006;
+  font-size: 15px;
+  line-height: 1;
+  font-weight: 600;
+}
+.link-node.edge-muted:not(:hover, :focus-visible) {
+  opacity: 0.65;
+}
+.link-node:is(.edge-focused, :hover) {
+  border-color: var(--accent);
+}
+.link-node.edge-reapproval {
+  border-color: var(--amber);
+  background: #342b1f;
+  color: var(--amber);
+}
+.link-node:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 2px;
+}
+.link-tooltip {
+  position: fixed;
+  z-index: 20;
+  pointer-events: none;
+  display: grid;
+  gap: 4px;
+  max-width: min(300px, calc(100vw - 16px));
+  overflow-wrap: anywhere;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--raised);
+  color: var(--text);
+  box-shadow: 0 4px 14px #0006;
+  font-size: 13px;
+}
+.link-reapproval {
+  color: var(--amber);
 }
 .grid #viewport {
   overflow: auto;
@@ -999,7 +1049,8 @@ body.no-left .sidebar {
   width: auto !important;
   height: 520px;
 }
-.grid #edges {
+.grid #edges,
+.grid #edge-labels {
   display: none;
 }
 .focus #cards {
