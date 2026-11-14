@@ -27,6 +27,7 @@
 credentials.json
 auth.json
 auth-status.json
+teams-profile/
 /local.workflow.desktop/
 /local.agentloom.desktop/
 *.pem

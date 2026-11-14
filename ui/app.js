@@ -141,6 +141,86 @@ function closeModal() {
   dialogSubmit = null;
   scheduleViewport();
 }
+
+const teamsButton = $("#teams");
+const teamsEdit = $("#teams-edit");
+const teamsControl = teamsButton.closest(".teams-control");
+const teamsSelfLink = "https://teams.microsoft.com/l/chat/48%3Anotes/conversations";
+let teamsTimer;
+
+function paintTeams(connection) {
+  teamsControl.dataset.state = connection.state;
+  const label = tr({
+    connected: "Bağlı",
+    disconnected: "Giriş gerekli",
+    "signing-in": "Giriş bekleniyor",
+  }[connection.state]);
+  const status = $("#teams-state");
+  if (status.textContent !== label) status.textContent = label;
+  teamsButton.hidden = connection.state === "connected";
+  const signingIn = connection.state === "signing-in";
+  $("#teams-action").textContent = tr(signingIn ? "Devam et" : "Bağlan");
+  teamsButton.setAttribute("aria-label", tr(signingIn ? "Teams girişine devam et" : "Teams’e bağlan"));
+  renderTeamsEditor();
+}
+
+function checkTeams(delay = 0) {
+  clearTimeout(teamsTimer);
+  teamsTimer = setTimeout(async () => {
+    try {
+      paintTeams(await api("teams", "status"));
+    } catch {
+      paintTeams({ state: "disconnected" });
+    }
+    checkTeams(teamsControl.dataset.state === "signing-in" ? 1250 : 20000);
+  }, delay);
+}
+
+function teamsLink(value = "") {
+  const link = el("input");
+  link.type = "url";
+  link.spellcheck = false;
+  link.placeholder = "https://teams.microsoft.com/l/chat/…";
+  link.value = value;
+  return link;
+}
+
+function canSetTeamsDestination(s) {
+  return !!s && !s.archived && !s.login && s.tools !== false;
+}
+
+function renderTeamsEditor() {
+  teamsEdit.hidden = teamsControl.dataset.state !== "connected" ||
+    !canSetTeamsDestination(session(focusId));
+}
+
+function teamsDestination(s) {
+  const link = teamsLink(s.teamsChatLink || "");
+  modal(tr("Teams hedefi") + " · " + s.name, [
+    field(tr("Teams sohbet bağlantısı"), link),
+    button(tr("Kendi sohbetim"), () => { link.value = teamsSelfLink; }, "quiet"),
+    el("p", "help", tr("Bu oturumun ajanı, burada kaydettiğin sohbete mesaj gönderebilir. Erişimi kaldırmak için alanı boş bırakıp kaydet.")),
+  ], () => api("teams", "set_target", { sessionId: s.id, link: link.value }));
+}
+
+teamsEdit.onclick = () => {
+  const s = session(focusId);
+  if (!teamsEdit.hidden && canSetTeamsDestination(s)) teamsDestination(s);
+};
+
+teamsButton.onclick = async () => {
+  if (teamsButton.disabled || teamsButton.hidden) return;
+  teamsButton.disabled = true;
+  try {
+    paintTeams(await api("teams", "connect"));
+  } catch (e) {
+    error(e);
+  } finally {
+    teamsButton.disabled = false;
+    checkTeams(1000);
+  }
+};
+
 $("#dialog-close").onclick = closeModal;
 $("#dialog").addEventListener("close", scheduleViewport);
 $("#dialog").addEventListener("cancel", (e) => {
@@ -249,6 +329,7 @@ function render() {
     session(focusId)?.archived
   )
     focusId = visibleSessions()[0]?.id || null;
+  renderTeamsEditor();
   renderProjects();
   renderCards();
   renderProviderCards();
@@ -775,6 +856,7 @@ function createCard(s, index) {
     if (e.target.closest(".card-summary")) return;
     if (focusId !== s.id) {
       focusId = s.id;
+      renderTeamsEditor();
       renderProjects();
       $$(".session-card").forEach((c) =>
         c.classList.toggle("focused", c.dataset.id === s.id),
@@ -1006,6 +1088,9 @@ async function sessionMenu(id) {
       ? []
       : [button(tr("Eklentiler"), () => sessionAddons(id))]),
     ...(s.login ? [] : [button(tr("Önizleme ayarları"), () => previewSettings(s))]),
+    ...(canSetTeamsDestination(s)
+      ? [button(tr("Teams hedefi"), () => teamsDestination(s))]
+      : []),
     button(tr("Çalışma klasörünü aç"), () =>
       api("app", "reveal", { sessionId: id }),
     ),
@@ -3776,6 +3861,7 @@ async function initialize() {
     openPanel,
     refresh: sync,
   };
+  checkTeams();
 }
 initialize().catch(error);
 setInterval(() => {

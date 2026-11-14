@@ -12,7 +12,7 @@ use std::{
 
 fn tools() -> Value {
     let object = |properties: Value, required: Vec<&str>| json!({"type":"object","properties":properties,"required":required});
-    json!([
+    let catalog = json!([
         {"name":"browser_open","description":"Open an HTTP/HTTPS page in this session's embedded browser or installed Chrome. Set newTab true for another tab.","inputSchema":object(json!({"url":{"type":"string"},"mode":{"type":"string","enum":["embedded","chrome"]},"newTab":{"type":"boolean"},"pageId":{"type":"string"}}),vec!["url"])},
         {"name":"browser_read","description":"Read a tab's visible text, structured elements and optional screenshot. Use documentId and element ref for actions. Returns tabs if no tab is open.","inputSchema":object(json!({"pageId":{"type":"string"},"screenshot":{"type":"boolean"}}),vec![])},
         {"name":"browser_action","description":"Interact with the session browser. Actions: click, double_click, right_click, hover, drag, fill, type, select, check, key, scroll, wait. For ref actions include documentId from the latest browser_read. Coordinates refer to the latest screenshot viewport.","inputSchema":object(json!({"pageId":{"type":"string"},"action":{"type":"string"},"documentId":{"type":"string"},"ref":{"type":"string"},"x":{"type":"number"},"y":{"type":"number"},"toX":{"type":"number"},"toY":{"type":"number"},"text":{"type":"string"},"checked":{"type":"boolean"},"key":{"type":"string"},"deltaX":{"type":"number"},"deltaY":{"type":"number"},"ms":{"type":"integer"}}),vec!["action"])},
@@ -23,7 +23,22 @@ fn tools() -> Value {
         {"name":"request_work","description":"Request work from a connected existing session with delegation permission. The user accepts it in Workflow; connecting sessions never starts jobs by itself. No new agent is spawned.","inputSchema":object(json!({"target":{"type":"string"},"instruction":{"type":"string"}}),vec!["target","instruction"])},
         {"name":"read_result","description":"Read the status or result of a work request created by this session.","inputSchema":object(json!({"requestId":{"type":"string"}}),vec!["requestId"])},
         {"name":"report_result","description":"Return the outcome of a work request addressed to this session.","inputSchema":object(json!({"requestId":{"type":"string"},"result":{"type":"string"}}),vec!["requestId","result"])}
-    ])
+    ]);
+    #[cfg(windows)]
+    let catalog = {
+        let mut catalog = catalog;
+        catalog.as_array_mut().unwrap().push(json!({
+            "name": "teams_send_message",
+            "description": "Submit a message to the Teams chat saved for this session through Workflow's signed-in Teams Web connection. Use only when the user explicitly asks to send a Teams message. If the user supplies a Teams chat or message link, pass it exactly so Workflow can verify that it matches the saved destination. A submitted result means Teams Web received the send action. Report submission without claiming delivery and check with the user before retrying.",
+            "inputSchema": object(json!({
+                "link": {"type":"string","description":"Include the Teams chat or message link when the user provides one"},
+                "text": {"type":"string","description":"Plain-text message to send"}
+            }), vec!["text"]),
+            "annotations": {"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true}
+        }));
+        catalog
+    };
+    catalog
 }
 pub fn start(core: &Arc<Core>) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
@@ -95,7 +110,12 @@ fn constant_eq(a: &str, b: &str) -> bool {
     }
     n == 0
 }
-pub fn configuration(core: &Core, session: &Value, run_id: &str) -> Result<Vec<String>> {
+pub fn configuration(
+    core: &Core,
+    session: &Value,
+    run_id: &str,
+    provider_exe: &std::path::Path,
+) -> Result<Vec<String>> {
     let sid = string(session, "id")?;
     let provider = string(session, "provider")?;
     let token = format!("{}{}", id(), id());
@@ -119,23 +139,57 @@ pub fn configuration(core: &Core, session: &Value, run_id: &str) -> Result<Vec<S
             format!("@{}", cfg.display()),
         ]);
     }
-    Ok(vec![
+    Ok(codex_configuration(
+        &executable.to_string_lossy(),
+        &file.to_string_lossy(),
+        crate::terminal::uses_windows_script(provider_exe),
+    ))
+}
+
+fn codex_configuration(command: &str, lease: &str, windows_script: bool) -> Vec<String> {
+    let quote = |value: &str| {
+        if !windows_script {
+            return json!(value).to_string();
+        }
+        // Preserve the TOML delimiters through Windows PowerShell's legacy argv
+        // conversion. Encode characters that a batch shim could expand or split.
+        use std::fmt::Write as _;
+        let mut quoted = String::from(r#"\""#);
+        for c in value.chars() {
+            if c.is_ascii_alphanumeric() || "-_./:".contains(c) {
+                quoted.push(c);
+            } else if (c as u32) <= 0xffff {
+                let _ = write!(quoted, "\\u{:04x}", c as u32);
+            } else {
+                let _ = write!(quoted, "\\U{:08x}", c as u32);
+            }
+        }
+        quoted.push_str(r#"\""#);
+        quoted
+    };
+    vec![
+        "-c".into(),
+        format!("mcp_servers.workflow.command={}", quote(command)),
         "-c".into(),
         format!(
-            "mcp_servers.workflow.command={}",
-            json!(executable.to_string_lossy())
+            "mcp_servers.workflow.args=[{},{}]",
+            quote("mcp"),
+            quote(lease)
         ),
         "-c".into(),
-        format!("mcp_servers.workflow.args={}", json!(argv)),
-        "-c".into(),
         "mcp_servers.workflow.startup_timeout_sec=20".into(),
-    ])
+    ]
 }
 
 fn forward_tool(endpoint: &std::net::SocketAddr, lease: &Value, params: &Value) -> Result<Value> {
     let mut stream = TcpStream::connect_timeout(endpoint, Duration::from_secs(4))
         .context("Workflow araç bağlantısı kurulamadı")?;
-    stream.set_read_timeout(Some(Duration::from_secs(25)))?;
+    let timeout = match params["name"].as_str() {
+        #[cfg(windows)]
+        Some("teams_send_message") => crate::teams::MCP_READ_TIMEOUT,
+        _ => Duration::from_secs(25),
+    };
+    stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(Duration::from_secs(4)))?;
     let mut call = lease.clone();
     call["method"] = params["name"].clone();
@@ -262,6 +316,8 @@ async fn call(core: &Arc<Core>, source: &str, method: &str, mut args: Value) -> 
         return browser::agent_action(core, source, action, &args).await;
     }
     match method {
+        #[cfg(windows)]
+        "teams_send_message" => crate::teams::send_for_session(core, source, &args).await,
         "session_catalog" => {
             let db = core.db.lock().unwrap();
             Ok(json!(db["links"].as_array().unwrap().iter().filter(|l|l["source"]==source).filter_map(|l|db["sessions"].as_array().unwrap().iter().find(|s|s["id"]==l["target"]&&s["archived"]!=true).map(|s|json!({"id":s["id"],"name":s["name"],"provider":s["provider"],"permissions":l}))).collect::<Vec<_>>()))

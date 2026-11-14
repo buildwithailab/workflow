@@ -210,55 +210,54 @@ async fn cdp(core: &Arc<Core>, p: &Page, method: &str, params: Value) -> Result<
         .get_webview(&p.label)
         .context("Tarayıcı görünümü kapalı")?;
     #[cfg(windows)]
-    {
-        use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
-        use windows::core::PCWSTR;
-        let (tx, rx) = tokio::sync::oneshot::channel::<Result<Value>>();
-        let tx = Arc::new(Mutex::new(Some(tx)));
-        let method = method.to_string();
-        let params = params.to_string();
-        w.with_webview(move |platform| {
-            let result = (|| -> Result<()> {
-                unsafe {
-                    let web = platform.controller().CoreWebView2()?;
-                    let m = method.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
-                    let a = params.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
-                    let t = tx.clone();
-                    let callback = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
-                        move |error, result| {
-                            let value = error
-                                .map_err(|w| anyhow!(w))
-                                .and_then(|_| serde_json::from_str(&result).map_err(Into::into));
-                            if let Some(tx) = t.lock().unwrap().take() {
-                                let _ = tx.send(value);
-                            }
-                            Ok(())
-                        },
-                    ));
-                    web.CallDevToolsProtocolMethod(
-                        PCWSTR(m.as_ptr()),
-                        PCWSTR(a.as_ptr()),
-                        &callback,
-                    )?;
-                }
-                Ok(())
-            })();
-            if let Err(w) = result {
-                if let Some(tx) = tx.lock().unwrap().take() {
-                    let _ = tx.send(Err(w));
-                }
-            }
-        })?;
-        tokio::time::timeout(Duration::from_secs(15), rx)
-            .await
-            .context("Tarayıcı yanıtı gecikti")?
-            .context("Tarayıcı kapandı")?
-    }
+    return webview_cdp(&w, method, params).await;
     #[cfg(not(windows))]
     {
         let _ = (w, method, params);
         bail!("Bu platformda otomasyon için Chrome modunu kullan")
     }
+}
+
+#[cfg(windows)]
+pub(crate) async fn webview_cdp(w: &tauri::Webview, method: &str, params: Value) -> Result<Value> {
+    use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
+    use windows::core::PCWSTR;
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<Value>>();
+    let tx = Arc::new(Mutex::new(Some(tx)));
+    let method = method.to_string();
+    let params = params.to_string();
+    w.with_webview(move |platform| {
+        let result = (|| -> Result<()> {
+            unsafe {
+                let web = platform.controller().CoreWebView2()?;
+                let m = method.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+                let a = params.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+                let t = tx.clone();
+                let callback = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+                    move |error, result| {
+                        let value = error
+                            .map_err(|w| anyhow!(w))
+                            .and_then(|_| serde_json::from_str(&result).map_err(Into::into));
+                        if let Some(tx) = t.lock().unwrap().take() {
+                            let _ = tx.send(value);
+                        }
+                        Ok(())
+                    },
+                ));
+                web.CallDevToolsProtocolMethod(PCWSTR(m.as_ptr()), PCWSTR(a.as_ptr()), &callback)?;
+            }
+            Ok(())
+        })();
+        if let Err(w) = result {
+            if let Some(tx) = tx.lock().unwrap().take() {
+                let _ = tx.send(Err(w));
+            }
+        }
+    })?;
+    tokio::time::timeout(Duration::from_secs(15), rx)
+        .await
+        .context("Tarayıcı yanıtı gecikti")?
+        .context("Tarayıcı kapandı")?
 }
 async fn eval(core: &Arc<Core>, p: &Page, script: &str) -> Result<Value> {
     let r = cdp(

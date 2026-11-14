@@ -182,6 +182,91 @@ pre {
   border-radius: 50%;
   background: currentColor;
 }
+.teams-control {
+  display: flex;
+  align-items: center;
+  position: relative;
+  gap: 8px;
+  min-height: 44px;
+  flex: none;
+  padding: 6px 8px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+.teams-icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  background: #242139;
+  color: #bcb0fc;
+}
+.teams-icon svg {
+  width: 19px;
+  height: 19px;
+}
+.teams-info {
+  flex: 1;
+  min-width: 0;
+  line-height: 1.3;
+}
+.teams-info strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+.teams-status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+}
+.teams-status .dot {
+  width: 6px;
+  height: 6px;
+}
+.teams-control[data-state="connected"] .dot {
+  color: var(--accent);
+}
+.teams-control[data-state="signing-in"] .dot {
+  color: var(--amber);
+}
+#teams {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-size: 11px;
+  color: var(--muted);
+}
+#teams::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+}
+.teams-control:has(#teams:not(:disabled):is(:hover, :focus-visible)) {
+  background: var(--raised);
+  border-color: #53604a;
+}
+#teams:is(:hover, :focus-visible) {
+  color: var(--text);
+}
+#teams-edit {
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+}
+#teams-edit:is(:hover, :focus-visible) {
+  background: var(--raised);
+  border-color: var(--line);
+  color: var(--text);
+}
+#teams-edit svg {
+  width: 15px;
+  height: 15px;
+}
 .state[data-state="running"] {
   color: #90b4df;
 }
@@ -253,6 +338,7 @@ body.no-left .sidebar {
   background: #566b44;
 }
 .sidebar {
+  container-type: inline-size;
   overflow: hidden;
   background: #12151a;
   display: flex;
@@ -298,6 +384,11 @@ body.no-left .sidebar {
 .sidebar-actions .primary {
   flex: 1;
   padding: 11px;
+}
+@container (max-width: 185px) {
+  #teams-action {
+    display: none;
+  }
 }
 .project-heading {
   margin: 8px 5px 12px;

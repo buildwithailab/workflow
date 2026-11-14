@@ -54,8 +54,11 @@ When session tools are enabled, Workflow configures the provider CLI to use its 
 | Inspect changed files or read selected files | `read_files` | Read files permission on the target link |
 | Ask for work and exchange results | `request_work`, `report_result`, `read_result` | Request work permission and user acceptance |
 | Use a browser and record checks | `browser_open`, `browser_read`, `browser_action`, `browser_assert` | Browser access for the calling session |
+| Send a Teams message | `teams_send_message` | A signed-in Teams Web connection and a matching chat link saved for the calling session |
 
 A work request goes to an existing session. When you accept it in Workflow, it becomes a draft in that session's terminal. You submit the draft, and the receiving agent can report the outcome for the originating session to read.
+
+To send a Teams message from an agent session, choose **Connect** in the Teams sidebar row. Once it shows **Connected**, select the session and click the pencil icon in the Teams row. You can also use the session card's **⋯ → Teams destination** menu. Enter a chat link or choose **Chat with myself**, then save. Ask the agent to send a message to the saved Teams chat and provide the text. Workflow checks the saved destination and submits the message through the hidden Teams Web window. Check the conversation in Teams to confirm delivery.
 
 ## From local preview to browser evidence
 

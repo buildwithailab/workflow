@@ -10,6 +10,8 @@ mod mcp;
 mod models;
 #[cfg(windows)]
 mod preview;
+#[cfg(windows)]
+mod teams;
 mod terminal;
 mod usage;
 use crate::core::*;
@@ -33,6 +35,12 @@ async fn dispatch(
         return Err("Bu sayfa uygulama araçlarına erişemez".into());
     }
     let core = state.inner().clone();
+    #[cfg(windows)]
+    if domain == "teams" {
+        return teams::dispatch(&core, &action, &args)
+            .await
+            .map_err(|e| e.to_string());
+    }
     #[cfg(windows)]
     if domain == "preview" && action == "open" {
         return preview::open(&core, &args).await.map_err(|e| e.to_string());
@@ -605,6 +613,8 @@ fn main() {
         let core = Core::new(directory, app.handle().clone())?;
         mcp::start(&core)?;
         app.manage(core.clone());
+        #[cfg(windows)]
+        app.manage(teams::Teams::default());
         if let Some(config) = &config {
             tauri::WebviewWindowBuilder::from_config(app, config)?.data_directory(webview_directory).build()?;
         }
@@ -644,6 +654,16 @@ fn main() {
         }
     };
     application.run(|app, event| {
+        #[cfg(windows)]
+        if let tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::CloseRequested { .. },
+            ..
+        } = &event {
+            if label == "main" {
+                teams::close(app);
+            }
+        }
         if matches!(
             event,
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit

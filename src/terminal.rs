@@ -136,13 +136,20 @@ pub fn executable(provider: &str, custom: Option<&str>) -> Option<PathBuf> {
     }
     None
 }
+pub(crate) fn uses_windows_script(exe: &Path) -> bool {
+    cfg!(windows)
+        && exe
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                ["cmd", "bat", "ps1"]
+                    .iter()
+                    .any(|kind| extension.eq_ignore_ascii_case(kind))
+            })
+}
+
 pub fn command(exe: &Path, args: &[String]) -> CommandBuilder {
-    let extension = exe
-        .extension()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_lowercase();
-    if cfg!(windows) && ["cmd", "bat", "ps1"].contains(&extension.as_str()) {
+    if uses_windows_script(exe) {
         let mut cmd = CommandBuilder::new("powershell.exe");
         cmd.args(["-NoLogo", "-NoProfile", "-Command"]);
         let literal = |s: &str| format!("'{}'", s.replace('\'', "''"));
@@ -209,6 +216,33 @@ fn provider_arguments(session: &Value, conversation: Option<&str>) -> Result<Vec
     Ok(args)
 }
 
+fn codex_mcp_bootstrap_failed(core: &Core, session: &Value, session_id: &str) -> bool {
+    if session["exitCode"] != 1 || session["tools"] == false {
+        return false;
+    }
+    let path = core
+        .directory
+        .join("transcripts")
+        .join(format!("{session_id}.ansi"));
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut bytes = Vec::new();
+    file.take(8193).read_to_end(&mut bytes).is_ok() && is_codex_mcp_bootstrap_error(&bytes)
+}
+
+fn is_codex_mcp_bootstrap_error(bytes: &[u8]) -> bool {
+    if bytes.len() > 8192 {
+        return false;
+    }
+    let mut parser = vt100::Parser::new(100, 500, 0);
+    parser.process(bytes);
+    let screen = parser.screen().contents();
+    let output = screen.trim();
+    output.starts_with(r#"Error: invalid type: string "[mcp,"#)
+        && output.ends_with("expected a sequence\nin `mcp_servers.workflow.args`")
+}
+
 pub fn start(core: &Arc<Core>, session_id: &str) -> Result<Value> {
     let _guard = core.operations.lock().unwrap();
     if let Some(t) = core.terms.lock().unwrap().get(session_id) {
@@ -258,7 +292,7 @@ pub fn start(core: &Arc<Core>, session_id: &str) -> Result<Value> {
         conversation = history::discover(core, session_id)?;
         if let Some(thread) = &conversation {
             core.update_session(session_id, json!({"conversationId":thread}))?;
-        } else {
+        } else if !codex_mcp_bootstrap_failed(core, &session, session_id) {
             bail!("Bu kartın konuşma kaydı henüz doğrulanmadı. ⋯ menüsünden Konuşma seç ile kaydı bağla; yeni konuşma otomatik açılmadı.")
         }
     }
@@ -266,7 +300,7 @@ pub fn start(core: &Arc<Core>, session_id: &str) -> Result<Value> {
     let run_id = id();
     let tools = session["tools"] != false && session["login"] != true;
     let tool_args = if tools {
-        crate::mcp::configuration(core, &session, &run_id)?
+        crate::mcp::configuration(core, &session, &run_id, &exe)?
     } else {
         vec![]
     };

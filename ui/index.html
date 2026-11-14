@@ -25,6 +25,32 @@
           <button class="primary" id="new-session">+ Yeni oturum</button
           ><button class="icon" id="refresh" title="Yenile">↻</button>
         </div>
+        <div class="teams-control" data-state="disconnected">
+          <span class="teams-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <circle cx="13.5" cy="6" r="3" fill="currentColor" opacity=".8"/>
+              <circle cx="20" cy="8" r="2" fill="currentColor" opacity=".6"/>
+              <path d="M9 11h9v6a4.5 4.5 0 0 1-9 0zm10 1h3v4a3 3 0 0 1-3 3z" fill="currentColor" opacity=".6"/>
+              <rect x="2" y="8" width="12" height="12" rx="2" fill="currentColor"/>
+              <path d="M5 12h6m-3 0v5" fill="none" stroke="#20213a" stroke-width="1.4" stroke-linecap="round"/>
+            </svg>
+          </span>
+          <span class="teams-info">
+            <strong>Teams</strong>
+            <span class="teams-status">
+              <i class="dot" aria-hidden="true"></i>
+              <small id="teams-state" aria-live="polite">Giriş gerekli</small>
+            </span>
+          </span>
+          <button id="teams" type="button" aria-label="Teams’e bağlan">
+            <span id="teams-action">Bağlan</span><span aria-hidden="true">›</span>
+          </button>
+          <button class="icon" id="teams-edit" type="button" title="Teams hedefini düzenle" aria-label="Teams hedefini düzenle" aria-haspopup="dialog" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+              <path d="m15 5 4 4M4 20l1-5L16 4a2.8 2.8 0 0 1 4 4L9 19l-5 1Z"/>
+            </svg>
+          </button>
+        </div>
         <div class="project-heading">
           <span class="grow">PROJELER</span
           ><button class="icon quiet" id="addons" title="Eklentiler">◇</button
