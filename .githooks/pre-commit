@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+# Check the whole index, not just the working copy or the current diff.
+# Load the scanner from the index, so unstaged edits cannot weaken this gate.
+exec node -e '
+try {
+  const cp = require("node:child_process");
+  const source = cp.execFileSync("git", ["show", ":scripts/check-commit.cjs"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  if (!source.trim()) throw new Error("Missing scanner");
+  const scanner = new (require("node:module"))("workflow-commit-security");
+  scanner._compile(source, "scripts/check-commit.cjs");
+  process.argv = [process.execPath, "scripts/check-commit.cjs", "--staged"];
+  scanner.exports.main();
+} catch {
+  console.error("BLOCKED: the staged security scanner could not run. No commit is permitted.");
+  process.exitCode = 1;
+}'

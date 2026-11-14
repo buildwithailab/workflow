@@ -1080,7 +1080,12 @@ mod tests {
             "http://localhost:5080/api"
         );
         assert!(url("file:///C:/secret").is_err());
-        assert!(url("https://name:password@example.com").is_err());
+        let mut with_credentials = url::Url::parse("https://example.com").unwrap();
+        with_credentials.set_username("fixture").unwrap();
+        with_credentials
+            .set_password(Some(&uuid::Uuid::new_v4().to_string()))
+            .unwrap();
+        assert!(url(with_credentials.as_str()).is_err());
     }
 
     #[test]

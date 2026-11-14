@@ -811,6 +811,32 @@ body.no-left .sidebar {
 .terminal-host .xterm {
   height: 100%;
 }
+.terminal-menu {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  padding: 5px;
+  min-width: 220px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  box-shadow: 0 8px 28px #0008;
+}
+.terminal-menu button {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 24px;
+  width: 100%;
+  border: 0;
+  text-align: left;
+}
+.terminal-menu kbd {
+  font: inherit;
+  font-size: 11px;
+  color: var(--muted);
+}
 .xterm-viewport::-webkit-scrollbar {
   width: 12px;
 }

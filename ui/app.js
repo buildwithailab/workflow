@@ -715,6 +715,166 @@ function renderCards() {
   drawEdges();
   requestAnimationFrame(fitTerminals);
 }
+function terminalClipboard(term, host, writableRun, onInput) {
+  let inputQueue = Promise.resolve(), pasting = false, pastedInput;
+  let inputGeneration = 0, pendingInput = 0;
+  const enqueue = (action, affectsDraft = true) => {
+    if (affectsDraft) pendingInput++;
+    inputQueue = inputQueue.then(action).catch(error).finally(() => {
+      if (affectsDraft) pendingInput--;
+    });
+    return inputQueue;
+  };
+  term.onData((data) => {
+    if (pasting) {
+      pastedInput = onInput(data);
+      return;
+    }
+    const run = writableRun();
+    const generation = inputGeneration;
+    // xterm reports focus changes when the user clicks an action outside the terminal.
+    // Keep those reports ordered without treating them as pending draft text.
+    const focusReport = data === "\x1b[I" || data === "\x1b[O";
+    enqueue(() => {
+      if (generation === inputGeneration && run && host.isConnected && writableRun() === run)
+        return onInput(data);
+    }, !focusReport);
+  });
+  const copy = async () => {
+    const text = term.getSelection();
+    if (text) await api("clipboard", "write", { text });
+  };
+  const paste = (readText = () => api("clipboard", "read")) => {
+    const run = writableRun();
+    if (!run) return;
+    const generation = inputGeneration;
+    return enqueue(async () => {
+      const canPaste = () => host.isConnected && writableRun() === run && !term.options.disableStdin;
+      if (generation !== inputGeneration || !canPaste()) return;
+      let text = await readText();
+      // A stopped, replaced or detached terminal must not receive a pending paste.
+      if (!canPaste() || !text) return;
+      if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(text)) {
+        inputGeneration++;
+        throw Error(tr("Pano metninde terminal denetim karakterleri var. Metni temizleyip tekrar dene."));
+      }
+      const bracketed = term.modes.bracketedPasteMode && !term.options.ignoreBracketedPasteMode;
+      if (!bracketed && /[\r\n\t]/.test(text)) {
+        // Discard keystrokes buffered before the user makes a decision, including Enter.
+        inputGeneration++;
+        if (!(await confirmTerminalPaste()) || !canPaste()) return;
+        text = text.replace(/\r\n|[\r\n\t]/g, " ");
+      }
+      pasting = true;
+      try {
+        pastedInput = undefined;
+        term.paste(text);
+      } finally {
+        pasting = false;
+      }
+      await pastedInput;
+    });
+  };
+  host.addEventListener("paste", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const text = e.clipboardData?.getData("text/plain");
+    if (text) paste(() => text);
+  }, true);
+  term.attachCustomKeyEventHandler((e) => {
+    const key = e.key.toLowerCase();
+    const modifier = (e.ctrlKey || e.metaKey) && !e.altKey;
+    const copyKey = modifier &&
+      ((key === "c" && (e.shiftKey || term.hasSelection())) ||
+       (key === "insert" && !e.shiftKey));
+    const pasteKey = (modifier && key === "v") ||
+      (key === "insert" && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey);
+    if (copyKey || pasteKey) {
+      e.preventDefault();
+      if (e.type === "keydown") Promise.resolve(copyKey ? copy() : paste()).catch(error);
+      return false;
+    }
+    if (e.type === "keydown" && e.shiftKey && ["PageUp", "PageDown"].includes(e.key)) {
+      e.preventDefault();
+      term.scrollPages(e.key === "PageUp" ? -1 : 1);
+      return false;
+    }
+    return true;
+  });
+  const menu = el("div", "terminal-menu");
+  menu.setAttribute("popover", "auto");
+  menu.setAttribute("role", "menu");
+  menu.setAttribute("aria-label", tr("Terminal"));
+  const item = (label, shortcut, action) => {
+    const b = button("", () => {
+      menu.hidePopover();
+      term.focus();
+      return action();
+    });
+    b.setAttribute("role", "menuitem");
+    b.append(el("span", "", label), el("kbd", "", shortcut));
+    menu.append(b);
+    return b;
+  };
+  const copyButton = item(tr("Kopyala"), "Ctrl+Shift+C", copy);
+  const pasteButton = item(tr("Yapıştır"), "Ctrl+V", paste);
+  host.append(menu);
+  host.addEventListener("contextmenu", (e) => {
+    // Preserve mouse reporting in full-screen CLI applications (Shift overrides it).
+    if (term.modes.mouseTrackingMode !== "none" && !e.shiftKey) return;
+    e.preventDefault();
+    e.stopPropagation();
+    copyButton.disabled = !term.hasSelection();
+    pasteButton.disabled = !writableRun();
+    menu.showPopover();
+    const rect = host.getBoundingClientRect();
+    const x = e.clientX || rect.left + 12, y = e.clientY || rect.top + 12;
+    menu.style.left = Math.max(4, Math.min(x, innerWidth - menu.offsetWidth - 4)) + "px";
+    menu.style.top = Math.max(4, Math.min(y, innerHeight - menu.offsetHeight - 4)) + "px";
+    (copyButton.disabled ? pasteButton : copyButton).focus();
+  }, true);
+  menu.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      menu.hidePopover();
+      term.focus();
+    } else if (["ArrowDown", "ArrowUp"].includes(e.key)) {
+      e.preventDefault();
+      const next = document.activeElement === copyButton ? pasteButton : copyButton;
+      if (!next.disabled) next.focus();
+    }
+  });
+  return () => pendingInput > 0;
+}
+
+function confirmTerminalPaste() {
+  if ($("#terminal-paste-confirmation")) return Promise.resolve(false);
+  const dialog = el("dialog");
+  dialog.id = "terminal-paste-confirmation";
+  dialog.setAttribute("aria-labelledby", "terminal-paste-title");
+  const header = el("header", "dialog-header");
+  const title = el("h2", "", tr("Terminale yapıştır"));
+  title.id = "terminal-paste-title";
+  header.append(title);
+  const body = el("div", "dialog-body");
+  body.append(el("p", "help", tr("Bu terminalde satır sonları komutu çalıştırabilir. Satır sonları ve sekmeler boşluğa çevrilsin mi?")));
+  const footer = el("footer", "dialog-footer");
+  const cancel = button(tr("Vazgeç"), () => dialog.close());
+  cancel.autofocus = true;
+  footer.append(cancel, button(tr("Tek satır olarak yapıştır"), () => dialog.close("paste"), "primary"));
+  dialog.append(header, body, footer);
+  document.body.append(dialog);
+  hideBrowser();
+  return new Promise((resolve) => {
+    dialog.addEventListener("close", () => {
+      dialog.remove();
+      scheduleViewport();
+      resolve(dialog.returnValue === "paste");
+    }, { once: true });
+    dialog.showModal();
+  });
+}
+
 function createCard(s, index) {
   const card = el("article", "session-card");
   card.dataset.id = s.id;
@@ -817,7 +977,7 @@ function createCard(s, index) {
     observedModel: null,
   };
   term.onWriteParsed(() => observeTerminal(s.id, v));
-  term.onData((data) => {
+  const sendInput = (data) => {
     if (
       v.replaying ||
       !active(s.id) ||
@@ -830,19 +990,12 @@ function createCard(s, index) {
     else if (data.startsWith("\x1b[200~") && data.endsWith("\x1b[201~"))
       v.inputDraft += data.slice(6, -6);
     else if (!/^[\x00-\x1f\x7f]/.test(data)) v.inputDraft += data;
-    api("terminal", "write", { id: s.id, runId: v.runId, data }).catch(error);
-  });
-  term.attachCustomKeyEventHandler((e) => {
-    if (
-      e.type === "keydown" &&
-      e.shiftKey &&
-      ["PageUp", "PageDown"].includes(e.key)
-    ) {
-      term.scrollPages(e.key === "PageUp" ? -1 : 1);
-      return false;
-    }
-    return true;
-  });
+    return api("terminal", "write", { id: s.id, runId: v.runId, data });
+  };
+  v.hasPendingInput = terminalClipboard(term, host, () =>
+    views.get(s.id) === v && v.ready && !v.replaying && active(s.id) ? v.runId : null,
+    sendInput,
+  );
   const observer = new ResizeObserver(() => {
     clearTimeout(v.resizeTimer);
     v.resizeTimer = setTimeout(() => {
@@ -1187,7 +1340,7 @@ function modelChangeBlock(id) {
       .slice(-8)
       .some((line) => /^\s*[›❯>]?\s*Ask Codex to do anything\s*$/i.test(line));
   }
-  if (view.inputDraft.trim())
+  if (view.hasPendingInput() || view.inputDraft.trim())
     return tr("Terminalde bir taslak var. Modeli uygulamadan önce taslağı temizle veya gönder.");
   if (state === "working")
     return tr("Ajan çalışıyor. Yanıtı bitirip girişe döndüğünde modeli uygula.");
@@ -1758,7 +1911,6 @@ async function openProviderLogin(provider, accountId = defaultAccount) {
   const close = $("#dialog-footer button");
   close.textContent = tr("Kapat");
   let runId, timer;
-  let inputQueue = Promise.resolve();
   let closed = false;
   let ended = false;
   let since = 0;
@@ -1769,6 +1921,9 @@ async function openProviderLogin(provider, accountId = defaultAccount) {
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
   term.open(host);
+  terminalClipboard(term, host, () => !closed && !ended ? runId : null, (data) => {
+    if (!/^\x1b\[[?0-9;]*[Rc]$/.test(data)) return call("write", { data });
+  });
   fit.fit();
   const call = (action, args) =>
     api("provider_login", action, { runId, ...args });
@@ -1820,16 +1975,6 @@ async function openProviderLogin(provider, accountId = defaultAccount) {
     await call("resize", { cols: term.cols, rows: term.rows });
     if (closed) return;
     status.textContent = tr("Sağlayıcının giriş adımlarını takip et.");
-    term.onData((data) => {
-      if (ended || /^\x1b\[[?0-9;]*[Rc]$/.test(data)) return;
-      inputQueue = inputQueue
-        .then(() => {
-          if (!closed && !ended) return call("write", { data });
-        })
-        .catch((e) => {
-          if (!closed && !ended) error(e);
-        });
-    });
     term.focus();
     poll();
   } catch (e) {
@@ -3552,7 +3697,7 @@ function draftTarget(id) {
   if (!active(id) || !v?.ready || !v.runId)
     throw Error(tr("Bu oturumun terminalini önce başlat"));
   if (
-    v.inputDraft.trim() ||
+    v.hasPendingInput() || v.inputDraft.trim() ||
     v.term.options.disableStdin ||
     ["working", "permission"].includes(status(id).key)
   )
@@ -3593,7 +3738,7 @@ async function pollBrowser() {
     browserPollBusy ||
     !browserPage ||
     panel !== "browser" ||
-    $("#dialog").open ||
+    $("dialog[open]") ||
     document.body.classList.contains("no-right")
   )
     return;
@@ -3718,7 +3863,7 @@ function scheduleViewport() {
         if (
           !browserPage ||
           panel !== "browser" ||
-          $("#dialog").open ||
+          $("dialog[open]") ||
           document.body.classList.contains("no-right") ||
           jsonVisible
         ) {

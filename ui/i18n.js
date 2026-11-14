@@ -2,6 +2,16 @@
 
 // Turkish source text is the default. Translate only messages authored by Workflow.
 const english = {
+  "Yapıştır": "Paste",
+  "Terminale yapıştır": "Paste into terminal",
+  "Tek satır olarak yapıştır": "Paste as one line",
+  "Bu terminalde satır sonları komutu çalıştırabilir. Satır sonları ve sekmeler boşluğa çevrilsin mi?": "Line breaks can run commands in this terminal. Replace line breaks and tabs with spaces?",
+  "Pano metninde terminal denetim karakterleri var. Metni temizleyip tekrar dene.": "Clipboard text contains terminal control characters. Remove them and try again.",
+  "Pano işlemi bulunamadı": "Clipboard action not found",
+  "Pano şu anda kullanılıyor. Tekrar dene.": "The clipboard is busy. Try again.",
+  "Panodaki metin okunamadı": "Could not read clipboard text",
+  "Metin panoya kopyalanamadı": "Could not copy text to the clipboard",
+  "Metin gerekli": "Text is required",
   "Bağlı": "Connected",
   "Bağlan": "Connect",
   "Devam et": "Continue",

@@ -819,6 +819,35 @@ async function test() {
     inputBefore,
   );
   console.log("PASS three provider PTYs and renderer reattach without input");
+
+  const clipboardSession = sessions[0].id;
+  const clipboardTerminal = page.locator('[data-id="' + clipboardSession + '"] .xterm-helper-textarea');
+  const receivedPath = path.join(data, "test-input", "codex.txt");
+  const inputLog = () => fs.readFileSync(receivedPath, "utf8");
+  const beforePaste = inputLog();
+  assert.equal(await page.evaluate(id => window.workflow.views.get(id).term.modes.bracketedPasteMode, clipboardSession), false);
+  const pasteInApp = async (text) => {
+    await clipboardTerminal.focus();
+    await clipboardTerminal.evaluate((target, text) => {
+      const clipboardData = new DataTransfer();
+      clipboardData.setData("text/plain", text);
+      target.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData }));
+    }, text);
+  };
+  const confirmation = page.getByRole("dialog", { name: "Terminale yapıştır" });
+  await pasteInApp("synthetic clipboard\r\nsecond line");
+  await confirmation.getByRole("button", { name: "Vazgeç", exact: true }).click();
+  await confirmation.waitFor({ state: "hidden" });
+  assert.equal(inputLog(), beforePaste, "cancelling paste must leave the fixture input unchanged");
+  await pasteInApp("synthetic clipboard\r\nsecond line\tend");
+  await confirmation.getByRole("button", { name: "Tek satır olarak yapıştır", exact: true }).click();
+  await confirmation.waitFor({ state: "hidden" });
+  await until(() => page.evaluate(id => window.workflow.views.get(id).inputDraft === "synthetic clipboard second line end", clipboardSession), "single-line paste handed to PTY");
+  assert.equal(inputLog(), beforePaste, "paste must not submit the terminal line");
+  await clipboardTerminal.focus();
+  await page.keyboard.press("Enter");
+  await until(() => inputLog().slice(beforePaste.length).replace(/\r\n/g, "\n") === "synthetic clipboard second line end\n", "exactly one submitted line");
+  console.log("PASS native Workflow WebView and provider PTY accept unbracketed multiline paste only as a confirmed single-line draft");
   for (const s of sessions) {
     const models = await api("models", "list", { id: s.id });
     assert(models.some((m) => m.id === "fixture-" + s.provider));
@@ -1667,7 +1696,7 @@ async function test() {
   assert(context.result[0].content.text.includes("beta"));
   const denied = await mcp(s.id, "read_context", { target: sessions[2].id });
   assert(denied.error);
-  const bad = await mcp(s.id, "session_catalog", {}, { token: "bad" });
+  const bad = await mcp(s.id, "session_catalog", {}, { token: randomBytes(24).toString("hex") });
   assert(bad.closed);
   const job = await mcp(s.id, "request_work", {
     target: sessions[1].id,
@@ -1683,6 +1712,10 @@ async function test() {
   const targetInput = page.locator(`[data-id="${targetId}"] .xterm-helper-textarea`);
   const acceptJob = page.getByRole("button", { name: "Kabul et · taslağa ekle", exact: true });
   await targetInput.pressSequentially("Existing draft");
+  await until(() => page.evaluate((id) => {
+    const view = window.workflow.views.get(id);
+    return view.inputDraft === "Existing draft" && !view.hasPendingInput();
+  }, targetId), "queued terminal draft written");
   await acceptJob.click();
   await page.locator("#toast").getByText(/giriş taslağını temizle/).waitFor();
   assert.equal((await api("app", "state")).jobs.find((entry) => entry.id === job.result.id).state, "pending");
@@ -1691,6 +1724,10 @@ async function test() {
     id: job.result.id, decision: "accept", runId: "stale-run",
   }), /Oturum çalıştırması değişti/);
   await targetInput.press("Enter");
+  await until(() => page.evaluate((id) => {
+    const view = window.workflow.views.get(id);
+    return !view.inputDraft && !view.hasPendingInput();
+  }, targetId), "terminal draft submitted before accepting work");
   await acceptJob.click();
   await until(() => page.evaluate(
     (id) => window.workflow.views.get(id).inputDraft.includes("Review the example"), targetId,

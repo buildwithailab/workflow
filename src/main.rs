@@ -2,6 +2,8 @@
 mod accounts;
 mod addons;
 mod browser;
+#[cfg(windows)]
+mod clipboard;
 mod core;
 mod files;
 mod git;
@@ -59,6 +61,12 @@ fn route(core: &Arc<Core>, domain: &str, action: &str, args: &Value) -> Result<V
     match domain {
         "app" => app_action(core, action, args),
         "terminal" => terminal::dispatch(core, action, args),
+        #[cfg(windows)]
+        "clipboard" => {
+            let window = core.app.get_webview_window("main").context("Pencere kapalı")?;
+            let owner = windows::Win32::Foundation::HWND(window.hwnd()?.0 as _);
+            clipboard::dispatch(owner, action, args)
+        }
         "provider_login" => terminal::login(core, action, args),
         "files" => files::dispatch(core, action, args),
         "git" => git::dispatch(core, action, args),

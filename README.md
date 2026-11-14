@@ -117,6 +117,14 @@ Open the **Add-on library** beside **Projects** and install a package. In **New 
 
 ## Local data and session lifetime
 
+### Terminal copy and paste
+
+Paste text from other Windows applications with **Ctrl+V**, **Ctrl+Shift+V**, or **Shift+Insert**. Select terminal text and use **Ctrl+C**, **Ctrl+Shift+C**, or **Ctrl+Insert** to copy it. With no selection, **Ctrl+C** still interrupts the CLI. Right-click opens Copy/Paste; when a CLI captures mouse input, hold **Shift** while right-clicking.
+
+Terminals that enable bracketed paste keep the original line breaks. Otherwise, Workflow asks before replacing line breaks and tabs with spaces. These shortcuts also work in provider sign-in terminals.
+
+### Session storage
+
 Workflow stores projects, session metadata, terminal output, layout, and conversation IDs locally. Closing the app stops its terminals and preview servers. Reopening restores the workspace, and the play button on a session card resumes a verified conversation. The default profile is `%LOCALAPPDATA%\local.workflow.desktop`. Set `WORKFLOW_DATA_DIR` before launch to use a separate profile.
 
 ## Build and test
