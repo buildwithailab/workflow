@@ -11,6 +11,21 @@ use std::{
 };
 mod editor;
 
+pub(crate) fn preview_content(path: &Path, bytes: &[u8]) -> Result<Value> {
+    let mime = match path.extension().and_then(|e| e.to_str()) {
+        Some("png") => Some("image/png"),
+        Some("jpg" | "jpeg") => Some("image/jpeg"),
+        Some("webp") => Some("image/webp"),
+        Some("gif") => Some("image/gif"),
+        _ => None,
+    };
+    if let Some(mime) = mime {
+        Ok(json!({"image":format!("data:{mime};base64,{}",B64.encode(bytes))}))
+    } else {
+        Ok(json!({"text":std::str::from_utf8(bytes).context("İkili dosya önizlenemiyor")?,"hash":hash(bytes)}))
+    }
+}
+
 pub fn store(core: &Core, bytes: &[u8]) -> Result<String> {
     let digest = hash(bytes);
     let p = core.directory.join("objects").join(&digest);
@@ -233,22 +248,7 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             if fs::metadata(&p)?.len() > 5 * 1024 * 1024 {
                 bail!("Önizleme sınırı 5 MB")
             };
-            let bytes = fs::read(&p)?;
-            let ext = p.extension().unwrap_or_default().to_string_lossy();
-            let mime = match ext.as_ref() {
-                "png" => Some("image/png"),
-                "jpg" | "jpeg" => Some("image/jpeg"),
-                "webp" => Some("image/webp"),
-                "gif" => Some("image/gif"),
-                _ => None,
-            };
-            if let Some(mime) = mime {
-                Ok(json!({"image":format!("data:{mime};base64,{}",B64.encode(&bytes))}))
-            } else {
-                Ok(
-                    json!({"text":std::str::from_utf8(&bytes).context("İkili dosya önizlenemiyor")?,"hash":hash(&bytes)}),
-                )
-            }
+            preview_content(&p, &fs::read(&p)?)
         }
         "edit_read" => editor::read(core, args),
         "edit_save" => editor::save(core, args),

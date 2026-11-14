@@ -743,16 +743,11 @@ async function test() {
     projectId: gp.id, path: ".git/config",
   }), /düzenlenemiyor/);
   console.log("PASS project file editor, Ctrl+S, UTF-8 BOM and CRLF, draft and external edit protection");
-  const addonRoot = path.join(data, "addons/openspec"),
-    skillsRoot = path.join(addonRoot, "template/.agents/skills/test-review");
-  fs.mkdirSync(skillsRoot, { recursive: true });
-  fs.writeFileSync(
-    path.join(skillsRoot, "SKILL.md"),
-    "---\nname: test-review\ndescription: Fixture review\n---\nReview the example.\n",
-  );
+  const addonRoot = path.join(data, "addons/ponytail");
+  fs.mkdirSync(addonRoot, { recursive: true });
   fs.writeFileSync(
     path.join(addonRoot, "manifest.json"),
-    JSON.stringify({ version: "test", skills: path.dirname(skillsRoot) }),
+    JSON.stringify({ version: "test" }),
   );
   const sessions = [];
   for (const provider of ["codex", "claude", "copilot"]) {
@@ -1062,37 +1057,63 @@ async function test() {
     projectId: p.id,
     provider: "codex",
     name: "Addon test",
-    addons: ["openspec"],
+    addons: ["ponytail"],
   });
-  const addonRun = await api("terminal", "start", { id: addonSession.id });
-  await until(
-    () =>
-      fs.existsSync(
-        path.join(
-          addonSession.directory,
-          ".agents/skills/test-review/SKILL.md",
-        ),
-      ),
-    "session addon",
-  );
-  await api("terminal", "stop", { id: addonSession.id, runId: addonRun.runId });
-  await until(
-    async () =>
-      !(await api("app", "state")).active.some((s) => s.id === addonSession.id),
-    "addon stop",
-  );
+  const warningBackup = path.join(addonSession.directory, "conn.php___");
+  fs.writeFileSync(warningBackup, "private backup fixture\n");
+  await page.evaluate((id) => window.workflow.selectSession(id), addonSession.id);
+  await page.locator('[data-id="' + addonSession.id + '"]')
+    .getByTitle("Aynı konuşmaya devam et", { exact: true }).click();
+  const sharingWarning = page.getByRole("dialog", { name: "Hassas olabilecek proje dosyaları" });
+  await sharingWarning.getByText("conn.php___", { exact: true }).waitFor();
+  assert(!(await sharingWarning.textContent()).includes("private backup fixture"));
+  await sharingWarning.getByRole("button", { name: "Vazgeç", exact: true }).click();
+  await sharingWarning.waitFor({ state: "hidden" });
+  assert(!(await api("app", "state")).active.some((s) => s.id === addonSession.id));
+  fs.unlinkSync(warningBackup);
+  await assert.rejects(api("terminal", "start", { id: addonSession.id }), /doğrulanmış sürüme yükselt/);
+  await assert.rejects(api("addons", "install", { id: "ponytail", revision: "old" }), /kütüphaneden onayla/);
+  const ponytail = (await api("addons", "list")).find((a) => a.id === "ponytail");
+  assert.equal(ponytail.installed, false);
+  assert.equal(ponytail.command, null);
+  assert(ponytail.files.includes("ponytail-review/SKILL.md"));
+  await page.locator("#addons").click();
+  await dialog.getByRole("button", { name: "Yükselt", exact: true }).click();
+  await dialog.getByText("ponytail-review/SKILL.md", { exact: true }).waitFor();
+  await dialog.getByRole("button", { name: "Vazgeç", exact: true }).click();
+  assert(!fs.existsSync(path.join(addonRoot, "verified.json")));
+  if (process.env.WORKFLOW_TEST_ADDON_DOWNLOADS === "1") {
+    await api("addons", "install", { id: "ponytail", revision: ponytail.revision });
+    const record = JSON.parse(fs.readFileSync(path.join(addonRoot, "verified.json"), "utf8"));
+    const cached = path.join(addonRoot, record.generation, "skills/ponytail/SKILL.md");
+    const original = fs.readFileSync(cached);
+    fs.appendFileSync(cached, "\nTampered fixture\n");
+    await assert.rejects(api("terminal", "start", { id: addonSession.id }), /bütünlük denetimi/);
+    fs.writeFileSync(cached, original);
+    const addonRun = await api("terminal", "start", { id: addonSession.id });
+    assert(fs.existsSync(path.join(addonSession.directory, ".agents/skills/ponytail/SKILL.md")));
+    await api("terminal", "stop", { id: addonSession.id, runId: addonRun.runId });
+    await until(async () => !(await api("app", "state")).active.some((s) => s.id === addonSession.id), "addon stop");
+    const openspec = (await api("addons", "list")).find((a) => a.id === "openspec");
+    await api("addons", "install", { id: "openspec", revision: openspec.revision });
+    await api("addons", "select", { id: addonSession.id, addons: ["openspec"] });
+    const specRun = await api("terminal", "start", { id: addonSession.id });
+    assert(fs.existsSync(path.join(addonSession.directory, ".agents/skills/openspec-propose/SKILL.md")));
+    await api("terminal", "stop", { id: addonSession.id, runId: specRun.runId });
+    await until(async () => !(await api("app", "state")).active.some((s) => s.id === addonSession.id), "openspec stop");
+  }
   await api("addons", "select", { id: addonSession.id, addons: [] });
   const restartAddon = await api("terminal", "start", { id: addonSession.id });
   assert(
     !fs.existsSync(
-      path.join(addonSession.directory, ".agents/skills/test-review/SKILL.md"),
+      path.join(addonSession.directory, ".agents/skills/openspec-propose/SKILL.md"),
     ),
   );
   await api("terminal", "stop", {
     id: addonSession.id,
     runId: restartAddon.runId,
   });
-  console.log("PASS addon enabled and disabled within one isolated session");
+  console.log("PASS addon review, explicit revision, legacy upgrade and optional pinned download checks");
   const s = sessions[0],
     working = path.join(s.directory, "sample.txt");
   fs.writeFileSync(working, "alpha\nchanged\n");
@@ -1694,6 +1715,26 @@ async function test() {
     paths: ["sample.txt"],
   });
   assert(context.result[0].content.text.includes("beta"));
+  const shareRoot = sessions[1].directory;
+  const credentialFixture = randomBytes(16).toString("hex");
+  fs.writeFileSync(path.join(project, ".workflowignore"), "/private-note.txt\n");
+  fs.writeFileSync(path.join(shareRoot, "private-note.txt"), "ignored fixture\n");
+  fs.writeFileSync(path.join(shareRoot, "conn.php___"), "backup fixture\n");
+  fs.writeFileSync(path.join(shareRoot, "sample.conf"), "$password = '" + credentialFixture + "';\n");
+  const warning = await api("app", "sharing_warnings", { sessionId: sessions[1].id });
+  assert.deepEqual(warning.files, ["conn.php___", "sample.conf"]);
+  assert(!JSON.stringify(warning).includes(credentialFixture));
+  for (const name of ["private-note.txt", "conn.php___", "sample.conf"]) {
+    const result = await mcp(s.id, "read_files", { target: sessions[1].id, paths: ["sample.txt", name] });
+    assert(result.error && !result.result);
+    assert(!JSON.stringify(result).includes(credentialFixture));
+  }
+  const visibleChanges = await mcp(s.id, "read_files", { target: sessions[1].id });
+  assert(!visibleChanges.result.some((change) => ["private-note.txt", "conn.php___", "sample.conf"].includes(change.path)));
+  for (const name of ["private-note.txt", "conn.php___", "sample.conf"])
+    fs.unlinkSync(path.join(shareRoot, name));
+  fs.unlinkSync(path.join(project, ".workflowignore"));
+  console.log("PASS MCP denies protected paths and credential content, and local scan returns filenames only");
   const denied = await mcp(s.id, "read_context", { target: sessions[2].id });
   assert(denied.error);
   const bad = await mcp(s.id, "session_catalog", {}, { token: randomBytes(24).toString("hex") });

@@ -12,6 +12,7 @@ mod mcp;
 mod models;
 #[cfg(windows)]
 mod preview;
+mod sharing;
 #[cfg(windows)]
 mod teams;
 mod terminal;
@@ -81,6 +82,7 @@ fn route(core: &Arc<Core>, domain: &str, action: &str, args: &Value) -> Result<V
 fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
     match action {
         "state" => Ok(core.snapshot()),
+        "sharing_warnings" => Ok(serde_json::to_value(sharing::warnings(&core.root(args)?)?)?),
         "notify" => {
             use tauri_plugin_notification::NotificationExt;
             let sid = string(args, "id")?;

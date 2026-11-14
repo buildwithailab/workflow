@@ -309,6 +309,19 @@ pub fn start(core: &Arc<Core>, session_id: &str) -> Result<Value> {
     } else if tools {
         args.extend(tool_args);
     }
+    let openspec_path = if session["workspaceKind"] != "direct" && session["addons"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|v| v == "openspec"))
+    {
+        let bin = crate::addons::openspec_directory(core)?;
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        Some(std::env::join_paths(paths)?)
+    } else {
+        None
+    };
     crate::addons::prepare(core, &session)?;
     let mut cmd = command(&exe, &args);
     profile.apply_pty(&mut cmd);
@@ -316,16 +329,8 @@ pub fn start(core: &Arc<Core>, session_id: &str) -> Result<Value> {
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("TERM_PROGRAM", "workflow");
-    if session["addons"]
-        .as_array()
-        .is_some_and(|a| a.iter().any(|v| v == "openspec"))
-    {
-        let bin = core.directory.join("addons/openspec/node_modules/.bin");
-        let mut paths = vec![bin];
-        paths.extend(std::env::split_paths(
-            &std::env::var_os("PATH").unwrap_or_default(),
-        ));
-        cmd.env("PATH", std::env::join_paths(paths)?);
+    if let Some(path) = openspec_path {
+        cmd.env("PATH", path);
     }
     let folder = core.directory.join("transcripts");
     fs::create_dir_all(&folder)?;

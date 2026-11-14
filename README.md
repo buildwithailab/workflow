@@ -96,6 +96,10 @@ For checks in Chrome, Workflow can open a tab in a dedicated Chrome profile.
 | **Providers** | Choose a CLI account per session and view the usage limits each provider reports |
 | **Add-ons** | Install supported skill packages from the Add-on Library and enable them per isolated session. The current catalog includes [OpenSpec](https://github.com/Fission-AI/OpenSpec) and [Ponytail](https://github.com/DietrichGebert/ponytail). |
 
+The Add-on Library previews the pinned version, installed skill files, and any setup command before installation. Workflow verifies the Windows x64 OpenSpec download before running its initializer, and verifies each skill from the pinned Ponytail revision. Existing installations can be upgraded from the library.
+
+Workflow MCP checks the target project's and session workspace's `.workflowignore` rules before sharing a file. It also blocks common sensitive filenames and detected credentials. The local warning before opening a session shows paths only. A provider's own shell and file tools follow that provider's access settings.
+
 Choose **Current folder and branch** to work directly in the project. Choose **Separate workspace** to work in a Git worktree when the project has an initial commit, or a folder copy otherwise. Workflow also supports projects without Git.
 
 ## Use add-ons in selected sessions

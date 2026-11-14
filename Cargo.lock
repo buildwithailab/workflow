@@ -5190,6 +5190,7 @@ dependencies = [
  "dunce",
  "ignore",
  "portable-pty",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

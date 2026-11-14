@@ -1184,6 +1184,38 @@ async function conversationFromLogin(id) {
   await sync();
   await toggleTerminal(id);
 }
+function confirmSharingWarnings({ files, truncated }) {
+  if (!files.length) return Promise.resolve(true);
+  const dialog = el("dialog");
+  const title = el("h2", "", tr("Hassas olabilecek proje dosyaları"));
+  title.id = "sharing-warning-title";
+  dialog.setAttribute("aria-labelledby", title.id);
+  const header = el("header", "dialog-header");
+  header.append(title);
+  const body = el("div", "dialog-body");
+  body.append(el("p", "help", tr("Bu dosyalar kimlik bilgileri içerebilir. Sağlayıcı kendi araçlarıyla çalışma alanındaki dosyalara erişebilir.")));
+  if (files.length) {
+    const list = el("ul");
+    for (const file of files) list.append(el("li", "", file));
+    body.append(list);
+  }
+  if (truncated) body.append(el("p", "help", tr("Tarama sınırlıydı. Listelenmeyen dosyalar olabilir.")));
+  const footer = el("footer", "dialog-footer");
+  const cancel = button(tr("Vazgeç"), () => dialog.close());
+  cancel.autofocus = true;
+  footer.append(cancel, button(tr("Devam et"), () => dialog.close("continue"), "primary"));
+  dialog.append(header, body, footer);
+  document.body.append(dialog);
+  hideBrowser();
+  return new Promise((resolve) => {
+    dialog.addEventListener("close", () => {
+      dialog.remove();
+      scheduleViewport();
+      resolve(dialog.returnValue === "continue");
+    }, { once: true });
+    dialog.showModal();
+  });
+}
 async function toggleTerminal(id) {
   if (starting.has(id)) return;
   if (active(id)) {
@@ -1194,6 +1226,10 @@ async function toggleTerminal(id) {
   starting.add(id);
   renderCards();
   try {
+    if (!session(id)?.login) {
+      const warnings = await api("app", "sharing_warnings", { sessionId: id });
+      if (!await confirmSharingWarnings(warnings)) return;
+    }
     const snapshot = await api("terminal", "start", { id });
     await sync();
     const v = views.get(id);
@@ -2113,21 +2149,13 @@ async function addonLibrary() {
     const row = el("div", "provider-card");
     row.style.marginBottom = "12px";
     row.append(el("h3", "", a.name), el("p", "help", tMessage(a.description)));
+    row.append(el("p", "help", a.previousVersion && !a.installed
+      ? tr("Kurulu {previous} → doğrulanmış {version}", { previous: a.previousVersion.slice(0, 12), version: a.version })
+      : tr("Sürüm {version}", { version: a.version })));
     row.append(
       button(
-        a.installed ? tr("Kurulu · Yeniden kur") : tr("Kur"),
-        async (e) => {
-          const b = e.currentTarget;
-          b.disabled = true;
-          b.textContent = tr("Kuruluyor…");
-          try {
-            await api("addons", "install", { id: a.id });
-            b.textContent = tr("Kuruldu");
-            toast(a.name + tr(" kütüphaneye kuruldu"));
-          } finally {
-            b.disabled = false;
-          }
-        },
+        a.installed ? tr("Kurulu · Yeniden kur") : a.previousVersion ? tr("Yükselt") : tr("Kur"),
+        () => reviewAddonInstall(a),
         "primary",
       ),
     );
@@ -2137,10 +2165,43 @@ async function addonLibrary() {
     el(
       "p",
       "help",
-      tr("Kurmak tüm oturumlarda etkinleştirmez. Oturum oluştururken veya oturumun ⋯ menüsündeki Eklentiler bölümünden seç. OpenSpec’in kendi CLI’sı için bilgisayardaki Node.js/npm kullanılır."),
+      tr("Eklentileri oturum oluştururken veya oturumun ⋯ menüsünden etkinleştir."),
     ),
   );
   modal(tr("Eklenti kütüphanesi"), box);
+}
+function reviewAddonInstall(addon) {
+  const box = el("div");
+  box.append(el("p", "help", tr("Sürüm {version}", { version: addon.version })));
+  const source = button(tr("Sürüm kaynağını aç"), () => api("app", "external", { url: addon.source }), "quiet");
+  box.append(source, el("h3", "", tr("Oturuma eklenen dosyalar")));
+  const list = el("ul");
+  for (const file of addon.files) list.append(el("li", "", file));
+  box.append(list);
+  if (addon.command) {
+    box.append(el("p", "help", tr("Kurulum, özeti doğrulanan Windows programını geçici çalışma alanında çalıştırır.")));
+    box.append(el("code", "", addon.command));
+  } else {
+    box.append(el("p", "help", tr("Kurulum yalnızca doğrulanmış beceri belgelerini indirir.")));
+  }
+  if (addon.previousVersion && !addon.installed) {
+    box.append(el("p", "help", tr("Bu sürüm kütüphanedeki eski sürümün yerini alır. Etkin oturumlar yeni dosyaları yeniden açıldığında alır.")));
+    if (addon.changedFiles?.length) {
+      box.append(el("h3", "", tr("Sürümde değişen dosyalar")));
+      const changes = el("ul");
+      const labels = { added: "Eklendi", modified: "Değişti", removed: "Kaldırıldı" };
+      for (const change of addon.changedFiles)
+        changes.append(el("li", "", change.file + " · " + tr(labels[change.status])));
+      box.append(changes);
+    } else if (!addon.changedFiles) {
+      box.append(el("p", "help", tr("Eski kurulumun doğrulanmış dosya kaydı yok.")));
+    }
+  }
+  closeModal();
+  modal(addon.name, box, async () => {
+    await api("addons", "install", { id: addon.id, revision: addon.revision });
+    toast(addon.name + tr(" kütüphaneye kuruldu"));
+  }, addon.previousVersion && !addon.installed ? tr("Yükselt") : tr("Kur"));
 }
 async function sessionAddons(id) {
   const s = session(id),

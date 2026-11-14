@@ -60,7 +60,7 @@ pub fn safe_path(root: &Path, rel: &str) -> Result<PathBuf> {
     for component in p.components() {
         at.push(component);
         match fs::symlink_metadata(&at) {
-            Ok(m) if m.file_type().is_symlink() => {
+            Ok(m) if is_link(&m) => {
                 bail!("Bağlantılı dosyalar bu işlemde desteklenmiyor")
             }
             Ok(_) => {
@@ -77,6 +77,16 @@ pub fn safe_path(root: &Path, rel: &str) -> Result<PathBuf> {
         }
     }
     Ok(at)
+}
+pub(crate) fn is_link(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0;
+    }
+    #[cfg(not(windows))]
+    metadata.file_type().is_symlink()
 }
 pub fn read_optional(p: &Path) -> Result<Option<Vec<u8>>> {
     match fs::read(p) {

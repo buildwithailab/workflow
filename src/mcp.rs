@@ -19,7 +19,7 @@ fn tools() -> Value {
         {"name":"browser_assert","description":"Verify browser text or URL and record a passed/failed test step. Checks: text_contains, text_absent, url_contains. Supply a short human-readable label without credentials or personal data. Failure captures a screenshot when possible.","inputSchema":object(json!({"pageId":{"type":"string"},"check":{"type":"string","enum":["text_contains","text_absent","url_contains"]},"expected":{"type":"string"},"label":{"type":"string"},"timeoutMs":{"type":"integer","minimum":0,"maximum":8000}}),vec!["check","expected"])},
         {"name":"session_catalog","description":"List only sessions explicitly connected to this session, with permissions.","inputSchema":object(json!({}),vec![])},
         {"name":"read_context","description":"Read a connected session conversation, without starting a provider or sending terminal input.","inputSchema":object(json!({"target":{"type":"string"}}),vec!["target"])},
-        {"name":"read_files","description":"Read files from a connected session with file permission. If paths is omitted, list changed files.","inputSchema":object(json!({"target":{"type":"string"},"paths":{"type":"array","items":{"type":"string"}}}),vec!["target"])},
+        {"name":"read_files","description":"Read shareable files from a connected session with file permission. If paths is omitted, list shareable changed files. Workflow excludes ignored files and likely credentials.","inputSchema":object(json!({"target":{"type":"string"},"paths":{"type":"array","items":{"type":"string"}}}),vec!["target"])},
         {"name":"request_work","description":"Request work from a connected existing session with delegation permission. The user accepts it in Workflow; connecting sessions never starts jobs by itself. No new agent is spawned.","inputSchema":object(json!({"target":{"type":"string"},"instruction":{"type":"string"}}),vec!["target","instruction"])},
         {"name":"read_result","description":"Read the status or result of a work request created by this session.","inputSchema":object(json!({"requestId":{"type":"string"}}),vec!["requestId"])},
         {"name":"report_result","description":"Return the outcome of a work request addressed to this session.","inputSchema":object(json!({"requestId":{"type":"string"},"result":{"type":"string"}}),vec!["requestId","result"])}
@@ -330,17 +330,49 @@ async fn call(core: &Arc<Core>, source: &str, method: &str, mut args: Value) -> 
         "read_files" => {
             let target = string(&args, "target")?;
             link(core, source, target, "files")?;
-            if let Some(paths) = args["paths"].as_array() {
+            let scope = json!({"sessionId":target});
+            let root = core.root(&scope)?;
+            let project = core.root(&json!({"projectId":core.session(target)?["projectId"]}))?.canonicalize()?;
+            if let Some(paths) = args.get("paths") {
+                let paths = paths.as_array().context("Dosya yolları liste olmalı")?;
                 if paths.len() > 20 {
                     bail!("Tek istekte en fazla 20 dosya")
                 };
                 let mut out = vec![];
+                let mut bytes_read = 0;
                 for path in paths {
-                    out.push(json!({"path":path,"content":files::dispatch(core,"read",&json!({"sessionId":target,"path":path}))?}));
+                    let relative = path.as_str().context("Dosya yolu metin olmalı")?;
+                    let bytes = crate::sharing::read_shared(&root, &project, relative)?;
+                    bytes_read += bytes.len();
+                    if bytes_read > crate::sharing::BATCH_LIMIT {
+                        bail!("Tek istekte en fazla 20 MB dosya paylaşılabilir")
+                    }
+                    out.push(json!({"path":relative,"content":files::preview_content(std::path::Path::new(relative), &bytes)?}));
                 }
                 Ok(json!(out))
             } else {
-                files::list_changes(core, &json!({"sessionId":target}))
+                let Value::Array(changes) = files::list_changes(core, &scope)? else {
+                    bail!("Geçersiz değişiklik listesi")
+                };
+                let root = root.canonicalize()?;
+                let mut visible = Vec::new();
+                for change in changes {
+                    let relative = string(&change, "path")?;
+                    if crate::sharing::project_path_blocked(&root, &project, std::path::Path::new(relative))? {
+                        continue;
+                    }
+                    // A renamed or deleted file may still have a sensitive baseline.
+                    if let Some(before) = change["before"].as_str() {
+                        if !crate::sharing::safe_baseline(core, before).unwrap_or(false) {
+                            continue;
+                        }
+                    }
+                    if change["after"].is_string() && crate::sharing::read_shared(&root, &project, relative).is_err() {
+                        continue;
+                    }
+                    visible.push(change);
+                }
+                Ok(json!(visible))
             }
         }
         "request_work" => {
