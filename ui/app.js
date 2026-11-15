@@ -1287,21 +1287,23 @@ async function conversationFromLogin(id) {
   await toggleTerminal(id);
 }
 function confirmSharingWarnings({ files, truncated }) {
-  if (!files.length) return Promise.resolve(true);
+  if (!files.length && !truncated) return Promise.resolve(true);
   const dialog = el("dialog");
-  const title = el("h2", "", tr("Hassas olabilecek proje dosyaları"));
+  const title = el("h2", "", tr(files.length ? "Hassas olabilecek proje dosyaları" : "Dosya taraması eksik kaldı"));
   title.id = "sharing-warning-title";
   dialog.setAttribute("aria-labelledby", title.id);
   const header = el("header", "dialog-header");
   header.append(title);
   const body = el("div", "dialog-body");
-  body.append(el("p", "help", tr("Bu dosyalar kimlik bilgileri içerebilir. Sağlayıcı kendi araçlarıyla çalışma alanındaki dosyalara erişebilir.")));
   if (files.length) {
+    body.append(el("p", "help", tr("Bu dosyalar kimlik bilgileri içerebilir. Sağlayıcı kendi araçlarıyla çalışma alanındaki dosyalara erişebilir.")));
     const list = el("ul");
     for (const file of files) list.append(el("li", "", file));
     body.append(list);
+  } else {
+    body.append(el("p", "help", tr("Taranan kısımda hassas olabilecek dosya bulunmadı.")));
   }
-  if (truncated) body.append(el("p", "help", tr("Tarama sınırlıydı. Listelenmeyen dosyalar olabilir.")));
+  if (truncated) body.append(el("p", "help", tr("Bazı dosyalar tam olarak taranamadı.")));
   const footer = el("footer", "dialog-footer");
   const cancel = button(tr("Vazgeç"), () => dialog.close());
   cancel.autofocus = true;

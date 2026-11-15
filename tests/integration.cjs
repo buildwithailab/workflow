@@ -1099,8 +1099,9 @@ async function test() {
   const warningBackup = path.join(addonSession.directory, "conn.php___");
   fs.writeFileSync(warningBackup, "private backup fixture\n");
   await page.evaluate((id) => window.workflow.selectSession(id), addonSession.id);
-  await page.locator('[data-id="' + addonSession.id + '"]')
-    .getByTitle("Aynı konuşmaya devam et", { exact: true }).click();
+  const startAddon = page.locator('[data-id="' + addonSession.id + '"]')
+    .getByTitle("Aynı konuşmaya devam et", { exact: true });
+  await startAddon.click();
   const sharingWarning = page.getByRole("dialog", { name: "Hassas olabilecek proje dosyaları" });
   await sharingWarning.getByText("conn.php___", { exact: true }).waitFor();
   assert(!(await sharingWarning.textContent()).includes("private backup fixture"));
@@ -1108,6 +1109,19 @@ async function test() {
   await sharingWarning.waitFor({ state: "hidden" });
   assert(!(await api("app", "state")).active.some((s) => s.id === addonSession.id));
   fs.unlinkSync(warningBackup);
+  const largeScanFile = path.join(addonSession.directory, "large-scan-fixture.txt");
+  fs.writeFileSync(largeScanFile, Buffer.alloc(64 * 1024, "a"));
+  assert.deepEqual(await api("app", "sharing_warnings", { sessionId: addonSession.id }), {
+    files: [],
+    truncated: true,
+  });
+  await startAddon.click();
+  const partialWarning = page.getByRole("dialog", { name: "Dosya taraması eksik kaldı" });
+  await partialWarning.getByText("Taranan kısımda hassas olabilecek dosya bulunmadı.", { exact: true }).waitFor();
+  await partialWarning.getByText("Bazı dosyalar tam olarak taranamadı.", { exact: true }).waitFor();
+  await partialWarning.getByRole("button", { name: "Vazgeç", exact: true }).click();
+  await partialWarning.waitFor({ state: "hidden" });
+  assert(!(await api("app", "state")).active.some((s) => s.id === addonSession.id));
   await assert.rejects(api("terminal", "start", { id: addonSession.id }), /doğrulanmış sürüme yükselt/);
   await assert.rejects(api("addons", "install", { id: "ponytail", revision: "old" }), /kütüphaneden onayla/);
   const ponytail = (await api("addons", "list")).find((a) => a.id === "ponytail");
@@ -1140,7 +1154,13 @@ async function test() {
     await until(async () => !(await api("app", "state")).active.some((s) => s.id === addonSession.id), "openspec stop");
   }
   await api("addons", "select", { id: addonSession.id, addons: [] });
-  const restartAddon = await api("terminal", "start", { id: addonSession.id });
+  await startAddon.click();
+  await partialWarning.getByRole("button", { name: "Devam et", exact: true }).click();
+  const restartAddon = await until(
+    async () => (await api("app", "state")).active.find((s) => s.id === addonSession.id),
+    "session starts after accepting an incomplete scan",
+  );
+  fs.unlinkSync(largeScanFile);
   assert(
     !fs.existsSync(
       path.join(addonSession.directory, ".agents/skills/openspec-propose/SKILL.md"),
@@ -1150,6 +1170,7 @@ async function test() {
     id: addonSession.id,
     runId: restartAddon.runId,
   });
+  console.log("PASS incomplete local scan with no findings warns before cancelling or continuing");
   console.log("PASS addon review, explicit revision, legacy upgrade and optional pinned download checks");
   const s = sessions[0],
     working = path.join(s.directory, "sample.txt");
