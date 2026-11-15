@@ -378,16 +378,67 @@ body.no-left .sidebar {
 }
 .sidebar-actions {
   display: flex;
-  gap: 7px;
   margin-bottom: 10px;
 }
-.sidebar-actions .primary {
+.sidebar-actions > button {
+  height: 42px;
+}
+.sidebar-actions > button:hover,
+#session-templates:has(+ :popover-open) {
+  background: #cef2aa;
+}
+.sidebar-actions > button:focus-visible {
+  outline: 2px solid #30432a;
+  outline-offset: -4px;
+}
+#new-session {
   flex: 1;
-  padding: 11px;
+  min-width: 0;
+  padding-inline: 8px;
+  border-radius: 7px 0 0 7px;
 }
 #session-templates {
+  width: 38px;
+  border-left-color: #8caa70;
+  border-radius: 0 7px 7px 0;
+}
+#session-templates svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+#session-template-menu {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  padding: 5px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--raised);
+  color: var(--text);
+  box-shadow: 0 8px 24px #0007;
+  overflow-y: auto;
+}
+#session-template-menu button {
+  display: block;
   width: 100%;
-  margin-bottom: 10px;
+  border-color: transparent;
+  padding: 8px;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#session-template-items:not(:empty) + #manage-session-templates {
+  margin-top: 4px;
+  border-top-color: var(--line);
+  border-radius: 0 0 6px 6px;
+}
+#session-template-items p {
+  padding: 8px;
 }
 #provider-count {
   font-variant-numeric: tabular-nums;
@@ -655,11 +706,23 @@ body.no-left .sidebar {
   background: #34404b;
   color: var(--accent);
 }
+#providers-section {
+  margin-bottom: 18px;
+}
+.provider-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 6px;
+}
+.provider-toolbar button:hover {
+  background: var(--raised);
+  border-color: var(--line);
+  color: var(--text);
+}
 #provider-cards {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
-  margin: 0 0 18px;
 }
 .provider-card {
   padding: 12px;

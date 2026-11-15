@@ -21,11 +21,23 @@
             <strong>workflow</strong><small>YOUR AGENTS, CONNECTED</small>
           </span>
         </button>
-        <div class="sidebar-actions">
-          <button class="primary" id="new-session">+ Yeni oturum</button
-          ><button class="icon" id="refresh" title="Yenile">↻</button>
+        <div class="sidebar-actions" role="group" aria-label="Oturum oluşturma">
+          <button class="primary" id="new-session" type="button">+ Yeni oturum</button>
+          <button
+            class="primary icon"
+            id="session-templates"
+            type="button"
+            title="Şablondan başlat"
+            aria-label="Şablondan başlat"
+            popovertarget="session-template-menu"
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
+          </button>
+          <div id="session-template-menu" popover role="group" aria-label="İş akışı şablonları">
+            <div id="session-template-items"></div>
+            <button id="manage-session-templates" type="button">Şablonları yönet</button>
+          </div>
         </div>
-        <button id="session-templates">Şablondan başlat</button>
         <div class="teams-control" data-state="disconnected">
           <span class="teams-icon" aria-hidden="true">
             <svg viewBox="0 0 24 24">
@@ -80,6 +92,8 @@
             id="show-providers"
             title="Sağlayıcıları göster/gizle"
             aria-label="Sağlayıcılar"
+            aria-controls="providers-section"
+            aria-expanded="false"
           >
             <span>Sağlayıcılar</span><span class="badge" id="provider-count">0/3</span>
           </button>
@@ -103,7 +117,12 @@
             </button>
           </div>
         </div>
-        <section id="provider-cards" hidden></section>
+        <section id="providers-section" aria-label="Sağlayıcılar" hidden>
+          <div class="provider-toolbar">
+            <button id="refresh" class="quiet" type="button">Çalışma alanını yenile</button>
+          </div>
+          <div id="provider-cards"></div>
+        </section>
         <div id="viewport">
           <div class="canvas-hint">
             Boş alandan sürükle · Ctrl + tekerlek ile yakınlaştır

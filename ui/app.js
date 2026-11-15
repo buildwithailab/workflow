@@ -705,13 +705,13 @@ async function refreshProviderUsage(id, accountId = defaultAccount) {
     renderProviderCards();
     if (
       providerInfo(id)?.executable !== executable &&
-      !$("#provider-cards").hidden
+      !$("#providers-section").hidden
     )
       refreshProviderUsage(id, accountId);
   }
 }
 async function refreshProviderUsageAll() {
-  if (!$("#provider-cards").hidden)
+  if (!$("#providers-section").hidden)
     await Promise.allSettled(providers.flatMap((p) =>
       p.accounts.map((account) => refreshProviderUsage(p.id, account.id)),
     ));
@@ -1869,7 +1869,7 @@ function remember() {
       panel,
       noLeft: document.body.classList.contains("no-left"),
       noRight: document.body.classList.contains("no-right"),
-      showProviders: !$("#provider-cards").hidden,
+      showProviders: !$("#providers-section").hidden,
     }),
   );
 }
@@ -2495,12 +2495,15 @@ function editTemplate(entry, projectId, destinationId) {
   name.focus();
 }
 
+function templateTitle(entry) {
+  const builtInTitles = { "builtin:0": "Kod + İnceleme", "builtin:1": "Özellik geliştirme", "builtin:2": "Hata ayıklama" };
+  return uiLanguage === "tr" && Object.hasOwn(builtInTitles, entry.id)
+    ? builtInTitles[entry.id] : entry.template.name;
+}
+
 async function openTemplates(selectedId, destinationId = projectId) {
   const entries = await api("templates", "list");
-  const title = (entry) => entry.id.startsWith("builtin:") && uiLanguage === "tr"
-    ? ["Kod + İnceleme", "Özellik geliştirme", "Hata ayıklama"][Number(entry.id.slice(8))]
-    : entry.template.name;
-  const templateSelect = select(entries.map((entry) => ({ id: entry.id, label: title(entry) })), selectedId);
+  const templateSelect = select(entries.map((entry) => ({ id: entry.id, label: templateTitle(entry) })), selectedId);
   const projects = db.projects.filter((p) => !p.removed);
   const destination = select(projects.map((p) => ({ id: p.id, label: p.name })), destinationId);
   const content = el("div", "setup-content");
@@ -2596,7 +2599,46 @@ async function openTemplates(selectedId, destinationId = projectId) {
 }
 
 $("#new-session").onclick = () => newSession().catch(error);
-$("#session-templates").onclick = () => openTemplates().catch(error);
+const templateMenu = $("#session-template-menu");
+const templateItems = $("#session-template-items");
+function positionTemplateMenu() {
+  const { left, bottom, width } = $(".sidebar-actions").getBoundingClientRect();
+  const top = bottom + 5;
+  templateMenu.style.left = left + "px";
+  templateMenu.style.top = top + "px";
+  templateMenu.style.width = width + "px";
+  templateMenu.style.maxHeight = Math.min(280, innerHeight - top - 8) + "px";
+}
+templateMenu.addEventListener("beforetoggle", (event) => {
+  if (event.newState === "open") positionTemplateMenu();
+});
+templateMenu.addEventListener("toggle", async (event) => {
+  if (event.newState !== "open") return;
+  const loading = el("p", "muted", tr("Yükleniyor…"));
+  templateItems.replaceChildren(loading);
+  try {
+    const entries = await api("templates", "list");
+    if (loading.parentElement !== templateItems) return;
+    templateItems.replaceChildren(...entries.map((entry) => {
+      const label = templateTitle(entry);
+      const item = button(label, () => {
+        templateMenu.hidePopover();
+        return openTemplates(entry.id);
+      }, "", label);
+      item.dataset.templateId = entry.id;
+      return item;
+    }));
+  } catch (e) {
+    if (loading.parentElement === templateItems) {
+      loading.remove();
+      error(e);
+    }
+  }
+});
+$("#manage-session-templates").onclick = () => {
+  templateMenu.hidePopover();
+  openTemplates().catch(error);
+};
 $("#add-project").onclick = () => newProject().catch(error);
 $("#addons").onclick = () => addonLibrary().catch(error);
 $("#archive").onclick = () => archiveList().catch(error);
@@ -2606,8 +2648,9 @@ $("#refresh").onclick = busy($("#refresh"), async () => {
   await refreshPanel();
 });
 $("#show-providers").onclick = () => {
-  $("#provider-cards").hidden = !$("#provider-cards").hidden;
-  $("#show-providers").setAttribute("aria-expanded", String(!$("#provider-cards").hidden));
+  const section = $("#providers-section");
+  section.hidden = !section.hidden;
+  $("#show-providers").setAttribute("aria-expanded", String(!section.hidden));
   remember();
   refreshProviderUsageAll().catch(() => {});
   fitTerminals();
@@ -4338,7 +4381,7 @@ async function initialize() {
       panel = saved.panel || "browser";
       document.body.classList.toggle("no-left", !!saved.noLeft);
       document.body.classList.toggle("no-right", !!saved.noRight);
-      $("#provider-cards").hidden = !saved.showProviders;
+      $("#providers-section").hidden = !saved.showProviders;
     }
     const widths = JSON.parse(
       localStorage.getItem("agentloom-widths") || "null",
@@ -4407,7 +4450,7 @@ async function initialize() {
   await scanProviders();
   setMode(mode);
   await openPanel(panel, false);
-  $("#show-providers").setAttribute("aria-expanded", String(!$("#provider-cards").hidden));
+  $("#show-providers").setAttribute("aria-expanded", String(!$("#providers-section").hidden));
   const connected = providers.some((p) => p.installed && p.accounts.some(isConnected));
   if (!connected && !db.sessions.length && !localStorage.getItem("workflow-setup-seen")) {
     await Promise.allSettled(providers.filter((p) => p.installed)
@@ -4416,6 +4459,7 @@ async function initialize() {
     if (!providers.some((p) => p.installed && p.accounts.some(isConnected))) await openProviderSetup();
   }
   window.addEventListener("resize", () => {
+    if (templateMenu.matches(":popover-open")) positionTemplateMenu();
     fitTerminals();
     scheduleViewport();
   });

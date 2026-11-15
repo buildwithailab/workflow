@@ -360,8 +360,20 @@ async function test() {
   };
   assert.equal(await page.evaluate(() => localStorage.getItem("workflow-language")), null);
   await page.getByRole("button", { name: "+ New session", exact: true }).waitFor();
+  await page.locator(".sidebar-actions").getByRole("button", { name: "Start from template" }).waitFor();
+  await page.locator("#show-providers").click();
+  await page.locator("#providers-section").getByRole("button", { name: "Refresh workspace" }).waitFor();
+  await page.locator("#show-providers").click();
   await changeLanguage("tr");
   await page.getByRole("button", { name: "+ Yeni oturum", exact: true }).waitFor();
+  const openTemplateMenu = async () => {
+    await page.locator("#session-templates").click();
+    await page.locator("#session-template-menu").waitFor({ state: "visible" });
+  };
+  const openTemplateManager = async () => {
+    await openTemplateMenu();
+    await page.locator("#manage-session-templates").click();
+  };
   console.log("PASS English on first launch, Turkish available in Settings");
   assert.equal(
     await page
@@ -446,6 +458,29 @@ async function test() {
   assertPanelsFit(await widths());
   assert.equal((await widths()).left, 180);
   assert.equal((await widths()).right, 310);
+  await openTemplateMenu();
+  await page.locator("#session-template-items [data-template-id='builtin:1']").waitFor();
+  assert(await page.evaluate(() => {
+    const primary = document.querySelector("#new-session").getBoundingClientRect();
+    const arrow = document.querySelector("#session-templates").getBoundingClientRect();
+    const menu = document.querySelector("#session-template-menu").getBoundingClientRect();
+    return Math.abs(primary.top - arrow.top) < 1 && Math.abs(primary.height - arrow.height) < 1 &&
+      Math.abs(primary.right - arrow.left) < 1 && Math.abs(menu.left - primary.left) < 1 &&
+      menu.right <= innerWidth && menu.bottom <= innerHeight;
+  }));
+  await page.keyboard.press("Escape");
+  await page.locator("#session-template-menu").waitFor({ state: "hidden" });
+  const workspaceRefresh = page.locator("#providers-section #refresh");
+  const providerToggle = page.locator("#show-providers");
+  assert.equal(await page.locator(".main-header #refresh").count(), 0);
+  await workspaceRefresh.waitFor({ state: "hidden" });
+  await providerToggle.click();
+  await workspaceRefresh.waitFor({ state: "visible" });
+  assert.equal(await workspaceRefresh.innerText(), "Çalışma alanını yenile");
+  await workspaceRefresh.click();
+  await until(() => workspaceRefresh.isEnabled(), "workspace refresh finished");
+  await providerToggle.click();
+  await workspaceRefresh.waitFor({ state: "hidden" });
   const viewportSession = await page.context().newCDPSession(page);
   await viewportSession.send("Emulation.clearDeviceMetricsOverride");
   await viewportSession.detach();
@@ -458,6 +493,7 @@ async function test() {
     "PASS panel width limits, restore, hidden panels and narrow layout",
   );
   await page.locator('#panel-tabs [data-tab="links"]').click();
+  await page.locator(".inspector-header #panel-refresh").click();
   await page.locator("#panel-links").waitFor({ state: "visible" });
   await page.locator('#panel-tabs [data-tab="browser"]').click();
   await page.locator("#show-providers").click();
@@ -2257,16 +2293,22 @@ async function test() {
   fs.mkdirSync(templateProjectPath);
   const templateProject = await api("app", "add_project", { directory: templateProjectPath });
   await page.evaluate((id) => window.workflow.selectProject(id), templateProject.id);
-  await page.locator("#session-templates").click();
+  await page.locator("#new-session").click();
+  await dialog.getByRole("heading", { name: "Yeni oturum", exact: true }).waitFor();
+  assert(!(await page.locator("#session-template-menu").isVisible()));
+  await dialog.getByRole("button", { name: "Vazgeç", exact: true }).click();
+  await openTemplateMenu();
+  await page.locator("#session-template-items [data-template-id='builtin:1']").click();
   await dialog.getByRole("heading", { name: "İş akışı şablonları" }).waitFor();
-  await dialog.getByLabel("Şablon", { exact: true }).selectOption("builtin:1");
+  assert.equal(await dialog.getByLabel("Şablon", { exact: true }).inputValue(), "builtin:1");
   await dialog.getByRole("button", { name: "Oturumları oluştur" }).click();
   await dialog.waitFor({ state: "hidden" });
   const afterTemplate = await api("app", "state");
   const created = afterTemplate.sessions.filter((item) => item.projectId === templateProject.id);
   assert.equal(created.length, 5);
   assert(created.every((item) => item.initialPrompt && item.workspaceKind === "copy"));
-  assert.deepEqual(afterTemplate.active, activeBeforeLanguageChange);
+  const bySession = (runs) => [...runs].sort((a, b) => a.id.localeCompare(b.id));
+  assert.deepEqual(bySession(afterTemplate.active), bySession(activeBeforeLanguageChange));
   const ids = new Set(created.map((item) => item.id));
   assert.equal(afterTemplate.links.filter((link) => ids.has(link.source) && ids.has(link.target)).length, 5);
   const capture = await api("templates", "capture", { projectId: templateProject.id, name: "Reusable map" });
@@ -2278,7 +2320,7 @@ async function test() {
   assert(!exported.includes(created[0].id));
   const imported = await api("templates", "import", { path: exportPath });
   assert.deepEqual(imported.template, capture.template);
-  await page.locator("#session-templates").click();
+  await openTemplateManager();
   const templateChoice = dialog.getByLabel("Şablon", { exact: true });
   const editTemplateButton = dialog.getByRole("button", { name: "Şablonu düzenle" });
   const deleteTemplateButton = dialog.getByRole("button", { name: "Şablonu sil" });
@@ -2398,13 +2440,13 @@ async function test() {
   await setupDialog.getByText(/Anthropic\.ClaudeCode/).waitFor();
   await assert.rejects(api("app", "provider_install", { provider: "claude", method: "winget" }), /önce onayla/);
   await setupDialog.getByRole("button", { name: "Skip", exact: true }).click();
-  await page.locator("#session-templates").click();
+  await openTemplateManager();
   await setupDialog.getByText("Claude Code is not installed. Choose another provider.").waitFor();
   assert.equal(await setupDialog.getByRole("button", { name: "Create sessions" }).isDisabled(), true);
   await stop();
   await start("claude,copilot", setupProfile);
   const alternateProject = await api("app", "add_project", { directory: templateProjectPath });
-  await page.locator("#session-templates").click();
+  await openTemplateManager();
   const alternateDialog = page.locator("#dialog");
   await alternateDialog.getByLabel("Implementation · Separate folder").selectOption("codex");
   await alternateDialog.getByRole("button", { name: "Create sessions" }).click();
