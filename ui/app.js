@@ -365,19 +365,28 @@ function renderProjects() {
       (s) => s.projectId === p.id && !s.archived,
     );
     const open = expanded[p.id] !== false;
-    row.append(
-      button(
-        open ? "⌄" : "›",
-        () => {
-          expanded[p.id] = !open;
-          renderProjects();
-          remember();
-        },
-        "icon quiet",
-      ),
-      el("span", "muted", "▱"),
-      el("span", "project-name", p.name),
-      el("small", "", sessions.length),
+    const expandProject = button("", () => {
+      expanded[p.id] = !open;
+      renderProjects();
+      remember();
+    }, "icon quiet project-expand", tr("Proje oturumları"));
+    expandProject.setAttribute("aria-label", expandProject.title);
+    expandProject.setAttribute("aria-expanded", String(open));
+    const instructions = button(
+      "",
+      () => editProjectInstructions(p),
+      "icon quiet project-rules",
+      tr("Proje talimatları"),
+    );
+    instructions.setAttribute("aria-label", instructions.title);
+    const name = el("span", "project-name", p.name);
+    name.title = p.name;
+    const count = el("small", "project-session-count", sessions.length);
+    count.title = countLabel(sessions.length, "{count} oturum");
+    const actions = el("div", "project-actions");
+    actions.append(
+      count,
+      instructions,
       button(
         "×",
         () => {
@@ -401,6 +410,7 @@ function renderProjects() {
         tr("Projeyi kaldır"),
       ),
     );
+    row.append(expandProject, el("span", "project-folder"), name, actions);
     row.onclick = () => selectProject(p.id);
     item.append(row);
     if (open) {
@@ -425,6 +435,24 @@ function renderProjects() {
     }
     root.append(item);
   }
+}
+async function editProjectInstructions(project) {
+  const saved = await api("app", "project_instructions_read", { projectId: project.id });
+  const editor = el("textarea");
+  editor.value = saved.text;
+  editor.rows = 12;
+  editor.spellcheck = false;
+  editor.maxLength = saved.maxBytes;
+  const note = el("p", "help", tr("Bu talimatlar Workflow’da saklanır ve Codex, Claude Code ve Copilot oturumlarına bir sonraki başlatmada uygulanır."));
+  modal(tr("Proje talimatları") + " · " + project.name, [
+    note, field(tr("Ortak talimatlar"), editor),
+  ], async () => {
+    await api("app", "project_instructions_save", {
+      projectId: project.id, revision: saved.revision, text: editor.value,
+    });
+    toast(tr("Proje talimatları kaydedildi."));
+  });
+  editor.focus();
 }
 async function rename(id) {
   const s = session(id),

@@ -5,7 +5,7 @@ const fs = require("fs"),
   http = require("http"),
   cp = require("child_process"),
   assert = require("assert/strict"),
-  { randomBytes } = require("crypto");
+  { createHash, randomBytes } = require("crypto");
 const root = path.resolve(__dirname, ".."),
   exe =
     process.env.WORKFLOW_TEST_EXE ||
@@ -2125,6 +2125,134 @@ async function test() {
   await changeLanguage("tr");
   await page.getByRole("button", { name: "+ Yeni oturum", exact: true }).waitFor();
   console.log("PASS English and Turkish UI, persisted language, quota labels and live terminals");
+  const rulesDir = path.join(temporary, "rules-project");
+  fs.mkdirSync(rulesDir);
+  const manualInstructions = "\ufeffExisting project rules\r\n";
+  fs.writeFileSync(path.join(rulesDir, "AGENTS.md"), manualInstructions);
+  fs.writeFileSync(path.join(rulesDir, "AGENTS.override.md"), "");
+  fs.writeFileSync(path.join(rulesDir, "CLAUDE.md"), "Existing Claude project rules");
+  const rulesProject = await api("app", "add_project", { directory: rulesDir });
+  const getRules = (projectId) => api("app", "project_instructions_read", { projectId });
+  const saveRules = (projectId, text, revision) => api("app", "project_instructions_save", { projectId, text, revision });
+  await page.evaluate((id) => window.workflow.selectProject(id), rulesProject.id);
+  const projectRow = page.locator(".project-row.active");
+  const projectLayout = await projectRow.evaluate((row) => {
+    const rect = (name) => row.querySelector(name).getBoundingClientRect();
+    const name = rect(".project-name");
+    const count = rect(".project-session-count");
+    const rules = rect(".project-rules");
+    return { ordered: name.right < count.left && count.right < rules.left,
+      centerOffset: Math.abs((count.top + count.bottom - rules.top - rules.bottom) / 2) };
+  });
+  assert(projectLayout.ordered && projectLayout.centerOffset <= 1);
+  await projectRow.getByRole("button", { name: "Proje talimatları" }).click();
+  await dialog.getByLabel("Ortak talimatlar").fill("Run the project checks.");
+  await dialog.getByRole("button", { name: "Kaydet" }).click();
+  await dialog.waitFor({ state: "hidden" });
+  const firstRules = await getRules(rulesProject.id);
+  assert.equal(firstRules.text, "Run the project checks.");
+  const ruleSessions = [];
+  const preLaunchMessage = "Workflow shared instructions are present at process startup.";
+  const updatedMessage = "Updated Workflow instructions are present at process startup.";
+  const terminalText = async (session) => {
+    const attached = await api("terminal", "attach", { id: session.id });
+    return Buffer.from(attached.data, "base64").toString();
+  };
+  for (const provider of ["codex", "claude", "copilot"]) {
+    const session = await api("app", "create_session", { projectId: rulesProject.id, provider, name: provider + " shared rules", tools: false });
+    const run = await api("terminal", "start", { id: session.id });
+    pids.push(run.pid);
+    await until(async () => (await terminalText(session)).includes(preLaunchMessage), provider + " instructions at process startup");
+    if (provider === "codex")
+      assert((await terminalText(session)).includes("Codex custom instructions were preserved."));
+    assert.equal(fs.readFileSync(path.join(session.directory, "AGENTS.md"), "utf8"), manualInstructions);
+    assert(!fs.existsSync(path.join(session.directory, ".claude")));
+    assert(!fs.existsSync(path.join(session.directory, ".github")));
+    assert.deepEqual(await api("files", "changes", { sessionId: session.id }), []);
+    ruleSessions.push({ session, run });
+  }
+  assert.equal(fs.readFileSync(path.join(rulesDir, "AGENTS.md"), "utf8"), manualInstructions);
+  assert.equal(fs.readFileSync(path.join(rulesDir, "CLAUDE.md"), "utf8"), "Existing Claude project rules");
+  assert(!fs.existsSync(path.join(rulesDir, ".claude")));
+  await saveRules(rulesProject.id, "Run the updated project checks.", firstRules.revision);
+  await assert.rejects(saveRules(rulesProject.id, "Outdated editor", firstRules.revision), /Editörü yeniden aç/);
+  const currentRules = await getRules(rulesProject.id);
+  const [codexRules, claudeRules] = ruleSessions;
+  const attachedAgain = await api("terminal", "start", { id: codexRules.session.id });
+  assert.equal(attachedAgain.runId, codexRules.run.runId);
+  assert(!(await terminalText(codexRules.session)).includes(updatedMessage));
+  for (const { session, run } of ruleSessions)
+    await api("terminal", "stop", { id: session.id, runId: run.runId });
+  await until(async () => !(await api("app", "state")).active.some((run) =>
+    ruleSessions.some(({ session }) => run.id === session.id)), "instructions sessions stopped");
+  const resumedRules = await api("terminal", "start", { id: codexRules.session.id });
+  pids.push(resumedRules.pid);
+  assert.notEqual(resumedRules.runId, codexRules.run.runId);
+  await until(async () => (await terminalText(codexRules.session)).includes(updatedMessage), "updated instructions at process startup");
+  assert.equal(fs.readFileSync(path.join(codexRules.session.directory, "AGENTS.override.md"), "utf8"), "");
+  await api("terminal", "stop", { id: codexRules.session.id, runId: resumedRules.runId });
+  const resumedClaudeRules = await api("terminal", "start", { id: claudeRules.session.id });
+  pids.push(resumedClaudeRules.pid);
+  assert.notEqual(resumedClaudeRules.runId, claudeRules.run.runId);
+  await until(async () => (await terminalText(claudeRules.session)).includes(updatedMessage), "Claude receives updated instructions");
+  await api("terminal", "stop", { id: claudeRules.session.id, runId: resumedClaudeRules.runId });
+
+  const worktreeRules = await api("app", "create_session", { projectId: gp.id, provider: "claude", name: "Rules in worktree", tools: false });
+  assert.equal(worktreeRules.workspaceKind, "worktree");
+  const gitRules = await getRules(gp.id);
+  await saveRules(gp.id, "Verify changes before committing.", gitRules.revision);
+  const directGitRules = await api("app", "create_session", { projectId: gp.id, provider: "copilot", workspaceMode: "direct", name: "Rules in Git project", tools: false });
+  for (const session of [worktreeRules, directGitRules]) {
+    const context = { sessionId: session.id };
+    const before = await api("git", "state", context);
+    assert(before.available);
+    const run = await api("terminal", "start", { id: session.id });
+    pids.push(run.pid);
+    await until(async () => (await terminalText(session)).includes(preLaunchMessage), "Git workspace receives rules");
+    assert.deepEqual((await api("git", "state", context)).files, before.files);
+    assert.deepEqual(await api("files", "changes", context), []);
+    await api("terminal", "stop", { id: session.id, runId: run.runId });
+  }
+
+  const directRules = await api("app", "create_session", { projectId: rulesProject.id, provider: "codex", workspaceMode: "direct", name: "Rules in existing folder", tools: false });
+  const overridePath = path.join(rulesDir, "AGENTS.override.md");
+  const digest = (value) => createHash("sha256").update(value).digest("hex");
+  const legacyRules = (prefix) => {
+    const body = "A shared instruction from a previous version.\n";
+    return `${prefix}<!-- workflow:begin -->\n<!-- workflow:sha256 ${digest(body)} ${digest(prefix)} -->\n${body}<!-- workflow:end -->\n`;
+  };
+  fs.writeFileSync(overridePath, legacyRules("Handwritten override\n"));
+  const oldCopilotRules = path.join(rulesDir, ".github", "copilot-instructions.md");
+  fs.mkdirSync(path.dirname(oldCopilotRules));
+  fs.writeFileSync(oldCopilotRules, legacyRules(""));
+  const directRulesRun = await api("terminal", "start", { id: directRules.id });
+  pids.push(directRulesRun.pid);
+  await until(async () => (await terminalText(directRules)).includes(updatedMessage), "existing-folder rules at startup");
+  assert.equal(fs.readFileSync(overridePath, "utf8"), "Handwritten override");
+  assert(!fs.existsSync(oldCopilotRules));
+  assert.equal(fs.readFileSync(path.join(rulesDir, "AGENTS.md"), "utf8"), manualInstructions);
+  await api("terminal", "stop", { id: directRules.id, runId: directRulesRun.runId });
+  await until(async () => !(await api("app", "state")).active.some((run) => run.id === directRules.id), "direct rules session stopped");
+  await saveRules(rulesProject.id, "", currentRules.revision);
+  const clearedRulesRun = await api("terminal", "start", { id: directRules.id });
+  pids.push(clearedRulesRun.pid);
+  await until(async () => (await terminalText(directRules)).includes("Ready >"), "session starts with cleared rules");
+  assert(!(await terminalText(directRules)).includes(updatedMessage));
+  assert.equal(fs.readFileSync(overridePath, "utf8"), "Handwritten override");
+  await api("terminal", "stop", { id: directRules.id, runId: clearedRulesRun.runId });
+  await until(async () => !(await api("app", "state")).active.some((run) =>
+    run.id === claudeRules.session.id), "Claude instructions session stopped");
+  const clearedClaudeRules = await api("terminal", "start", { id: claudeRules.session.id });
+  pids.push(clearedClaudeRules.pid);
+  assert.notEqual(clearedClaudeRules.runId, resumedClaudeRules.runId);
+  await until(async () => (await terminalText(claudeRules.session)).includes("Ready >"), "Claude starts after clearing rules");
+  const clearedClaudeText = await terminalText(claudeRules.session);
+  assert(clearedClaudeText.includes("Claude reloads the current instructions."));
+  assert(!clearedClaudeText.includes(updatedMessage));
+  await api("terminal", "stop", { id: claudeRules.session.id, runId: clearedClaudeRules.runId });
+  await until(async () => !(await api("app", "state")).active.some((run) =>
+    [...ruleSessions.map(({ session }) => session.id), worktreeRules.id, directGitRules.id, directRules.id].includes(run.id)), "shared instructions test terminals stopped");
+  console.log("PASS project row alignment, external instructions for all three providers, unchanged Git state, reattach, and legacy cleanup");
   const templateProjectPath = path.join(temporary, "template-project");
   fs.mkdirSync(templateProjectPath);
   const templateProject = await api("app", "add_project", { directory: templateProjectPath });

@@ -464,11 +464,12 @@ body.no-left .sidebar {
   margin-bottom: 8px;
 }
 .project-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: 24px 14px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
   border-radius: 7px;
-  padding: 9px 5px;
+  padding: 5px 7px;
   cursor: pointer;
   border: 1px solid transparent;
 }
@@ -480,10 +481,62 @@ body.no-left .sidebar {
   background: #20252c;
 }
 .project-name {
-  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
   font-weight: 500;
+}
+.project-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-inline-start: 4px;
+}
+.project-session-count {
+  min-width: 22px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.project-row button.icon {
+  width: 24px;
+  height: 26px;
+}
+.project-expand::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-block-start: 1px solid;
+  border-inline-end: 1px solid;
+  transform: rotate(45deg);
+}
+.project-expand[aria-expanded="true"]::before {
+  transform: rotate(135deg);
+}
+.project-folder {
+  width: 13px;
+  height: 9px;
+  border: 1px solid var(--muted);
+  border-radius: 2px;
+  position: relative;
+}
+.project-folder::before {
+  content: "";
+  position: absolute;
+  inset: -3px auto auto -1px;
+  width: 5px;
+  height: 2px;
+  border: 1px solid var(--muted);
+  border-block-end: 0;
+  border-radius: 2px 2px 0 0;
+}
+.project-rules::before {
+  content: "";
+  width: 11px;
+  height: 14px;
+  border: 1px solid;
+  border-radius: 2px;
+  background: linear-gradient(currentColor, currentColor) center 4px / 5px 1px no-repeat,
+    linear-gradient(currentColor, currentColor) center 7px / 5px 1px no-repeat;
 }
 .project-children {
   margin: 4px 8px 10px 13px;

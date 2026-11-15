@@ -196,6 +196,17 @@ fn codex_rpc(core: &Core, exe: &std::path::Path, profile: &Profile) -> Result<Rp
     rpc.send(json!({"method":"initialized"}))?;
     Ok(rpc)
 }
+pub(crate) fn codex_instructions(
+    core: &Core,
+    directory: &std::path::Path,
+    profile: &Profile,
+) -> Result<String> {
+    let exe = executable(core, "codex").context("CLI kurulumu bulunamadı")?;
+    let result = codex_rpc(core, &exe, profile)?
+        .request("config/read", json!({"cwd":directory,"includeLayers":false}))?;
+    let config = result["config"].as_object().context("Codex talimat ayarları okunamadı.")?;
+    Ok(config.get("developer_instructions").and_then(Value::as_str).unwrap_or("").to_owned())
+}
 fn copilot_rpc(core: &Core, exe: &std::path::Path, profile: &Profile) -> Result<Rpc> {
     let mut rpc = Rpc::new("copilot", exe, &core.directory, profile)?;
     rpc.request(
@@ -284,11 +295,30 @@ fn test_directory() -> Option<PathBuf> {
     .flatten()
 }
 fn claude_status(exe: &std::path::Path, profile: &Profile) -> Result<Value> {
-    let args = if test_directory().is_some() {
-        vec!["--usage-auth-fixture"]
+    let args: &[&str] = if test_directory().is_some() {
+        &["--usage-auth-fixture"]
     } else {
-        vec!["auth", "status"]
+        &["auth", "status"]
     };
+    Ok(serde_json::from_slice(&claude_probe(exe, profile, args)?)?)
+}
+
+pub(crate) fn claude_supports_prompt_snapshot(exe: &std::path::Path, profile: &Profile) -> Result<bool> {
+    let output = claude_probe(exe, profile, &["--version"])?;
+    let output = std::str::from_utf8(&output)?;
+    Ok(claude_snapshot_version(output).context("Claude Code sürümü okunamadı.")?)
+}
+
+fn claude_snapshot_version(output: &str) -> Option<bool> {
+    let version = output.split_whitespace().next()?.trim_start_matches('v');
+    let mut parts = version.split(['.', '-', '+']);
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    let patch: u32 = parts.next()?.parse().ok()?;
+    Some((major, minor, patch) >= (2, 1, 257))
+}
+
+fn claude_probe(exe: &std::path::Path, profile: &Profile, args: &[&str]) -> Result<Vec<u8>> {
     let mut command = if cfg!(windows)
         && exe
             .extension()
@@ -354,7 +384,7 @@ fn claude_status(exe: &std::path::Path, profile: &Profile) -> Result<Value> {
     if bytes.len() > 256 * 1024 {
         bail!("CLI hesap yanıtı çok büyük")
     }
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok(bytes)
 }
 fn credential(auth: &Value, profile: Option<&Profile>) -> Result<(String, Option<i64>)> {
     let method = auth["authMethod"].as_str().unwrap_or("");
@@ -552,6 +582,14 @@ mod tests {
         assert_eq!(rows[1]["label"], "Haftalık");
         assert_eq!(rows[2]["label"], "Ek · 15 dakikalık");
         assert!(codex_windows(&json!({"rateLimits":{"primary":{"usedPercent":null}}})).is_empty());
+    }
+    #[test]
+    fn claude_prompt_snapshot_version_gate() {
+        assert_eq!(claude_snapshot_version("2.1.119 (Claude Code)"), Some(false));
+        assert_eq!(claude_snapshot_version("2.1.256 (Claude Code)"), Some(false));
+        assert_eq!(claude_snapshot_version("2.1.257 (Claude Code)"), Some(true));
+        assert_eq!(claude_snapshot_version("v2.2.0"), Some(true));
+        assert_eq!(claude_snapshot_version("Unknown version"), None);
     }
     #[test]
     fn claude_has_independent_windows_and_unlimited_extra() {

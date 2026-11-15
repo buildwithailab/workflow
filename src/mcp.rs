@@ -147,26 +147,7 @@ pub fn configuration(
 }
 
 fn codex_configuration(command: &str, lease: &str, windows_script: bool) -> Vec<String> {
-    let quote = |value: &str| {
-        if !windows_script {
-            return json!(value).to_string();
-        }
-        // Preserve the TOML delimiters through Windows PowerShell's legacy argv
-        // conversion. Encode characters that a batch shim could expand or split.
-        use std::fmt::Write as _;
-        let mut quoted = String::from(r#"\""#);
-        for c in value.chars() {
-            if c.is_ascii_alphanumeric() || "-_./:".contains(c) {
-                quoted.push(c);
-            } else if (c as u32) <= 0xffff {
-                let _ = write!(quoted, "\\u{:04x}", c as u32);
-            } else {
-                let _ = write!(quoted, "\\U{:08x}", c as u32);
-            }
-        }
-        quoted.push_str(r#"\""#);
-        quoted
-    };
+    let quote = |value: &str| crate::terminal::codex_config_string(value, windows_script);
     vec![
         "-c".into(),
         format!("mcp_servers.workflow.command={}", quote(command)),

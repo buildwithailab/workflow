@@ -174,6 +174,25 @@ pub fn command(exe: &Path, args: &[String]) -> CommandBuilder {
     cmd.args(args);
     cmd
 }
+pub(crate) fn codex_config_string(value: &str, windows_script: bool) -> String {
+    if !windows_script {
+        return json!(value).to_string();
+    }
+    // Preserve TOML quotes through PowerShell and encode batch-shim metacharacters.
+    use std::fmt::Write as _;
+    let mut quoted = String::from(r#"\""#);
+    for c in value.chars() {
+        if c.is_ascii_alphanumeric() || "-_./:".contains(c) {
+            quoted.push(c);
+        } else if (c as u32) <= 0xffff {
+            let _ = write!(quoted, "\\u{:04x}", c as u32);
+        } else {
+            let _ = write!(quoted, "\\U{:08x}", c as u32);
+        }
+    }
+    quoted.push_str(r#"\""#);
+    quoted
+}
 pub fn internal_variable(key: &str) -> bool {
     [
         "CLAUDECODE",
@@ -303,6 +322,7 @@ pub fn start(core: &Arc<Core>, session_id: &str) -> Result<Value> {
             bail!("Bu kartın konuşma kaydı henüz doğrulanmadı. ⋯ menüsünden Konuşma seç ile kaydı bağla; yeni konuşma otomatik açılmadı.")
         }
     }
+    let instructions = crate::instructions::prepare(core, &session, &directory, &exe, &profile)?;
     let mut args = provider_arguments(&session, conversation.as_deref())?;
     let run_id = id();
     let tools = session["tools"] != false && session["login"] != true;
@@ -316,9 +336,11 @@ pub fn start(core: &Arc<Core>, session_id: &str) -> Result<Value> {
     } else if tools {
         args.extend(tool_args);
     }
-    let openspec_path = if session["workspaceKind"] != "direct" && session["addons"]
-        .as_array()
-        .is_some_and(|a| a.iter().any(|v| v == "openspec"))
+    args.extend(instructions.arguments);
+    let openspec_path = if session["workspaceKind"] != "direct"
+        && session["addons"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|v| v == "openspec"))
     {
         let bin = crate::addons::openspec_directory(core)?;
         let mut paths = vec![bin];
@@ -336,6 +358,9 @@ pub fn start(core: &Arc<Core>, session_id: &str) -> Result<Value> {
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("TERM_PROGRAM", "workflow");
+    if let Some(directories) = instructions.copilot_directories {
+        cmd.env(crate::instructions::COPILOT_DIRECTORIES, directories);
+    }
     if let Some(path) = openspec_path {
         cmd.env("PATH", path);
     }

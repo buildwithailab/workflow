@@ -2,6 +2,23 @@
 
 // Turkish source text is the default. Translate only messages authored by Workflow.
 const english = {
+  "Proje talimatları": "Project instructions",
+  "Proje oturumları": "Project sessions",
+  "Ortak talimatlar": "Shared instructions",
+  "Bu talimatlar Workflow’da saklanır ve Codex, Claude Code ve Copilot oturumlarına bir sonraki başlatmada uygulanır.": "Workflow stores these instructions locally. Codex, Claude Code, and Copilot receive them the next time a session starts.",
+  "Proje talimatları kaydedildi.": "Project instructions saved.",
+  "Talimat dosyası normal bir dosya olmalı.": "The instruction file must be a regular file.",
+  "Talimat dosyası boyut sınırını aşıyor.": "The instruction file exceeds the size limit.",
+  "Talimat dosyası UTF-8 olmalı.": "The instruction file must use UTF-8.",
+  "Proje talimatları değişti. Editörü yeniden aç.": "The project instructions changed. Reopen the editor.",
+  "Ortak proje talimatları en fazla 16 KB olabilir.": "Shared project instructions can be up to 16 KB.",
+  "Ortak proje talimatları geçersiz bir karakter içeriyor.": "Shared project instructions contain an invalid character.",
+  "Codex talimat ayarları okunamadı.": "Could not read Codex instruction settings.",
+  "Claude Code sürümü okunamadı.": "Could not read the Claude Code version.",
+  "Copilot talimat klasörü yolunda virgül kullanılamıyor.": "The Copilot instructions folder path cannot contain commas.",
+  "Talimat dosyasındaki Workflow işaretleri eşleşmiyor.": "The Workflow markers in the instruction file do not match.",
+  "Workflow talimat bölümü elle değişmiş. Dosyayı kontrol et.": "The Workflow instructions section was edited. Check the file.",
+  "Talimat dosyası değişti. Oturumu yeniden başlatmayı dene.": "The instruction file changed. Try starting the session again.",
   "Sağlayıcılar": "Providers",
   "Tüm sağlayıcılar": "All providers",
   "Sağlayıcı kurulumu": "Provider setup",

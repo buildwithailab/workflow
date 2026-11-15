@@ -8,6 +8,7 @@ mod core;
 mod files;
 mod git;
 mod history;
+mod instructions;
 mod mcp;
 mod models;
 #[cfg(windows)]
@@ -85,6 +86,9 @@ fn route(core: &Arc<Core>, domain: &str, action: &str, args: &Value) -> Result<V
 fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
     match action {
         "state" => Ok(core.snapshot()),
+        "project_instructions_read" | "project_instructions_save" => {
+            instructions::edit(core, action, args)
+        }
         "sharing_warnings" => Ok(serde_json::to_value(sharing::warnings(&core.root(args)?)?)?),
         "notify" => {
             use tauri_plugin_notification::NotificationExt;
@@ -544,6 +548,8 @@ fn rpc_fixture(provider: &str) -> Result<()> {
             json!({"account":login.as_ref().map(|login| json!({"type":"chatgpt","email":format!("{login}@localhost"),"planType":"test"}))})
         } else if v["method"] == "account/rateLimits/read" {
             json!({"rateLimits":{"primary":{"usedPercent":if profile.is_some() {40} else {25},"windowDurationMins":300,"resetsAt":2000000000},"secondary":{"usedPercent":80,"windowDurationMins":10080,"resetsAt":2000000000}}})
+        } else if v["method"] == "config/read" {
+            json!({"config":{"developer_instructions":"Existing Codex test instruction."}})
         } else if v["method"] == "auth.getStatus" {
             json!({"isAuthenticated":login.is_some(),"login":login})
         } else if v["method"] == "account.getQuota" {
