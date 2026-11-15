@@ -12,9 +12,11 @@ mod mcp;
 mod models;
 #[cfg(windows)]
 mod preview;
+mod provider_setup;
 mod sharing;
 #[cfg(windows)]
 mod teams;
+mod templates;
 mod terminal;
 mod usage;
 use crate::core::*;
@@ -74,6 +76,7 @@ fn route(core: &Arc<Core>, domain: &str, action: &str, args: &Value) -> Result<V
         "history" => history::dispatch(core, action, args),
         "addons" => addons::dispatch(core, action, args),
         "models" => models::dispatch(core, action, args),
+        "templates" => templates::dispatch(core, action, args),
         #[cfg(windows)]
         "preview" => preview::dispatch(core, action, args),
         _ => bail!("Uygulama işlemi bulunamadı"),
@@ -112,6 +115,8 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             Ok(core.snapshot())
         }
         "provider_usage" => usage::read(core, args),
+        "provider_install_options" => Ok(provider_setup::options()),
+        "provider_install" => provider_setup::install(core, args),
         "provider_account_add" => accounts::add(core, args),
         "provider_account_verify" => usage::verify_account(core, args),
         "providers" => {
@@ -256,37 +261,16 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
         "create_session" => {
             let _guard = core.operations.lock().unwrap();
             let project = core.project(string(args, "projectId")?)?;
-            let provider = string(args, "provider")?;
-            if !["codex", "claude", "copilot"].contains(&provider) {
-                bail!("Sağlayıcı geçersiz")
-            };
-            let account = accounts::Profile::get(core, provider, &args["accountId"])?;
-            if !account.verified() {
-                bail!("Önce bu hesabı bağla.");
+            let session = prepare_session(core, &project, args)?;
+            let mut db = core.db.lock().unwrap();
+            db["sessions"].as_array_mut().unwrap().push(session.clone());
+            if let Err(error) = core.save_workspace(&db) {
+                db["sessions"].as_array_mut().unwrap().pop();
+                drop(db);
+                files::discard_new_workspace(core, &session)?;
+                return Err(error);
             }
-            let direct = match args["workspaceMode"].as_str() {
-                None | Some("isolated") => false,
-                Some("direct") => true,
-                _ => bail!("Çalışma alanı seçimi geçersiz"),
-            };
-            if direct
-                && args["addons"]
-                    .as_array()
-                    .is_some_and(|addons| !addons.is_empty())
-            {
-                bail!("Oturuma özel eklentiler için ayrı çalışma alanı seç.")
-            }
-            let sid = id();
-            let w = files::create_workspace(core, &project, &sid, direct)?;
-            let mut session = json!({"id":sid,"provider":provider,"accountId":account.id,"name":args["name"].as_str().filter(|s|!s.trim().is_empty()).unwrap_or("Yeni oturum"),"projectId":project["id"],"createdAt":now(),"directory":w["directory"],"workspaceKind":w["kind"],"branch":w["branch"],"state":"stopped","tools":args["tools"]!=false,"browserAccess":true,"addons":args["addons"].as_array().cloned().unwrap_or_default(),"login":args["login"]==true,"model":args["model"].as_str().map(str::to_string).or_else(||models::configured(provider,&account))});
-            if direct {
-                session["baselineRef"] = w["baselineRef"].clone();
-            }
-            core.db.lock().unwrap()["sessions"]
-                .as_array_mut()
-                .unwrap()
-                .push(session.clone());
-            core.save()?;
+            drop(db);
             core.emit("workspace", core.snapshot());
             Ok(session)
         }
@@ -442,6 +426,43 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
         }
         _ => bail!("İşlem bulunamadı"),
     }
+}
+
+fn prepare_session(core: &Core, project: &Value, args: &Value) -> Result<Value> {
+    let provider = string(args, "provider")?;
+    if !["codex", "claude", "copilot"].contains(&provider) {
+        bail!("Sağlayıcı geçersiz");
+    }
+    let account = accounts::Profile::get(core, provider, &args["accountId"])?;
+    if !account.verified() {
+        bail!("Önce bu hesabı bağla.");
+    }
+    let direct = match args["workspaceMode"].as_str() {
+        None | Some("isolated") => false,
+        Some("direct") => true,
+        _ => bail!("Çalışma alanı seçimi geçersiz"),
+    };
+    if direct
+        && args["addons"]
+            .as_array()
+            .is_some_and(|addons| !addons.is_empty())
+    {
+        bail!("Oturuma özel eklentiler için ayrı çalışma alanı seç.");
+    }
+    let sid = id();
+    let w = files::create_workspace(core, project, &sid, direct)?;
+    let mut session = json!({
+        "id":sid, "provider":provider, "accountId":account.id, "projectId":project["id"],
+        "name":args["name"].as_str().filter(|s|!s.trim().is_empty()).unwrap_or("Yeni oturum"),
+        "createdAt":now(), "directory":w["directory"], "workspaceKind":w["kind"], "branch":w["branch"],
+        "state":"stopped", "tools":args["tools"]!=false, "browserAccess":true,
+        "addons":args["addons"].as_array().cloned().unwrap_or_default(), "login":args["login"]==true,
+        "model":args["model"].as_str().map(str::to_string).or_else(||models::configured(provider,&account)),
+    });
+    if direct {
+        session["baselineRef"] = w["baselineRef"].clone();
+    }
+    Ok(session)
 }
 fn fixture(provider: &str) -> Result<()> {
     use std::io::{BufRead, Write};

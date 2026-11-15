@@ -385,6 +385,61 @@ body.no-left .sidebar {
   flex: 1;
   padding: 11px;
 }
+#session-templates {
+  width: 100%;
+  margin-bottom: 10px;
+}
+#provider-count {
+  font-variant-numeric: tabular-nums;
+}
+.setup-content,
+.setup-list {
+  display: grid;
+  gap: 10px;
+}
+.setup-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.setup-steps li,
+.setup-row {
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+.setup-steps [aria-current="step"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.setup-row,
+.setup-row .form-field {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+.setup-command code,
+.template-prompt {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.template-actions {
+  flex-wrap: wrap;
+}
+.template-links {
+  margin: 0;
+  padding-inline-start: 22px;
+}
+.setup-row > summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.setup-row[open] > summary {
+  margin-bottom: 8px;
+}
 @container (max-width: 185px) {
   #teams-action {
     display: none;
@@ -507,6 +562,9 @@ body.no-left .sidebar {
   }
   #show-providers {
     padding-inline: 5px;
+  }
+  #show-providers > span:first-child {
+    display: none;
   }
   .main-header .view-switch button {
     width: 26px;

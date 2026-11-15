@@ -77,7 +77,7 @@ fn sensitive_name(path: &Path) -> bool {
         .any(|ext| name.ends_with(ext))
 }
 
-fn contains_credentials(bytes: &[u8]) -> bool {
+pub(crate) fn contains_credentials(bytes: &[u8]) -> bool {
     static PATTERNS: OnceLock<RegexSet> = OnceLock::new();
     let patterns = PATTERNS.get_or_init(|| {
         RegexSet::new([

@@ -486,6 +486,9 @@ function usageRow(w) {
 function renderProviderCards() {
   const box = $("#provider-cards");
   box.replaceChildren();
+  const count = providers.filter((p) => p.installed && p.accounts.some(isConnected)).length + "/" + Object.keys(names).length;
+  $("#provider-count").textContent = count;
+  $("#show-providers").setAttribute("aria-label", tr("Sağlayıcılar") + " " + count);
   for (const id of Object.keys(names)) {
     const p = providerInfo(id),
       card = el("div", "provider-card"),
@@ -516,6 +519,7 @@ function renderProviderCards() {
     }
     if (!accounts.length) usageList.append(el("p", "usage-message", tr("Kullanım alınıyor…")));
     const actions = el("div", "row provider-actions");
+    if (p && !p.installed) actions.append(button(tr("Kur"), () => openProviderSetup(1, id)));
     const data = providerAccount(id)?.usage;
     if (data?.connection === "connected") {
       actions.append(el("span", "provider-connected", tr("✓ Hesap bağlı")));
@@ -549,6 +553,76 @@ function renderProviderCards() {
     card.append(row, usageList, actions);
     box.append(card);
   }
+}
+const isConnected = (account) =>
+  account.id === defaultAccount ? account.usage?.connection === "connected"
+    : account.usage?.connection === "connected" || (account.verified && !account.usage?.connection);
+
+async function openProviderSetup(step = 0, selectedProvider = null) {
+  const steps = [tr("Algıla"), tr("Kur"), tr("Giriş yap")];
+  const options = step === 1 ? await api("app", "provider_install_options") : null;
+  const content = el("div", "setup-content");
+  const progress = el("ol", "setup-steps");
+  steps.forEach((label, i) => {
+    const item = el("li", "", label);
+    if (i === step) item.setAttribute("aria-current", "step");
+    progress.append(item);
+  });
+  content.append(progress);
+  const list = el("div", "setup-list");
+  const installed = (id) => providerInfo(id)?.installed;
+  for (const id of selectedProvider ? [selectedProvider] : Object.keys(names)) {
+    const row = el("section", "setup-row");
+    const header = el("div", "row");
+    header.append(el("strong", "grow", names[id]),
+      el("small", "", installed(id) ? tr("● Kurulu") : tr("○ Kurulu değil")));
+    row.append(header);
+    if (step === 1 && !installed(id)) {
+      for (const option of options[id]) {
+        const command = el("div", "row setup-command");
+        const install = button(tr("Kur"), () => {
+          const confirmation = el("div", "setup-content");
+          confirmation.append(el("p", "", tr("Bu komut bilgisayarına {provider} kurar.", { provider: names[id] })),
+            el("code", "", option.command));
+          modal(tr("Kurulumu onayla"), confirmation, async () => {
+            await api("app", "provider_install", { provider: id, method: option.id, confirmed: true });
+            await scanProviders();
+            $("#dialog").addEventListener("close", () => openProviderSetup(1, selectedProvider).catch(error), { once: true });
+          }, tr("Kur"));
+        });
+        install.disabled = !option.available;
+        command.append(el("code", "grow", option.command), install);
+        row.append(command);
+        if (!option.available) row.append(el("small", "", tr(option.id === "npm" ? "npm ve Node.js 22+ gerekli." : "WinGet bulunamadı.")));
+      }
+    }
+    if (step === 2 && installed(id)) {
+      if (providerInfo(id).accounts.some(isConnected)) row.append(el("small", "provider-connected", tr("✓ Hesap bağlı")));
+      else row.append(button(tr("Hesabı bağla"), async () => {
+        await openProviderLogin(id);
+        if ($("#dialog").open)
+          $("#dialog").addEventListener("close", () => openProviderSetup(2).catch(error), { once: true });
+      }));
+    }
+    list.append(row);
+  }
+  const actions = el("div", "row");
+  const rescan = button(tr("Yeniden tara"), () => {});
+  rescan.onclick = busy(rescan, async () => {
+    await scanProviders();
+    if (content.isConnected && $("#dialog").open) await openProviderSetup(step, selectedProvider);
+  });
+  actions.append(rescan);
+  if (step === 1 && selectedProvider)
+    actions.append(button(tr("Tüm sağlayıcılar"), () => openProviderSetup(1)));
+  if (step > 0) actions.append(button(tr("Geri"), () => openProviderSetup(step - 1)));
+  content.append(list, actions);
+  modal(tr("Sağlayıcı kurulumu"), content, async () => {
+    if (step < 2)
+      $("#dialog").addEventListener("close", () => openProviderSetup(step + 1).catch(error), { once: true });
+  }, step === 2 ? tr("Bitir") : tr("Sonraki"));
+  const skip = $("#dialog-footer button");
+  skip.textContent = tr("Atla");
 }
 function renderAccountUsage(provider, account) {
     const usage = el("div", "provider-usage"), data = account.usage;
@@ -1277,6 +1351,11 @@ async function sessionMenu(id) {
       ? []
       : [button(tr("Eklentiler"), () => sessionAddons(id))]),
     ...(s.login ? [] : [button(tr("Önizleme ayarları"), () => previewSettings(s))]),
+    ...(s.initialPrompt ? [button(tr("Şablon istemini göster"), () => {
+      const prompt = el("pre", "template-prompt", s.initialPrompt);
+      const copy = button(tr("Kopyala"), () => api("clipboard", "write", { text: s.initialPrompt }));
+      modal(tr("Şablon istemi"), [prompt, copy]);
+    })] : []),
     ...(canSetTeamsDestination(s)
       ? [button(tr("Teams hedefi"), () => teamsDestination(s))]
       : []),
@@ -1777,7 +1856,10 @@ $("#app-settings").onclick = () => {
     remember();
     location.reload();
   };
-  modal(tr("Ayarlar"), field(tr("Arayüz dili"), language));
+  modal(tr("Ayarlar"), [
+    field(tr("Arayüz dili"), language),
+    button(tr("Sağlayıcı kurulumu"), () => openProviderSetup()),
+  ]);
   $("#dialog-footer button").textContent = tr("Kapat");
 };
 function panelToggle(side) {
@@ -2327,7 +2409,166 @@ async function archiveList() {
     box.append(el("p", "help", tr("Arşivlenmiş oturum yok.")));
   modal(tr("Geçmiş oturumlar"), box);
 }
+function editTemplate(entry, projectId, destinationId) {
+  const template = entry.template;
+  const content = el("div", "setup-content");
+  const name = input(template.name);
+  name.maxLength = 160;
+  const fromMap = check(tr("Oturumları ve bağlantıları mevcut haritadan al"));
+  fromMap.input.disabled = !visibleSessions().length;
+  const editor = el("div", "setup-list");
+  const rows = template.sessions.map((session, index) => {
+    const section = el("details", "setup-row");
+    const heading = el("summary", "", session.name);
+    const sessionName = input(session.name);
+    sessionName.maxLength = 160;
+    sessionName.oninput = () => { heading.textContent = sessionName.value || session.name; };
+    const provider = select(Object.entries(names).map(([id, label]) => ({ id, label })), session.provider);
+    const workspace = select([
+      { id: "isolated", label: tr("Ayrı klasör") },
+      { id: "direct", label: tr("Mevcut klasör") },
+    ], session.workspaceMode);
+    const model = input(session.model || "", tr("Varsayılan model"));
+    model.maxLength = 128;
+    provider.onchange = () => { model.value = provider.value === session.provider ? session.model || "" : ""; };
+    const prompt = el("textarea");
+    prompt.rows = 3;
+    prompt.maxLength = 4000;
+    prompt.value = session.initialPrompt || "";
+    section.append(heading, field(tr("Oturum adı"), sessionName), field(tr("Sağlayıcı"), provider),
+      field(tr("Çalışma alanı"), workspace), field(tr("Model"), model), field(tr("Şablon istemi"), prompt));
+    if (!index) section.open = true;
+    editor.append(section);
+    return () => ({
+      name: sessionName.value.trim(), provider: provider.value, workspaceMode: workspace.value,
+      model: model.value.trim() || null, initialPrompt: prompt.value || null, position: session.position,
+    });
+  });
+  const permissions = template.links.map((link) => {
+    const section = el("details", "setup-row");
+    const read = check(tr("Konuşma"), link.read);
+    const files = check(tr("Dosya"), link.files);
+    const work = check(tr("İş"), link.work);
+    section.append(el("summary", "", template.sessions[link.source].name + " → " + template.sessions[link.target].name),
+      read.label, files.label, work.label);
+    editor.append(section);
+    return () => ({ ...link, read: read.input.checked, files: files.input.checked, work: work.input.checked });
+  });
+  fromMap.input.onchange = () => { editor.hidden = fromMap.input.checked; };
+  content.append(field(tr("Şablon adı"), name), fromMap.label, editor);
+  modal(tr("Şablonu düzenle"), content, async () => {
+    const update = fromMap.input.checked
+      ? { projectId, name: name.value }
+      : { template: { ...template, name: name.value.trim(), sessions: rows.map((row) => row()), links: permissions.map((read) => read()) } };
+    await api("templates", "update", { id: entry.id, revision: entry.revision, ...update });
+    $("#dialog").addEventListener("close", () => openTemplates(entry.id, destinationId).catch(error), { once: true });
+  });
+  $("#dialog-footer button").onclick = () => openTemplates(entry.id, destinationId).catch(error);
+  name.focus();
+}
+
+async function openTemplates(selectedId, destinationId = projectId) {
+  const entries = await api("templates", "list");
+  const title = (entry) => entry.id.startsWith("builtin:") && uiLanguage === "tr"
+    ? ["Kod + İnceleme", "Özellik geliştirme", "Hata ayıklama"][Number(entry.id.slice(8))]
+    : entry.template.name;
+  const templateSelect = select(entries.map((entry) => ({ id: entry.id, label: title(entry) })), selectedId);
+  const projects = db.projects.filter((p) => !p.removed);
+  const destination = select(projects.map((p) => ({ id: p.id, label: p.name })), destinationId);
+  const content = el("div", "setup-content");
+  const preview = el("div", "setup-list");
+  const installed = Object.keys(names).filter((id) => providerInfo(id)?.installed);
+  let choices = [];
+  const selection = () => entries.find((entry) => entry.id === templateSelect.value);
+  const edit = button(tr("Şablonu düzenle"), () => editTemplate(selection(), projectId, destination.value));
+  const remove = button(tr("Şablonu sil"), () => {
+    const entry = selection();
+    const target = destination.value;
+    modal(tr("Şablonu sil"), el("p", "", tr("“{name}” şablonu silinsin mi?", { name: entry.template.name })), async () => {
+      await api("templates", "delete", { id: entry.id, revision: entry.revision });
+      $("#dialog").addEventListener("close", () => openTemplates(undefined, target).catch(error), { once: true });
+    }, tr("Sil"));
+    $("#dialog-footer button").onclick = () => openTemplates(entry.id, target).catch(error);
+    $("#dialog-footer button").focus();
+  }, "danger");
+  const render = () => {
+    const entry = selection();
+    const { template } = entry;
+    edit.hidden = remove.hidden = !entry.revision;
+    choices = template.sessions.map((session) => select([
+      { id: "", label: tr("Sağlayıcı seç") },
+      ...installed.map((id) => ({ id, label: names[id] })),
+    ], installed.includes(session.provider) ? session.provider : ""));
+    preview.replaceChildren(...template.sessions.map((session, index) => {
+      const label = session.name + " · " + tr(session.workspaceMode === "direct" ? "Mevcut klasör" : "Ayrı klasör");
+      const row = el("section", "setup-row");
+      row.append(field(label, choices[index]));
+      if (!installed.includes(session.provider))
+        row.append(el("small", "link-reapproval", tr("{provider} kurulu değil. Başka bir sağlayıcı seç.", { provider: names[session.provider] })));
+      return row;
+    }));
+    if (template.links.length) {
+      const links = el("ul", "template-links");
+      for (const link of template.links) links.append(el("li", "",
+        template.sessions[link.source].name + " → " + template.sessions[link.target].name +
+        " · " + linkPermissionNames(link).join(" · ")));
+      preview.append(links);
+    }
+    const apply = $("#dialog-footer .primary");
+    const validateSelection = () => { apply.disabled = !destination.value || choices.some((choice) => !choice.value); };
+    choices.forEach((choice) => { choice.onchange = validateSelection; });
+    destination.onchange = validateSelection;
+    validateSelection();
+  };
+  const actions = el("div", "row template-actions");
+  const capture = button(tr("Haritayı şablon olarak kaydet"), () => {
+    const name = input("", tr("Şablon adı"));
+    modal(tr("Haritayı şablon olarak kaydet"), field(tr("Şablon adı"), name), async () => {
+      const entry = await api("templates", "capture", { projectId, name: name.value });
+      $("#dialog").addEventListener("close", () => openTemplates(entry.id).catch(error), { once: true });
+    });
+    name.focus();
+  });
+  capture.disabled = visibleSessions().length === 0;
+  const chooseTemplateFile = (action) => invoke("plugin:dialog|" + action, {
+    options: { filters: [{ name: "JSON", extensions: ["json"] }],
+      ...(action === "save" ? { defaultPath: "workflow-template.json" } : {}) },
+  });
+  actions.append(capture,
+    button(tr("İçe aktar"), async () => {
+      const path = await chooseTemplateFile("open");
+      if (path) {
+        const entry = await api("templates", "import", { path });
+        await openTemplates(entry.id);
+      }
+    }),
+    button(tr("Dışa aktar"), async () => {
+      const id = selection().id;
+      const path = await chooseTemplateFile("save");
+      if (path) {
+        await api("templates", "export", { id, path });
+        toast(tr("Şablon dışa aktarıldı."));
+      }
+    }),
+    edit, remove,
+  );
+  content.append(actions, field(tr("Şablon"), templateSelect), field(tr("Hedef proje"), destination), preview);
+  if (!projects.length) content.append(el("p", "help", tr("Şablonu uygulamadan önce bir proje ekle.")));
+  content.append(el("p", "help", tr("Oturumlar ve bağlantılar oluşturulur. Oturumları haritadan başlatabilirsin.")));
+  modal(tr("İş akışı şablonları"), content, async () => {
+    const target = destination.value;
+    await api("templates", "apply", { id: selection().id, projectId: target, providers: choices.map((choice) => choice.value) });
+    await sync();
+    selectProject(target);
+    setMode("map");
+    fitMap();
+  }, tr("Oturumları oluştur"));
+  templateSelect.onchange = render;
+  render();
+}
+
 $("#new-session").onclick = () => newSession().catch(error);
+$("#session-templates").onclick = () => openTemplates().catch(error);
 $("#add-project").onclick = () => newProject().catch(error);
 $("#addons").onclick = () => addonLibrary().catch(error);
 $("#archive").onclick = () => archiveList().catch(error);
@@ -2338,6 +2579,7 @@ $("#refresh").onclick = busy($("#refresh"), async () => {
 });
 $("#show-providers").onclick = () => {
   $("#provider-cards").hidden = !$("#provider-cards").hidden;
+  $("#show-providers").setAttribute("aria-expanded", String(!$("#provider-cards").hidden));
   remember();
   refreshProviderUsageAll().catch(() => {});
   fitTerminals();
@@ -4137,6 +4379,14 @@ async function initialize() {
   await scanProviders();
   setMode(mode);
   await openPanel(panel, false);
+  $("#show-providers").setAttribute("aria-expanded", String(!$("#provider-cards").hidden));
+  const connected = providers.some((p) => p.installed && p.accounts.some(isConnected));
+  if (!connected && !db.sessions.length && !localStorage.getItem("workflow-setup-seen")) {
+    await Promise.allSettled(providers.filter((p) => p.installed)
+      .map((p) => refreshProviderUsage(p.id)));
+    localStorage.setItem("workflow-setup-seen", "true");
+    if (!providers.some((p) => p.installed && p.accounts.some(isConnected))) await openProviderSetup();
+  }
   window.addEventListener("resize", () => {
     fitTerminals();
     scheduleViewport();

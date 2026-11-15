@@ -145,6 +145,23 @@ pub fn create_workspace(core: &Core, project: &Value, sid: &str, direct: bool) -
     prepared?;
     Ok(json!({"directory":root,"kind":kind,"branch":branch,"baselineRef":baseline_ref}))
 }
+pub(crate) fn discard_new_workspace(core: &Core, session: &Value) -> Result<()> {
+    let sid = string(session, "id")?;
+    uuid::Uuid::parse_str(sid)?;
+    let workspaces = core.directory.join("workspaces");
+    let slot = safe_path(&workspaces, sid)?;
+    if session["workspaceKind"] == "worktree" {
+        let directory = slot.join("files");
+        let root = external_path(&directory).to_string_lossy();
+        let branch = string(session, "branch")?;
+        let project = core.project(string(session, "projectId")?)?;
+        let source = Path::new(string(&project, "directory")?);
+        git(source, &["worktree", "remove", "--force", "--", &root])?;
+        git(source, &["branch", "-D", "--", branch])?;
+    }
+    fs::remove_dir_all(slot)?;
+    Ok(())
+}
 fn require_restore_checkout(core: &Core, args: &Value, root: &Path) -> Result<()> {
     let session = core.session(string(args, "sessionId")?)?;
     if session["workspaceKind"] == "direct"

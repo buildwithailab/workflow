@@ -92,17 +92,18 @@ let child,
   server,
   pids = [],
   calls = 0;
-async function start() {
+async function start(missingProviders = "", profile = data) {
   const port = await freePort();
   const env = {
     ...process.env,
-    WORKFLOW_DATA_DIR: data,
-    CODEX_HOME: path.join(data, "test-codex-home"),
-    CLAUDE_CONFIG_DIR: path.join(data, "test-claude-home"),
-    COPILOT_HOME: path.join(data, "test-copilot-home"),
+    WORKFLOW_DATA_DIR: profile,
+    CODEX_HOME: path.join(profile, "test-codex-home"),
+    CLAUDE_CONFIG_DIR: path.join(profile, "test-claude-home"),
+    COPILOT_HOME: path.join(profile, "test-copilot-home"),
     WORKFLOW_TEST_MODE: "1",
     WORKFLOW_TEST_PROVIDER: fixtureExe,
     WORKFLOW_TEST_RPC_EXE: exe,
+    WORKFLOW_TEST_MISSING_PROVIDERS: missingProviders,
     WORKFLOW_TEST_USAGE_DIR: usageRoot,
     WORKFLOW_TEST_MANAGED_CREDENTIAL: managedFixtureCredential,
     WORKFLOW_TEST_USAGE_URL:
@@ -123,7 +124,7 @@ async function start() {
   await until(() => {
     if (errors || child.exitCode !== null)
       throw Error(errors || "Application exited: " + child.exitCode);
-    return fs.existsSync(path.join(data, "ready.json"));
+    return fs.existsSync(path.join(profile, "ready.json"));
   }, "startup");
   browser = await until(
     () => playwright.chromium.connectOverCDP("http://127.0.0.1:" + port),
@@ -2124,6 +2125,80 @@ async function test() {
   await changeLanguage("tr");
   await page.getByRole("button", { name: "+ Yeni oturum", exact: true }).waitFor();
   console.log("PASS English and Turkish UI, persisted language, quota labels and live terminals");
+  const templateProjectPath = path.join(temporary, "template-project");
+  fs.mkdirSync(templateProjectPath);
+  const templateProject = await api("app", "add_project", { directory: templateProjectPath });
+  await page.evaluate((id) => window.workflow.selectProject(id), templateProject.id);
+  await page.locator("#session-templates").click();
+  await dialog.getByRole("heading", { name: "İş akışı şablonları" }).waitFor();
+  await dialog.getByLabel("Şablon", { exact: true }).selectOption("builtin:1");
+  await dialog.getByRole("button", { name: "Oturumları oluştur" }).click();
+  await dialog.waitFor({ state: "hidden" });
+  const afterTemplate = await api("app", "state");
+  const created = afterTemplate.sessions.filter((item) => item.projectId === templateProject.id);
+  assert.equal(created.length, 5);
+  assert(created.every((item) => item.initialPrompt && item.workspaceKind === "copy"));
+  assert.deepEqual(afterTemplate.active, activeBeforeLanguageChange);
+  const ids = new Set(created.map((item) => item.id));
+  assert.equal(afterTemplate.links.filter((link) => ids.has(link.source) && ids.has(link.target)).length, 5);
+  const capture = await api("templates", "capture", { projectId: templateProject.id, name: "Reusable map" });
+  const exportPath = path.join(temporary, "workflow-template.json");
+  await api("templates", "export", { id: capture.id, path: exportPath });
+  await assert.rejects(api("templates", "export", { id: capture.id, path: exportPath }), /yeni bir dosya adı/);
+  const exported = fs.readFileSync(exportPath, "utf8");
+  assert(!/accountId|conversationId|directory|projectId/.test(exported));
+  assert(!exported.includes(created[0].id));
+  const imported = await api("templates", "import", { path: exportPath });
+  assert.deepEqual(imported.template, capture.template);
+  await page.locator("#session-templates").click();
+  const templateChoice = dialog.getByLabel("Şablon", { exact: true });
+  const editTemplateButton = dialog.getByRole("button", { name: "Şablonu düzenle" });
+  const deleteTemplateButton = dialog.getByRole("button", { name: "Şablonu sil" });
+  assert.equal(await editTemplateButton.isVisible(), false);
+  assert.equal(await deleteTemplateButton.isVisible(), false);
+  for (const action of ["update", "delete"]) {
+    await assert.rejects(api("templates", action, { id: "builtin:1" }), /Hazır şablonlar/);
+  }
+  await templateChoice.selectOption(imported.id);
+  await editTemplateButton.click();
+  await dialog.getByLabel("Şablon adı", { exact: true }).fill("Updated map");
+  await dialog.getByLabel("Oturum adı", { exact: true }).first().fill("Acceptance");
+  await dialog.getByText("Implementation → Requirements", { exact: true }).click();
+  await dialog.getByRole("checkbox", { name: "Dosya", exact: true }).check();
+  await dialog.getByRole("button", { name: "Kaydet", exact: true }).click();
+  await templateChoice.waitFor();
+  assert.equal(await templateChoice.inputValue(), imported.id);
+  const updated = (await api("templates", "list")).find((entry) => entry.id === imported.id);
+  assert.equal(updated.template.name, "Updated map");
+  assert.equal(updated.template.sessions[0].name, "Acceptance");
+  assert.equal(updated.template.links[0].files, true);
+  await assert.rejects(api("templates", "delete", { id: imported.id, revision: imported.revision }), /Şablon değişti/);
+  await editTemplateButton.click();
+  await dialog.getByRole("checkbox", { name: "Oturumları ve bağlantıları mevcut haritadan al" }).check();
+  await dialog.getByRole("button", { name: "Kaydet", exact: true }).click();
+  await templateChoice.waitFor();
+  const recaptured = (await api("templates", "list")).find((entry) => entry.id === imported.id);
+  assert.equal(recaptured.template.name, "Updated map");
+  assert.deepEqual(recaptured.template.sessions, capture.template.sessions);
+  assert.deepEqual(recaptured.template.links, capture.template.links);
+  await deleteTemplateButton.click();
+  await dialog.getByRole("button", { name: "Vazgeç", exact: true }).click();
+  await templateChoice.waitFor();
+  assert.equal(await templateChoice.inputValue(), imported.id);
+  await deleteTemplateButton.click();
+  await dialog.getByRole("button", { name: "Sil", exact: true }).click();
+  await templateChoice.waitFor();
+  const templates = await api("templates", "list");
+  assert.equal(templates.filter((entry) => entry.id.startsWith("builtin:")).length, 3);
+  assert(templates.some((entry) => entry.id === capture.id));
+  assert(!templates.some((entry) => entry.id === imported.id));
+  const afterDeletion = await api("app", "state");
+  assert.deepEqual(afterDeletion.sessions, afterTemplate.sessions);
+  assert.deepEqual(afterDeletion.links, afterTemplate.links);
+  await dialog.getByRole("button", { name: "Vazgeç", exact: true }).click();
+  await dialog.waitFor({ state: "hidden" });
+  console.log("PASS custom template edit, recapture, stale revision, safe deletion and built-in protection");
+  console.log("PASS template UI, five-session map, isolated creation and portable import/export");
   const out = path.join(root, "test-results");
   fs.mkdirSync(out, { recursive: true });
   await page.evaluate(() => window.workflow.openPanel("browser"));
@@ -2183,6 +2258,33 @@ async function test() {
     previewUrl,
   );
   await stop();
+  const setupProfile = path.join(temporary, "clean-setup-profile");
+  await start("codex,claude,copilot", setupProfile);
+  const setupDialog = page.locator("#dialog");
+  await setupDialog.getByRole("heading", { name: "Provider setup" }).waitFor();
+  await setupDialog.getByRole("button", { name: "Skip", exact: true }).click();
+  await page.locator("#app-settings").click();
+  await setupDialog.getByRole("button", { name: "Provider setup", exact: true }).click();
+  await setupDialog.getByText("Detect", { exact: true }).waitFor();
+  await setupDialog.getByRole("button", { name: "Next", exact: true }).click();
+  await setupDialog.getByText(/Anthropic\.ClaudeCode/).waitFor();
+  await assert.rejects(api("app", "provider_install", { provider: "claude", method: "winget" }), /önce onayla/);
+  await setupDialog.getByRole("button", { name: "Skip", exact: true }).click();
+  await page.locator("#session-templates").click();
+  await setupDialog.getByText("Claude Code is not installed. Choose another provider.").waitFor();
+  assert.equal(await setupDialog.getByRole("button", { name: "Create sessions" }).isDisabled(), true);
+  await stop();
+  await start("claude,copilot", setupProfile);
+  const alternateProject = await api("app", "add_project", { directory: templateProjectPath });
+  await page.locator("#session-templates").click();
+  const alternateDialog = page.locator("#dialog");
+  await alternateDialog.getByLabel("Implementation · Separate folder").selectOption("codex");
+  await alternateDialog.getByRole("button", { name: "Create sessions" }).click();
+  await alternateDialog.waitFor({ state: "hidden" });
+  const alternateSessions = (await api("app", "state")).sessions.filter((item) => item.projectId === alternateProject.id);
+  assert.deepEqual(alternateSessions.map((item) => item.provider), ["codex", "codex"]);
+  await stop();
+  console.log("PASS setup detection, installer confirmation guard and unavailable template providers");
   console.log("PASS application exit closes all providers; reopen starts none");
   fs.writeFileSync(
     path.join(out, "integration.json"),

@@ -25,6 +25,7 @@
           <button class="primary" id="new-session">+ Yeni oturum</button
           ><button class="icon" id="refresh" title="Yenile">↻</button>
         </div>
+        <button id="session-templates">Şablondan başlat</button>
         <div class="teams-control" data-state="disconnected">
           <span class="teams-icon" aria-hidden="true">
             <svg viewBox="0 0 24 24">
@@ -78,8 +79,9 @@
             class="quiet"
             id="show-providers"
             title="Sağlayıcıları göster/gizle"
+            aria-label="Sağlayıcılar"
           >
-            ◎
+            <span>Sağlayıcılar</span><span class="badge" id="provider-count">0/3</span>
           </button>
           <div class="view-switch">
             <button id="view-map" class="selected" title="Çalışma haritası">

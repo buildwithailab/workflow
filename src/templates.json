@@ -1,0 +1,35 @@
+[
+  {
+    "version": 1, "name": "Code + Review",
+    "sessions": [
+      {"name":"Implementation","provider":"claude","workspaceMode":"isolated","initialPrompt":"Implement the requested change in this workspace and verify it with tests.","position":{"x":40,"y":50}},
+      {"name":"Review","provider":"codex","workspaceMode":"isolated","initialPrompt":"Review the implementation for correctness, regressions, and missing tests.","position":{"x":900,"y":50}}
+    ],
+    "links": [{"source":1,"target":0,"read":false,"files":true,"work":false}]
+  },
+  {
+    "version": 1, "name": "Feature Development",
+    "sessions": [
+      {"name":"Requirements","provider":"claude","workspaceMode":"isolated","initialPrompt":"Define the acceptance criteria and edge cases for the requested feature.","position":{"x":1700,"y":50}},
+      {"name":"Implementation","provider":"codex","workspaceMode":"isolated","initialPrompt":"Read the requirements, implement the feature, and request a review and browser verification.","position":{"x":870,"y":520}},
+      {"name":"API Review","provider":"codex","workspaceMode":"isolated","initialPrompt":"Inspect the implementation and review the API contract, validation, and regressions.","position":{"x":40,"y":520}},
+      {"name":"Browser QA","provider":"copilot","workspaceMode":"isolated","initialPrompt":"Verify the supplied preview against the acceptance criteria and record the results.","position":{"x":1700,"y":630}},
+      {"name":"Release Notes","provider":"claude","workspaceMode":"isolated","initialPrompt":"Write a short release note based on the verified behavior.","position":{"x":1700,"y":1210}}
+    ],
+    "links": [
+      {"source":1,"target":0,"read":true,"files":false,"work":false},
+      {"source":1,"target":2,"read":false,"files":false,"work":true},
+      {"source":2,"target":1,"read":false,"files":true,"work":false},
+      {"source":1,"target":3,"read":false,"files":false,"work":true},
+      {"source":1,"target":4,"read":false,"files":false,"work":true}
+    ]
+  },
+  {
+    "version": 1, "name": "Debugging",
+    "sessions": [
+      {"name":"Debug","provider":"claude","workspaceMode":"isolated","initialPrompt":"Investigate the reported behavior and find its root cause.","position":{"x":40,"y":50}},
+      {"name":"Regression Tests","provider":"codex","workspaceMode":"isolated","initialPrompt":"Use the debugging findings to add a regression test for the intended behavior.","position":{"x":900,"y":50}}
+    ],
+    "links": [{"source":1,"target":0,"read":true,"files":true,"work":false}]
+  }
+]

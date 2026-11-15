@@ -122,6 +122,13 @@ pub fn executable(provider: &str, custom: Option<&str>) -> Option<PathBuf> {
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();
     folders.push(home().join(".local/bin"));
     folders.push(home().join("AppData/Roaming/npm"));
+    #[cfg(windows)]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        folders.extend([
+            local.join("Microsoft/WinGet/Links"),
+            local.join("Microsoft/WindowsApps"),
+        ]);
+    }
     for folder in folders {
         for ext in if cfg!(windows) {
             vec![".exe", ".cmd", ".bat", ".ps1", ""]

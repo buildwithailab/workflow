@@ -176,6 +176,11 @@ pub(crate) fn copilot_windows(result: &Value) -> Vec<Value> {
 }
 pub(crate) fn executable(core: &Core, provider: &str) -> Option<PathBuf> {
     if std::env::var("WORKFLOW_TEST_MODE").ok().as_deref() == Some("1") {
+        if std::env::var("WORKFLOW_TEST_MISSING_PROVIDERS")
+            .is_ok_and(|list| list.split(',').any(|id| id == provider))
+        {
+            return None;
+        }
         if let Some(exe) = std::env::var_os("WORKFLOW_TEST_RPC_EXE") {
             return Some(PathBuf::from(exe));
         }
