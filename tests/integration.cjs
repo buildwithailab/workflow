@@ -2289,6 +2289,29 @@ async function test() {
   await until(async () => !(await api("app", "state")).active.some((run) =>
     [...ruleSessions.map(({ session }) => session.id), worktreeRules.id, directGitRules.id, directRules.id].includes(run.id)), "shared instructions test terminals stopped");
   console.log("PASS project row alignment, external instructions for all three providers, unchanged Git state, reattach, and legacy cleanup");
+  const securityProjectPath = path.join(temporary, "security-template-project");
+  fs.mkdirSync(securityProjectPath);
+  const securityProject = await api("app", "add_project", { directory: securityProjectPath });
+  await page.evaluate((id) => window.workflow.selectProject(id), securityProject.id);
+  await openTemplateMenu();
+  await page.locator("#session-template-items").getByRole("button", { name: "Güvenlik Taraması", exact: true }).click();
+  assert.equal(await dialog.getByLabel("Şablon", { exact: true }).inputValue(), "builtin:3");
+  await dialog.getByRole("button", { name: "Oturumları oluştur" }).click();
+  await dialog.waitFor({ state: "hidden" });
+  const securityState = await api("app", "state");
+  const securitySessions = securityState.sessions.filter((item) => item.projectId === securityProject.id);
+  assert.deepEqual(securitySessions.map((item) => item.name),
+    ["Code Security Review", "Dependencies & Configuration", "Findings Summary"]);
+  assert(securitySessions.every((item) => item.provider === "claude" && item.initialPrompt && item.workspaceKind === "copy"));
+  const [codeReview, dependencyReview, findingsSummary] = securitySessions;
+  const securityIds = new Set(securitySessions.map((item) => item.id));
+  assert(!securityState.active.some((run) => securityIds.has(run.id)));
+  const securityLinks = securityState.links.filter((link) => securityIds.has(link.source) || securityIds.has(link.target));
+  assert.deepEqual(securityLinks.map(({ source, target, read, files, work }) => ({ source, target, read, files, work })), [
+    { source: findingsSummary.id, target: codeReview.id, read: true, files: false, work: false },
+    { source: findingsSummary.id, target: dependencyReview.id, read: true, files: false, work: false },
+  ]);
+  console.log("PASS built-in security template creates three idle workspaces and conversation-only links");
   const templateProjectPath = path.join(temporary, "template-project");
   fs.mkdirSync(templateProjectPath);
   const templateProject = await api("app", "add_project", { directory: templateProjectPath });
@@ -2301,12 +2324,20 @@ async function test() {
   await page.locator("#session-template-items [data-template-id='builtin:1']").click();
   await dialog.getByRole("heading", { name: "İş akışı şablonları" }).waitFor();
   assert.equal(await dialog.getByLabel("Şablon", { exact: true }).inputValue(), "builtin:1");
+  const implementationProvider = dialog.getByLabel("Implementation · Ayrı klasör", { exact: true });
+  const reviewProvider = dialog.getByLabel("API Review · Ayrı klasör", { exact: true });
+  const browserProvider = dialog.getByLabel("Browser QA · Ayrı klasör", { exact: true });
+  assert.equal(await implementationProvider.inputValue(), "claude");
+  assert.equal(await reviewProvider.inputValue(), "claude");
+  assert.equal(await browserProvider.inputValue(), "copilot");
+  await implementationProvider.selectOption("codex");
   await dialog.getByRole("button", { name: "Oturumları oluştur" }).click();
   await dialog.waitFor({ state: "hidden" });
   const afterTemplate = await api("app", "state");
   const created = afterTemplate.sessions.filter((item) => item.projectId === templateProject.id);
   assert.equal(created.length, 5);
   assert(created.every((item) => item.initialPrompt && item.workspaceKind === "copy"));
+  assert.deepEqual(created.map((item) => item.provider), ["claude", "codex", "claude", "copilot", "claude"]);
   const bySession = (runs) => [...runs].sort((a, b) => a.id.localeCompare(b.id));
   assert.deepEqual(bySession(afterTemplate.active), bySession(activeBeforeLanguageChange));
   const ids = new Set(created.map((item) => item.id));
@@ -2316,7 +2347,7 @@ async function test() {
   await api("templates", "export", { id: capture.id, path: exportPath });
   await assert.rejects(api("templates", "export", { id: capture.id, path: exportPath }), /yeni bir dosya adı/);
   const exported = fs.readFileSync(exportPath, "utf8");
-  assert(!/accountId|conversationId|directory|projectId/.test(exported));
+  assert(!/accountId|conversationId|directory|projectId|selectedProviders/.test(exported));
   assert(!exported.includes(created[0].id));
   const imported = await api("templates", "import", { path: exportPath });
   assert.deepEqual(imported.template, capture.template);
@@ -2326,6 +2357,17 @@ async function test() {
   const deleteTemplateButton = dialog.getByRole("button", { name: "Şablonu sil" });
   assert.equal(await editTemplateButton.isVisible(), false);
   assert.equal(await deleteTemplateButton.isVisible(), false);
+  await templateChoice.selectOption("builtin:0");
+  assert.equal(await implementationProvider.inputValue(), "claude");
+  assert.equal(await dialog.getByLabel("Review · Ayrı klasör", { exact: true }).inputValue(), "claude");
+  await templateChoice.selectOption("builtin:1");
+  assert.equal(await implementationProvider.inputValue(), "codex");
+  await implementationProvider.selectOption("claude");
+  await dialog.getByRole("button", { name: "Vazgeç", exact: true }).click();
+  await dialog.waitFor({ state: "hidden" });
+  await openTemplateManager();
+  await templateChoice.selectOption("builtin:1");
+  assert.equal(await implementationProvider.inputValue(), "codex");
   for (const action of ["update", "delete"]) {
     await assert.rejects(api("templates", action, { id: "builtin:1" }), /Hazır şablonlar/);
   }
@@ -2359,7 +2401,7 @@ async function test() {
   await dialog.getByRole("button", { name: "Sil", exact: true }).click();
   await templateChoice.waitFor();
   const templates = await api("templates", "list");
-  assert.equal(templates.filter((entry) => entry.id.startsWith("builtin:")).length, 3);
+  assert.equal(templates.filter((entry) => entry.id.startsWith("builtin:")).length, 4);
   assert(templates.some((entry) => entry.id === capture.id));
   assert(!templates.some((entry) => entry.id === imported.id));
   const afterDeletion = await api("app", "state");
@@ -2403,6 +2445,13 @@ async function test() {
   await start();
   await page.getByRole("button", { name: "+ Yeni oturum", exact: true }).waitFor();
   assert.equal((await api("app", "state")).active.length, 0);
+  await openTemplateManager();
+  const restoredTemplateDialog = page.locator("#dialog");
+  await restoredTemplateDialog.getByLabel("Şablon", { exact: true }).selectOption("builtin:1");
+  assert.equal(await restoredTemplateDialog.getByLabel("Implementation · Ayrı klasör", { exact: true }).inputValue(), "codex");
+  assert.equal(await restoredTemplateDialog.getByLabel("Browser QA · Ayrı klasör", { exact: true }).inputValue(), "copilot");
+  await restoredTemplateDialog.getByRole("button", { name: "Vazgeç", exact: true }).click();
+  console.log("PASS template provider defaults, saved per-role selection, cancellation and restart");
   for (const { id, accounts } of await api("app", "providers")) {
     assert.equal(accounts[0].id, "default");
     assert(accounts.some((a) => a.id === addedAccounts[id] && a.verified));
@@ -2441,7 +2490,7 @@ async function test() {
   await assert.rejects(api("app", "provider_install", { provider: "claude", method: "winget" }), /önce onayla/);
   await setupDialog.getByRole("button", { name: "Skip", exact: true }).click();
   await openTemplateManager();
-  await setupDialog.getByText("Claude Code is not installed. Choose another provider.").waitFor();
+  await setupDialog.getByText("Claude Code is not installed. Choose another provider.").first().waitFor();
   assert.equal(await setupDialog.getByRole("button", { name: "Create sessions" }).isDisabled(), true);
   await stop();
   await start("claude,copilot", setupProfile);
@@ -2449,6 +2498,7 @@ async function test() {
   await openTemplateManager();
   const alternateDialog = page.locator("#dialog");
   await alternateDialog.getByLabel("Implementation · Separate folder").selectOption("codex");
+  await alternateDialog.getByLabel("Review · Separate folder").selectOption("codex");
   await alternateDialog.getByRole("button", { name: "Create sessions" }).click();
   await alternateDialog.waitFor({ state: "hidden" });
   const alternateSessions = (await api("app", "state")).sessions.filter((item) => item.projectId === alternateProject.id);

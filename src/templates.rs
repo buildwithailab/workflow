@@ -157,6 +157,30 @@ fn template_entry(key: &str, template: &Template) -> Result<Value> {
     Ok(json!({"id":key,"template":template,"revision":revision}))
 }
 
+fn provider_layout(template: &Template) -> Result<String> {
+    let slots: Vec<_> = template
+        .sessions
+        .iter()
+        .map(|session| (&session.name, &session.provider, &session.position))
+        .collect();
+    Ok(hash(&serde_json::to_vec(&slots)?))
+}
+
+fn catalog_entry(key: &str, template: &Template, preferences: &Value) -> Result<Value> {
+    let mut entry = if key.starts_with("builtin:") {
+        json!({"id":key,"template":template})
+    } else {
+        template_entry(key, template)?
+    };
+    let saved = &preferences[key];
+    if let Some(layout) = saved["layout"].as_str() {
+        if layout == provider_layout(template)? {
+            entry["selectedProviders"] = saved["providers"].clone();
+        }
+    }
+    Ok(entry)
+}
+
 fn verify_revision(path: &Path, args: &Value) -> Result<()> {
     let current = read_template(path)?;
     if hash(&serde_json::to_vec(&current)?) != string(args, "revision")? {
@@ -245,7 +269,8 @@ fn apply(core: &Core, args: &Value) -> Result<Value> {
     if project["removed"] == true {
         bail!("Projeyi önce çalışma alanına ekle.");
     }
-    let template = local_template(core, string(args, "id")?)?;
+    let template_id = string(args, "id")?;
+    let template = local_template(core, template_id)?;
     template.validate()?;
     let providers = args["providers"]
         .as_array()
@@ -313,6 +338,8 @@ fn apply(core: &Core, args: &Value) -> Result<Value> {
             .unwrap()
             .extend(sessions.iter().cloned());
         updated["links"].as_array_mut().unwrap().extend(links);
+        updated["preferences"]["templateProviders"][template_id] =
+            json!({"layout":provider_layout(&template)?,"providers":providers});
         core.save_workspace(&updated)?;
         *db = updated;
         Ok(())
@@ -336,11 +363,14 @@ fn apply(core: &Core, args: &Value) -> Result<Value> {
 pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
     match action {
         "list" => {
+            let preferences = core.db.lock().unwrap()["preferences"]["templateProviders"].clone();
             let mut templates: Vec<_> = builtins()?
                 .into_iter()
                 .enumerate()
-                .map(|(i, template)| json!({"id":format!("builtin:{i}"),"template":template}))
-                .collect();
+                .map(|(i, template)| {
+                    catalog_entry(&format!("builtin:{i}"), &template, &preferences)
+                })
+                .collect::<Result<_>>()?;
             let directory = safe_path(&core.directory, "templates")?;
             fs::create_dir_all(&directory)?;
             for entry in fs::read_dir(directory)? {
@@ -358,7 +388,7 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
                     continue;
                 };
                 if let Ok(template) = read_template(&path) {
-                    templates.push(template_entry(&key.to_string(), &template)?);
+                    templates.push(catalog_entry(&key.to_string(), &template, &preferences)?);
                 }
             }
             Ok(json!(templates))

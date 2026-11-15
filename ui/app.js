@@ -2496,7 +2496,12 @@ function editTemplate(entry, projectId, destinationId) {
 }
 
 function templateTitle(entry) {
-  const builtInTitles = { "builtin:0": "Kod + İnceleme", "builtin:1": "Özellik geliştirme", "builtin:2": "Hata ayıklama" };
+  const builtInTitles = {
+    "builtin:0": "Kod + İnceleme",
+    "builtin:1": "Özellik geliştirme",
+    "builtin:2": "Hata ayıklama",
+    "builtin:3": "Güvenlik Taraması",
+  };
   return uiLanguage === "tr" && Object.hasOwn(builtInTitles, entry.id)
     ? builtInTitles[entry.id] : entry.template.name;
 }
@@ -2526,16 +2531,22 @@ async function openTemplates(selectedId, destinationId = projectId) {
     const entry = selection();
     const { template } = entry;
     edit.hidden = remove.hidden = !entry.revision;
-    choices = template.sessions.map((session) => select([
+    const options = [
       { id: "", label: tr("Sağlayıcı seç") },
       ...installed.map((id) => ({ id, label: names[id] })),
-    ], installed.includes(session.provider) ? session.provider : ""));
+    ];
+    choices = [];
     preview.replaceChildren(...template.sessions.map((session, index) => {
+      const saved = entry.selectedProviders?.[index];
+      const provider = Object.hasOwn(names, saved) ? saved : session.provider;
+      const available = installed.includes(provider);
+      const choice = select(options, available ? provider : "");
+      choices.push(choice);
       const label = session.name + " · " + tr(session.workspaceMode === "direct" ? "Mevcut klasör" : "Ayrı klasör");
       const row = el("section", "setup-row");
-      row.append(field(label, choices[index]));
-      if (!installed.includes(session.provider))
-        row.append(el("small", "link-reapproval", tr("{provider} kurulu değil. Başka bir sağlayıcı seç.", { provider: names[session.provider] })));
+      row.append(field(label, choice));
+      if (!available)
+        row.append(el("small", "link-reapproval", tr("{provider} kurulu değil. Başka bir sağlayıcı seç.", { provider: names[provider] })));
       return row;
     }));
     if (template.links.length) {

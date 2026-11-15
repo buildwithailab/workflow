@@ -2,19 +2,19 @@
   {
     "version": 1, "name": "Code + Review",
     "sessions": [
-      {"name":"Implementation","provider":"claude","workspaceMode":"isolated","initialPrompt":"Implement the requested change in this workspace and verify it with tests.","position":{"x":40,"y":50}},
-      {"name":"Review","provider":"codex","workspaceMode":"isolated","initialPrompt":"Review the implementation for correctness, regressions, and missing tests.","position":{"x":900,"y":50}}
+      {"name":"Implementation","provider":"claude","workspaceMode":"isolated","initialPrompt":"Implement the requested change in this workspace. Record the task scope, acceptance criteria, changed behavior, and test commands and results in this conversation. Flag any checks that could not be run so Review can distinguish them from verified results.","position":{"x":40,"y":50}},
+      {"name":"Review","provider":"claude","workspaceMode":"isolated","initialPrompt":"Use Workflow MCP to read the linked Implementation conversation and inspect its changed files. Review the change against the acceptance criteria for correctness, regressions, and missing tests. Keep this review read-only. Report findings in severity order with file and line, impact, and suggested correction. State any files or checks you could not verify.","position":{"x":900,"y":50}}
     ],
-    "links": [{"source":1,"target":0,"read":false,"files":true,"work":false}]
+    "links": [{"source":1,"target":0,"read":true,"files":true,"work":false}]
   },
   {
     "version": 1, "name": "Feature Development",
     "sessions": [
-      {"name":"Requirements","provider":"claude","workspaceMode":"isolated","initialPrompt":"Define the acceptance criteria and edge cases for the requested feature.","position":{"x":1700,"y":50}},
-      {"name":"Implementation","provider":"codex","workspaceMode":"isolated","initialPrompt":"Read the requirements, implement the feature, and request a review and browser verification.","position":{"x":870,"y":520}},
-      {"name":"API Review","provider":"codex","workspaceMode":"isolated","initialPrompt":"Inspect the implementation and review the API contract, validation, and regressions.","position":{"x":40,"y":520}},
-      {"name":"Browser QA","provider":"copilot","workspaceMode":"isolated","initialPrompt":"Verify the supplied preview against the acceptance criteria and record the results.","position":{"x":1700,"y":630}},
-      {"name":"Release Notes","provider":"claude","workspaceMode":"isolated","initialPrompt":"Write a short release note based on the verified behavior.","position":{"x":1700,"y":1210}}
+      {"name":"Requirements","provider":"claude","workspaceMode":"isolated","initialPrompt":"State the user goal, scope, exclusions, and open questions. Publish numbered acceptance criteria in this conversation, including expected browser behavior, relevant API contracts, and edge cases. Flag any unresolved criteria for Implementation.","position":{"x":1700,"y":50}},
+      {"name":"Implementation","provider":"claude","workspaceMode":"isolated","initialPrompt":"Use Workflow MCP to read Requirements. Implement the agreed scope, run relevant checks, and start the preview from this workspace. Use request_work to send API Review the changed endpoints and files, relevant acceptance criteria, and test evidence. Send Browser QA the reachable preview URL, any test-data setup, exact steps, expected results, and the numbered acceptance criteria. Keep the preview running while QA uses it. Track both requests with read_result and address findings before asking for another check. Wait for completed review and QA results before asking Release Notes to draft a note. Pass verified user-visible changes, the evidence supporting them, and any known limitations or blocked checks, clearly marked. Treat pending checks as pending.","position":{"x":870,"y":520}},
+      {"name":"API Review","provider":"claude","workspaceMode":"isolated","initialPrompt":"Use Workflow MCP to inspect the linked Implementation files for the changed API behavior named in the request. Review the contract, validation, errors, and regression risk against the supplied acceptance criteria. Return findings with severity, file and line, impact, and suggested correction. Mark gaps in evidence and use report_result for an accepted work request.","position":{"x":40,"y":520}},
+      {"name":"Browser QA","provider":"copilot","workspaceMode":"isolated","initialPrompt":"Open the preview URL from the request in the Workflow browser. Use the supplied test-data setup and steps to check the numbered acceptance criteria. Record an expected and observed result per criterion and mark each as Passed, Failed, or Blocked. If the URL, steps, or prerequisites are missing, report the blocker. Include browser test evidence and use report_result for an accepted work request.","position":{"x":1700,"y":630}},
+      {"name":"Release Notes","provider":"claude","workspaceMode":"isolated","initialPrompt":"Draft a short user-facing release note from the verified behavior and evidence supplied by Implementation. Explain who is affected, what changed, and any relevant known limitations or steps users need to take. Treat blocked or unverified behavior as a limitation when relevant. Use report_result to return the draft for an accepted work request.","position":{"x":1700,"y":1210}}
     ],
     "links": [
       {"source":1,"target":0,"read":true,"files":false,"work":false},
@@ -27,9 +27,24 @@
   {
     "version": 1, "name": "Debugging",
     "sessions": [
-      {"name":"Debug","provider":"claude","workspaceMode":"isolated","initialPrompt":"Investigate the reported behavior and find its root cause.","position":{"x":40,"y":50}},
-      {"name":"Regression Tests","provider":"codex","workspaceMode":"isolated","initialPrompt":"Use the debugging findings to add a regression test for the intended behavior.","position":{"x":900,"y":50}}
+      {"name":"Debug","provider":"claude","workspaceMode":"isolated","initialPrompt":"Reproduce the reported bug and record the base revision, steps, expected behavior, and root cause in this conversation. When Regression Tests publishes a test, read its report and test file through Workflow MCP and bring the test into this workspace. Confirm it fails on the original behavior, apply the fix here, and rerun the test and relevant checks. Report the before and after results and mark any verification you could not complete.","position":{"x":40,"y":50}},
+      {"name":"Regression Tests","provider":"claude","workspaceMode":"isolated","initialPrompt":"Read the linked Debug diagnosis and relevant files through Workflow MCP. Add a focused regression test in this workspace against the reported base revision and show that it detects the bug before the fix. Post the test file path, command, and result in this conversation so Debug can bring the test into the fix workspace. Flag any reproduction blockers and leave the fix to Debug.","position":{"x":900,"y":50}}
     ],
-    "links": [{"source":1,"target":0,"read":true,"files":true,"work":false}]
+    "links": [
+      {"source":1,"target":0,"read":true,"files":true,"work":false},
+      {"source":0,"target":1,"read":true,"files":true,"work":false}
+    ]
+  },
+  {
+    "version": 1, "name": "Security Scan",
+    "sessions": [
+      {"name":"Code Security Review","provider":"claude","workspaceMode":"isolated","initialPrompt":"Use static, read-only inspection of the project source. Review authorization, input validation, and sensitive data handling. Leave project files and the application runtime untouched. Post findings in this conversation with the reviewed revision, file and line references, impact, confidence, and suggested fixes. Report possible secrets by location and type only.","position":{"x":40,"y":50}},
+      {"name":"Dependencies & Configuration","provider":"claude","workspaceMode":"isolated","initialPrompt":"Use static, read-only inspection of dependency manifests, lockfiles, and configuration. Check published advisory records and leave packages and project files untouched. Post findings in this conversation with the reviewed revision, locked versions, affected ranges, advisory links and access date, and suggested mitigations. Mark unverified matches as requiring confirmation. Report possible secrets by location and type only.","position":{"x":40,"y":630}},
+      {"name":"Findings Summary","provider":"claude","workspaceMode":"isolated","initialPrompt":"Use Workflow MCP to read the two linked review conversations. Combine completed reports, deduplicate findings, prioritize confirmed issues by impact, and cite the source evidence and suggested fixes. Mark missing reports as pending and unverified items as requiring confirmation. Refer to possible secrets by location and type only.","position":{"x":900,"y":340}}
+    ],
+    "links": [
+      {"source":2,"target":0,"read":true,"files":false,"work":false},
+      {"source":2,"target":1,"read":true,"files":false,"work":false}
+    ]
   }
 ]
