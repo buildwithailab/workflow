@@ -1,0 +1,59 @@
+name: Bug Report
+description: Report a reproducible problem in Workflow.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Bug reports are public. Remove personal information, credentials, account details, conversation IDs, and session data from anything you share.
+
+        Use [private vulnerability reporting](https://github.com/buildwithailab/workflow/security/advisories/new) for security vulnerabilities.
+  - type: input
+    id: workflow-version
+    attributes:
+      label: Workflow version
+      description: Include the release version or commit SHA for a source build.
+      placeholder: v0.1.1
+    validations:
+      required: true
+  - type: input
+    id: windows-version
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 24H2
+    validations:
+      required: true
+  - type: input
+    id: affected-component
+    attributes:
+      label: Affected area or provider
+      description: Include the provider CLI version, browser mode, or workspace mode if relevant.
+      placeholder: Built-in browser, or Codex CLI with a separate workspace
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Describe the smallest setup and sequence that triggers the problem. Use sample data where possible.
+      placeholder: |
+        1. Open a session in a sample project.
+        2. …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Describe what happened and whether it happens every time.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Screenshots or log excerpts
+      description: Share only relevant, sanitized excerpts or screenshots. Check screenshots for private project names, paths, chat messages, and account details.

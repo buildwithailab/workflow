@@ -1,0 +1,34 @@
+name: Feature Request
+description: Suggest an improvement to Workflow.
+title: "[Feature] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature requests are public. Use sample data and remove personal information, credentials, and session details from examples or screenshots.
+
+        Use [private vulnerability reporting](https://github.com/buildwithailab/workflow/security/advisories/new) for security vulnerabilities.
+  - type: textarea
+    id: workflow-problem
+    attributes:
+      label: What are you trying to accomplish?
+      description: Describe your workflow, where you get stuck, and how often it happens.
+    validations:
+      required: true
+  - type: textarea
+    id: desired-behavior
+    attributes:
+      label: What would you like Workflow to do?
+      description: Describe the behavior you want and an example of how you would use it.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Current workaround or alternatives
+      description: Share what you do today or what else you considered.
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Mention any relevant providers, session permissions, browser modes, or workspace modes.
