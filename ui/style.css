@@ -284,6 +284,9 @@ pre {
 }
 #layout {
   --project-rail-width: 48px;
+  --rail-button-size: 34px;
+  --workspace-top: 20px;
+  --workspace-header-height: 43px;
   --sidebar-min: 180px;
   --main-min: 400px;
   --inspector-min: 310px;
@@ -344,7 +347,10 @@ body.no-left .sidebar {
   align-items: center;
   min-height: 0;
   gap: 7px;
-  padding: 12px 0 9px;
+  padding-block-start: calc(
+    var(--workspace-top) + (var(--workspace-header-height) - var(--rail-button-size)) / 2
+  );
+  padding-block-end: 9px;
   background: #101318;
   border-inline-end: 1px solid var(--line);
 }
@@ -371,8 +377,8 @@ body.no-left .sidebar {
   border-top: 1px solid var(--line);
 }
 .project-rail .icon {
-  width: 34px;
-  height: 34px;
+  width: var(--rail-button-size);
+  height: var(--rail-button-size);
 }
 .project-rail svg {
   width: 17px;
@@ -683,10 +689,10 @@ body.no-left .sidebar {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  padding: 20px 16px 0;
+  padding: var(--workspace-top) 16px 0;
 }
 .main-header {
-  min-height: 43px;
+  min-height: var(--workspace-header-height);
   display: flex;
   gap: 8px;
   align-items: center;
@@ -1394,7 +1400,7 @@ body.no-left .sidebar {
   border: 1px solid var(--line);
 }
 .summary-diff .diff-line {
-  grid-template-columns: 0 36px 36px minmax(max-content, 1fr);
+  grid-template-columns: 0 5ch 5ch 2ch minmax(0, 1fr);
 }
 #summary-links {
   display: flex;
@@ -1527,9 +1533,155 @@ body.no-left .sidebar {
   padding: 12px;
   overflow: auto;
 }
-.diff-line {
+#panel-changes {
+  container-type: inline-size;
+}
+.change-modes [aria-pressed="true"],
+.review-layout[aria-pressed="true"] {
+  color: var(--accent);
+  border-color: #536748;
+  background: #202b1d;
+}
+#changes-mode-history {
+  margin-left: auto;
+}
+.change-files {
+  flex: 0 1 auto;
+  min-height: 40px;
+  max-height: min(28vh, 230px);
+  overflow: auto;
+  border-bottom: 1px solid var(--line);
+}
+#git-history-picker > summary {
+  cursor: pointer;
+  padding: 9px 12px;
+  background: #1b232d;
+}
+.change-files .history-row {
+  width: 100%;
+  border: 0;
+  border-radius: 0;
+  text-align: left;
+}
+.change-files .history-row small {
+  flex-shrink: 0;
+}
+.change-files .file-row {
+  padding: 0 8px;
+  gap: 3px;
+}
+.change-files .file-row > .change-path {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: auto;
+  min-height: 34px;
+  padding: 4px;
+  text-align: left;
+  font-size: 12px;
+  border-color: transparent;
+  background: transparent;
+}
+.change-files .file-row.active {
+  box-shadow: inset 2px 0 var(--accent);
+}
+.change-heading {
   display: grid;
-  grid-template-columns: 22px 36px 36px minmax(max-content, 1fr);
+  gap: 3px;
+  min-width: 100%;
+}
+.change-heading small {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.change-heading code {
+  overflow-wrap: anywhere;
+}
+.change-stats {
+  display: inline-flex;
+  flex: none;
+  gap: 6px;
+  font: 11px Consolas, monospace;
+}
+.change-stats .added {
+  color: #a9db98;
+}
+.change-stats .removed {
+  color: #ec9aa8;
+}
+.change-restore {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-left: auto;
+}
+#change-review {
+  display: flex;
+  flex-direction: column;
+  flex: 1 0 170px;
+  min-height: 170px;
+  min-width: 0;
+}
+#change-diff {
+  flex: 1;
+  min-height: 0;
+}
+.review-controls {
+  position: sticky;
+  top: 0;
+  left: 0;
+  z-index: 1;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 4px 8px;
+}
+.review-controls button {
+  font-size: 11px;
+  padding: 4px 8px;
+}
+.review-position {
+  color: var(--muted);
+}
+.review-layout {
+  display: none;
+  margin-left: auto;
+}
+.review-lines {
+  min-width: max-content;
+}
+.review-chunk.current {
+  box-shadow: inset 2px 0 var(--accent);
+}
+.review-chunk.current .review-sign {
+  color: var(--accent);
+}
+.review-fold > summary,
+.review-gap,
+.review-notes {
+  padding: 4px 12px;
+  background: #1b232d;
+  color: var(--muted);
+  font: 11px/1.65 Consolas, monospace;
+}
+.review-fold > summary {
+  cursor: pointer;
+}
+.review-notes {
+  margin: 0;
+  overflow-x: auto;
+}
+.review-context .context-new {
+  display: none;
+}
+.review-line {
+  display: grid;
+  grid-template-columns: 22px 5ch 5ch 2ch minmax(0, 1fr);
   font:
     12px/1.75 Consolas,
     monospace;
@@ -1544,14 +1696,14 @@ body.no-left .sidebar {
   background: #321d27;
   color: #f0b4bf;
 }
-.diff-line .number {
+.review-line .number {
   font-size: 10px;
   color: #8e9dab;
   text-align: right;
   padding-right: 7px;
   user-select: none;
 }
-.diff-line input {
+.review-line input {
   width: 13px;
   height: 13px;
   margin: 4px;
@@ -1559,25 +1711,49 @@ body.no-left .sidebar {
 .diff-view {
   overflow: auto;
 }
-.diff-plain {
-  font:
-    12px/1.75 Consolas,
-    monospace;
-  white-space: pre;
-  min-height: 21px;
-  padding: 0 10px;
+.review-code {
+  padding-right: 8px;
+  tab-size: 4;
 }
-.diff-plain.insert {
-  background: #142a20;
-  color: #c0e5ac;
+.review-code mark {
+  color: inherit;
+  background: #46673f;
 }
-.diff-plain.delete {
-  background: #321d27;
-  color: #f0b4bf;
+.review-line.delete mark {
+  background: #70424e;
 }
-.diff-plain.hunk {
-  background: #1d3548;
-  color: #adcbea;
+.review-newline {
+  margin-left: 8px;
+  color: var(--muted);
+}
+@container (min-width: 760px) {
+  .review-layout {
+    display: inline-block;
+  }
+  .review-diff.split .review-lines {
+    min-width: 0;
+  }
+  .review-diff.split :is(.review-chunk, .review-context) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .review-diff.split .review-line {
+    grid-template-columns: 22px 5ch 2ch minmax(0, 1fr);
+  }
+  .review-diff.split .context-new {
+    display: grid;
+  }
+  .review-diff.split :is(.delete, .context-old) .new,
+  .review-diff.split :is(.insert, .context-new) .old {
+    display: none;
+  }
+  .review-diff.split :is(.review-inserted, .context-new) {
+    border-left: 1px solid var(--line);
+  }
+  .review-diff.split .review-code {
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
 }
 .commit-input {
   width: 100%;
@@ -2008,8 +2184,11 @@ dialog::backdrop {
     --sidebar: 210px;
     --inspector: 420px;
   }
+  #layout {
+    --workspace-top: 15px;
+  }
   .main {
-    padding: 15px 10px 0;
+    padding-inline: 10px;
   }
   .brand strong {
     font-size: 20px;

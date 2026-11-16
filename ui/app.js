@@ -36,10 +36,15 @@ let db = {
   fileScope = "",
   fileSelection = null,
   fileReadRevision = 0,
-  changeFile = null,
+  changesPreference = "git",
+  changesHistory = false,
+  changesMode = null,
+  changesScope = "",
+  changeSelection = null,
+  changeRevision = 0,
+  historyRevision = 0,
   changeDiff = null,
   gitState = null,
-  historyCommits = [],
   selectedCommit = null,
   baseCommit = null,
   lastTransfer = null,
@@ -1865,6 +1870,7 @@ function remember() {
       camera,
       projectFocus,
       panel,
+      changesPreference,
       noLeft: document.body.classList.contains("no-left"),
       noRight: document.body.classList.contains("no-right"),
       showProviders: !$("#providers-section").hidden,
@@ -2666,9 +2672,14 @@ $("#show-providers").onclick = () => {
 };
 
 async function openPanel(tab, reveal = true) {
+  if (tab === "git") {
+    changesPreference = "git";
+    changesHistory = false;
+    tab = "changes";
+  }
   panel = tab;
   if (reveal) document.body.classList.remove("no-right");
-  for (const n of ["browser", "files", "changes", "git", "links", "summary"])
+  for (const n of ["browser", "files", "changes", "links", "summary"])
     $("#panel-" + n).hidden = n !== tab;
   $$("#panel-tabs button").forEach((b) =>
     b.classList.toggle("selected", b.dataset.tab === tab),
@@ -2677,7 +2688,6 @@ async function openPanel(tab, reveal = true) {
     browser: tr("Tarayıcı"),
     files: tr("Dosyalar"),
     changes: tr("Değişiklikler"),
-    git: "Git",
     links: tr("Oturum Bağlantıları"),
     summary: tr("Oturum Özeti"),
   }[tab];
@@ -2698,11 +2708,10 @@ async function refreshPanel() {
     (session(focusId) ? " · " + session(focusId).name : "");
   if (panel !== "browser") hideBrowser();
   if (panel === "summary") return loadSummary(token);
-  if (!projectId && panel !== "files") return;
+  if (!projectId && !["files", "changes"].includes(panel)) return;
   try {
     if (panel === "files") await loadFiles(token);
-    if (panel === "changes") await loadChanges(token);
-    if (panel === "git") await loadGit(token);
+    if (panel === "changes") await loadChangesPanel(token);
     if (panel === "links") renderLinks();
     if (panel === "browser") await loadBrowser();
   } catch (e) {
@@ -2795,8 +2804,14 @@ async function showSummaryDiff(sid, path, row, token) {
     const result = await api("files", "diff", { sessionId: sid, path });
     if (!current()) return;
     const body = el("div", "diff-view");
-    body.append(...diffRows(result));
-    diff.replaceChildren(el("h4", "", path), body);
+    renderDiff(body, result, null, true);
+    diff.replaceChildren(el("h4", "", path), body,
+      button(tr("Değişikliklerde aç"), async () => {
+        changesPreference = "session";
+        changesHistory = false;
+        changeSelection = { kind: "session", path, scope: sid };
+        await openPanel("changes");
+      }, "quiet"));
   } catch (e) {
     if (current())
       diff.replaceChildren(
@@ -2935,17 +2950,154 @@ $("#files-root").onclick = () => {
   refreshPanel().catch(error);
 };
 $("#files-reveal").onclick = () => api("app", "reveal", ctx()).catch(error);
-async function loadChanges(token = panelGeneration) {
-  const context = ctx();
-  const direct = session(focusId)?.workspaceKind === "direct";
-  $("#transfer-open").hidden = $("#transfer-undo").hidden = direct;
-  $("#restore-undo").disabled = !lastRestore || lastRestore.sessionId !== focusId;
-  if (!focusId) {
-    $("#change-list").replaceChildren(el("p", "empty", tr("Bir oturum seç.")));
-    return;
+function setChangesMode(mode) {
+  if (mode !== "history") changesPreference = mode;
+  changesHistory = mode === "history";
+  remember();
+  return refreshPanel();
+}
+for (const mode of ["session", "git", "history"])
+  $("#changes-mode-" + mode).onclick = () => setChangesMode(mode);
+
+function showCommitForm(open, focus = false) {
+  $("#git-commit-section").hidden = !open;
+  $("#show-commit").setAttribute("aria-expanded", String(open));
+  if (open && focus) $("#commit-message").focus();
+}
+$("#show-commit").onclick = () => showCommitForm($("#git-commit-section").hidden, true);
+
+function clearReview(message = "") {
+  changeRevision++;
+  changeDiff = null;
+  $("#change-review").hidden = !message;
+  $("#change-file").textContent = "";
+  $("#change-comparison").textContent = "";
+  $("#change-stats").hidden = true;
+  $("#change-restore").hidden = true;
+  $("#restore-file").disabled = $("#restore-lines").disabled = true;
+  $("#change-diff").replaceChildren(...(message ? [el("p", "help", message)] : []));
+}
+
+async function loadChangesPanel(token) {
+  const context = ctx(), sid = focusId;
+  const scope = sid || projectId || "";
+  const scopeChanged = changesScope !== scope;
+  if (scopeChanged) {
+    changesScope = scope;
+    if (changeSelection?.scope !== scope) changeSelection = null;
+    selectedCommit = baseCommit = null;
+    lastTransfer = null;
+    gitSelected.clear();
+    $("#commit-message").value = "";
+    $("#history-branch").value = "--all";
   }
+  const commitFormWasOpen = !scopeChanged && !$("#git-commit-section").hidden;
+  clearReview();
+  showCommitForm(false);
+  changesMode = null;
+  gitState = null;
+  for (const id of ["changes-session-actions", "changes-git-actions",
+    "changes-history-actions", "change-files", "changes-mode-git",
+    "changes-mode-session", "changes-mode-history"])
+    $("#" + id).hidden = true;
+  const empty = $("#changes-empty");
+  empty.hidden = false;
+  empty.textContent = tr(projectId ? "Değişiklikler yükleniyor…" : "Bir proje seç.");
+  if (!projectId) return;
+  const state = await api("git", "state", { ...context, reviewStats: true });
+  if (token !== panelGeneration) return;
+  gitState = state;
+  changesMode = state.available
+    ? changesHistory ? "history" : sid ? changesPreference : "git"
+    : sid ? "session" : null;
+  for (const [mode, available] of [
+    ["session", !!sid], ["git", state.available], ["history", state.available],
+  ]) {
+    const control = $("#changes-mode-" + mode);
+    control.hidden = !available;
+    control.setAttribute("aria-pressed", String(changesMode === mode));
+  }
+  empty.hidden = !!changesMode;
+  empty.textContent = tr("Oturum farkını görmek için bir oturum seç.");
+  if (!changesMode) return;
+  $("#change-files").hidden = false;
+  $("#change-list").hidden = changesMode !== "session";
+  $("#git-lists").hidden = changesMode !== "git";
+  $("#history-lists").hidden = changesMode !== "history";
+  if (changesMode === "session") await loadSessionReview(context, sid, token);
+  else if (changesMode === "git") {
+    $("#changes-git-actions").hidden = false;
+    showCommitForm(commitFormWasOpen);
+    await loadGitReview(context, state, token);
+  } else {
+    $("#changes-history-actions").hidden = false;
+    const choice = $("#history-branch"), value = choice.value;
+    choice.replaceChildren(new Option(tr("Tüm dallar"), "--all"),
+      ...state.branches.map((b) => new Option(b.name, b.name)));
+    choice.value = [...choice.options].some((o) => o.value === value) ? value : "--all";
+    await loadHistory(context, token);
+  }
+}
+
+function reviewFileRow(item, open) {
+  const row = el("div", "file-row");
+  const path = button("", () => open(row), "change-path", item.path);
+  path.setAttribute("aria-pressed", "false");
+  path.append(el("span", "status", item.status), el("code", "", item.path));
+  if (item.stats) path.append(diffStatsLabel(item.stats));
+  row.append(path);
+  return row;
+}
+
+async function showReview(selection, row, comparison, load, token = panelGeneration) {
+  const path = selection.path;
+  if (token !== panelGeneration) return;
+  clearReview(tr("Fark yükleniyor…"));
+  const revision = changeRevision;
+  const current = () => token === panelGeneration && revision === changeRevision;
+  changeSelection = { ...selection, scope: changesScope };
+  for (const item of $$("#change-files .file-row.active")) {
+    item.classList.remove("active");
+    item.querySelector(".change-path")?.setAttribute("aria-pressed", "false");
+  }
+  row.classList.add("active");
+  row.querySelector(".change-path").setAttribute("aria-pressed", "true");
+  $("#change-file").textContent = path;
+  $("#change-comparison").textContent = comparison;
+  try {
+    const response = await load();
+    if (!current()) return;
+    const result = response.lines || response.binary ? response : reviewPatch(response.patch ?? "");
+    if (!result.binary && result.lines?.length) {
+      const stats = reviewStats(result.lines);
+      $("#change-stats").replaceChildren(diffStatsLabel(stats));
+      $("#change-stats").hidden = false;
+      const label = row.querySelector(".change-stats") || el("span");
+      if (!label.parentElement) row.querySelector(".change-path").append(label);
+      label.replaceWith(diffStatsLabel(stats));
+    }
+    const editable = selection.kind === "session";
+    $("#change-restore").hidden = !editable;
+    $("#restore-file").disabled = !editable;
+    changeDiff = result;
+    renderDiff($("#change-diff"), result, editable ? () => {
+      $("#restore-lines").disabled = !$$("#change-diff input:checked").length;
+    } : null);
+  } catch (e) {
+    if (current()) $("#change-diff").replaceChildren(
+      el("p", "help", tr("Fark alınamadı. ") + uiError(e)),
+    );
+  }
+}
+
+async function loadSessionReview(context, sid, token) {
+  const direct = session(sid)?.workspaceKind === "direct";
+  const list = $("#change-list");
+  list.replaceChildren(el("p", "help", tr("Dosyalar karşılaştırılıyor…")));
+  $("#transfer-open").hidden = $("#transfer-undo").hidden = direct;
+  $("#restore-undo").disabled = !lastRestore || lastRestore.sessionId !== sid;
   const [rows, transfers] = await Promise.all([
-    api("files", "changes", context),
+    api("files", "changes", { ...context, reviewStats: true }),
     direct ? [] : api("files", "transfer_history", context),
   ]);
   if (token !== panelGeneration) return;
@@ -2953,67 +3105,37 @@ async function loadChanges(token = panelGeneration) {
     transfers.find((t) => ["applied", "prepared", "reverting"].includes(t.state)) ||
     null;
   $("#transfer-undo").disabled = !lastTransfer;
-  $("#change-list").replaceChildren();
+  $("#changes-session-actions").hidden = false;
+  list.replaceChildren();
+  const comparison = tr(direct
+    ? "Oturum başlangıcı → Mevcut dosyalar · Ortak klasördeki tüm düzenlemeler"
+    : "Oturum başlangıcı → Mevcut dosyalar");
+  const entries = [];
   for (const item of rows) {
-    const row = el("div", "file-row");
-    row.append(el("span", "status", item.status), el("code", "", item.path));
-    row.onclick = () => showChange(item.path).catch(error);
-    $("#change-list").append(row);
+    const open = (row) => showReview({ kind: "session", path: item.path },
+      row, comparison, () => api("files", "diff", { ...context, path: item.path }), token);
+    const row = reviewFileRow(item, open);
+    entries.push({ item, row, open });
+    list.append(row);
   }
+  await openReviewEntry(entries, "session");
   if (!rows.length)
-    $("#change-list").append(
-      el("p", "empty", tr("Başlangıç kaydına göre değişiklik yok.")),
-    );
-  if (changeFile && rows.some((r) => r.path === changeFile))
-    await showChange(changeFile);
-  else {
-    $("#change-diff").replaceChildren();
-    $("#restore-file").disabled = true;
-    $("#restore-lines").disabled = true;
-  }
+    list.append(el("p", "empty", tr("Başlangıç kaydına göre değişiklik yok.")));
 }
-async function showChange(path) {
-  const context = ctx(),
-    token = panelGeneration,
-    result = await api("files", "diff", { ...context, path });
-  if (token !== panelGeneration) return;
-  changeFile = path;
-  changeDiff = result;
-  $("#change-file").textContent = path;
-  $("#restore-file").disabled = false;
-  $("#restore-lines").disabled = true;
-  $("#change-diff").replaceChildren(
-    ...diffRows(result, () => {
-      $("#restore-lines").disabled = !$$("#change-diff input:checked").length;
-    }),
-  );
-}
-function diffRows(result, onSelect) {
-  if (result.binary) return [el("p", "empty", tr("İkili dosya değişikliği"))];
-  return result.lines.map((line) => {
-    const row = el("div", "diff-line " + line.tag);
-    if (onSelect && line.tag !== "equal") {
-      const c = el("input");
-      c.type = "checkbox";
-      c.dataset.index = line.index;
-      c.onchange = onSelect;
-      row.append(c);
-    } else row.append(el("span"));
-    row.append(
-      el("span", "number", line.old ?? ""),
-      el("span", "number", line.new ?? ""),
-      el("span", "", line.text.replace(/\n$/, "")),
-    );
-    return row;
-  });
+
+async function openReviewEntry(entries, kind) {
+  const entry = entries.find(({ item }) => changeSelection?.kind === kind &&
+    changeSelection.path === item.path && changeSelection.staged === item.staged)
+    ?? entries.find(({ item }) => !item.conflict);
+  if (entry) await entry.open(entry.row);
 }
 async function restore(selected) {
-  if (!changeFile) return;
+  if (changeSelection?.kind !== "session" || !changeDiff) return;
   const indices = selected
     ? $$("#change-diff input:checked").map((c) => Number(c.dataset.index))
     : undefined;
   const context = ctx(),
-    path = changeFile,
+    path = changeSelection.path,
     stamp = changeDiff.stamp;
   modal(
     selected ? tr("Seçili satırları geri al") : tr("Dosyayı geri al"),
@@ -3031,19 +3153,19 @@ async function restore(selected) {
         indices,
       });
       $("#restore-undo").disabled = false;
-      await loadChanges();
+      await refreshChanges();
     },
     tr("Geri al"),
   );
 }
-$("#changes-refresh").onclick = () => loadChanges().catch(error);
+const refreshChanges = () => panel === "changes" ? refreshPanel() : Promise.resolve();
 $("#restore-file").onclick = () => restore(false);
 $("#restore-lines").onclick = () => restore(true);
 $("#restore-undo").onclick = async () => {
   try {
     await api("files", "undo_restore", { ...ctx(), token: lastRestore.id });
     $("#restore-undo").disabled = true;
-    await loadChanges();
+    await refreshChanges();
   } catch (e) {
     error(e);
   }
@@ -3138,40 +3260,13 @@ $("#transfer-undo").onclick = async () => {
   }
 };
 
-function patchView(target, patch) {
-  target.replaceChildren();
-  for (const line of String(patch || tr("Değişiklik yok.")).split("\n")) {
-    target.append(
-      el(
-        "div",
-        "diff-plain " +
-          (line.startsWith("@@")
-            ? "hunk"
-            : line.startsWith("+") && !line.startsWith("+++")
-              ? "insert"
-              : line.startsWith("-") && !line.startsWith("---")
-                ? "delete"
-                : ""),
-        line || " ",
-      ),
-    );
-  }
-}
-async function loadGit(token = panelGeneration) {
-  const context = ctx(),
-    state = await api("git", "state", context);
-  if (token !== panelGeneration) return;
-  gitState = state;
-  $("#git-empty").hidden = state.available;
-  $("#git-sections").hidden = !state.available;
-  $("#git-branch").textContent = state.available
-    ? "⑂ " + state.branch
-    : tr("Git kullanılmıyor");
+async function loadGitReview(context, state, token) {
+  $("#git-branch").textContent = "⑂ " + state.branch;
   $("#git-target").textContent =
     state.upstream || tr("Push hedefi: origin / ") + (state.branch || "");
-  if (!state.available) return;
   $("#git-staged").replaceChildren();
   $("#git-working").replaceChildren();
+  const entries = [], workingPaths = new Set();
   let staged = 0,
     working = 0;
   for (const file of state.files) {
@@ -3181,33 +3276,38 @@ async function loadGit(token = panelGeneration) {
         : file.work !== " " || file.untracked;
       if (!include) continue;
       if (isStaged) staged++;
-      else working++;
-      const row = el("div", "file-row"),
-        box = el("input");
-      box.type = "checkbox";
-      box.checked = gitSelected.has(file.path);
-      box.onchange = () =>
-        box.checked
-          ? gitSelected.add(file.path)
-          : gitSelected.delete(file.path);
-      const mark = el(
-        "span",
-        "status",
-        file.conflict
-          ? "!"
-          : file.untracked
-            ? "U"
-            : isStaged
-              ? file.index
-              : file.work,
-      );
-      mark.title = file.untracked
-        ? tr("Untracked · Git tarafından henüz izlenmiyor")
-        : file.conflict
-          ? tr("Çakışma")
-          : tr("Dosya değişti");
-      row.append(box, mark, el("code", "", file.path));
-      row.append(
+      else {
+        working++;
+        if (!file.conflict) workingPaths.add(file.path);
+      }
+      const item = {
+        ...file,
+        status: file.conflict ? "!" : file.untracked ? "U" : isStaged ? file.index : file.work,
+        stats: isStaged ? file.indexStats : file.workStats,
+        staged: isStaged,
+      };
+      const comparison = tr(isStaged ? "Son commit → Hazırlanan içerik"
+        : file.untracked ? "Yeni dosya → Çalışma alanı" : "Hazırlanan içerik → Çalışma alanı");
+      const open = (row) => file.conflict ? resolveConflict(file, context, state.stamp, token)
+        : showReview({ kind: "git", path: file.path, staged: isStaged },
+          row, comparison, () => api("git", "diff", {
+            ...context, path: file.path, staged: isStaged,
+            oldPath: (isStaged ? file.index : file.work) === "R" ? file.oldPath : undefined,
+          }), token);
+      const row = reviewFileRow(item, open);
+      if (!isStaged && !file.conflict) {
+        const box = el("input");
+        box.type = "checkbox";
+        box.setAttribute("aria-label", tr("Hazırlamak için seç") + " " + file.path);
+        box.checked = gitSelected.has(file.path);
+        box.onchange = () => {
+          if (box.checked) gitSelected.add(file.path);
+          else gitSelected.delete(file.path);
+          $("#stage-selected").disabled = !gitSelected.size;
+        };
+        row.prepend(box);
+      }
+      if (!file.conflict) row.append(
         button(
           isStaged ? "−" : "+",
           () => stage([file.path], isStaged),
@@ -3215,57 +3315,38 @@ async function loadGit(token = panelGeneration) {
           isStaged ? tr("Hazırlananlardan çıkar") : tr("Commit için hazırla"),
         ),
       );
-      row.onclick = async () => {
-        try {
-          if (file.conflict) {
-            await resolveConflict(file);
-            return;
-          }
-          const d = await api("git", "diff", {
-            ...context,
-            path: file.path,
-            staged: isStaged,
-          });
-          $("#git-diff-title").textContent =
-            file.path + (isStaged ? tr(" · Hazırlandı") : tr(" · Değişiklik"));
-          patchView($("#git-diff"), d.patch);
-        } catch (e) {
-          error(e);
-        }
-      };
+      entries.push({ item, row, open });
       (isStaged ? $("#git-staged") : $("#git-working")).append(row);
     }
   }
   $("#staged-count").textContent = staged;
   $("#working-count").textContent = working;
+  for (const path of gitSelected)
+    if (!workingPaths.has(path)) gitSelected.delete(path);
+  $("#stage-selected").disabled = !gitSelected.size;
+  $("#stage-all").disabled = !working;
+  $("#unstage-all").disabled = !staged;
   $("#git-commit").disabled = !staged;
   if (!staged)
     $("#git-staged").append(el("p", "help", tr("Henüz hazırlanmış dosya yok.")));
   if (!working) $("#git-working").append(el("p", "help", tr("Değişiklik yok.")));
-  const choice = $("#history-branch"),
-    value = choice.value;
-  choice.replaceChildren(
-    new Option(tr("Tüm dallar"), "--all"),
-    ...state.branches.map((b) => new Option(b.name, b.name)),
-  );
-  choice.value = [...choice.options].some((o) => o.value === value)
-    ? value
-    : "--all";
-  await loadHistory(context, token);
+  await openReviewEntry(entries, "git");
 }
 async function stage(files, unstage = false) {
-  if (!gitState) return;
+  if (!gitState?.available || !files.length) return;
   const context = ctx();
+  const sameContext = () => projectId === context.projectId && (focusId || undefined) === context.sessionId;
   await api("git", "stage", {
     ...context,
     stamp: gitState.stamp,
     files,
     unstage,
   });
+  if (!sameContext()) return;
   gitSelected.clear();
-  await loadGit();
-  if (!unstage && files.length > 1 && $("#suggest-after-stage").checked)
-    await suggestCommit();
+  await refreshChanges();
+  if (sameContext() && !unstage && files.length > 1 && $("#suggest-after-stage").checked)
+    await suggestCommit(context.sessionId);
 }
 $("#stage-all").onclick = () =>
   stage(
@@ -3282,14 +3363,15 @@ $("#unstage-all").onclick = () =>
     true,
   ).catch(error);
 $("#git-commit").onclick = busy($("#git-commit"), async () => {
+  const scope = changesScope;
   const result = await api("git", "commit", {
     ...ctx(),
     stamp: gitState.stamp,
     message: $("#commit-message").value,
   });
-  $("#commit-message").value = "";
+  if (scope === changesScope) $("#commit-message").value = "";
   toast(result.output || tr("Commit oluşturuldu"));
-  await loadGit();
+  await refreshChanges();
 });
 $("#git-push").onclick = busy($("#git-push"), async () => {
   const result = await api("git", "push", {
@@ -3300,7 +3382,7 @@ $("#git-push").onclick = busy($("#git-push"), async () => {
       : gitState.remotes[0],
   });
   toast(result.output || tr("Push tamamlandı"));
-  await loadGit();
+  await refreshChanges();
 });
 $("#git-fetch").onclick = busy($("#git-fetch"), async () => {
   await api("git", "fetch", {
@@ -3311,17 +3393,17 @@ $("#git-fetch").onclick = busy($("#git-fetch"), async () => {
       : gitState.remotes[0],
   });
   toast(tr("Uzak depo güncellendi"));
-  await loadGit();
+  await refreshChanges();
 });
-async function suggestCommit() {
-  if (!focusId || !active(focusId))
+async function suggestCommit(id = focusId) {
+  if (!id || !active(id))
     throw Error(tr("Mesaj önerisi için seçili oturumu başlat"));
-  const v = views.get(focusId);
-  if (v.inputDraft || ["working", "permission"].includes(status(focusId).key))
+  const v = views.get(id);
+  if (v.inputDraft || ["working", "permission"].includes(status(id).key))
     throw Error(tr("Ajan hazır olmalı ve giriş taslağı boş olmalı"));
   const message =
     "Git indexine hazırlanmış değişiklikleri incele. Yalnızca uygun bir commit mesajı öner. Commit veya push yapma; dosyaları değiştirme.";
-  await pasteDraft(focusId, message);
+  await pasteDraft(id, message);
   toast(
     tr("İstek terminale taslak olarak eklendi. Gönderdikten sonra önerilen mesajı commit alanına yazabilirsin."),
   );
@@ -3346,6 +3428,8 @@ $("#git-more").onclick = () => {
   modal(tr("Git işlemleri"), box);
 };
 function gitForm(action) {
+  if (!gitState?.available) return;
+  const context = ctx(), stamp = gitState.stamp;
   const choices = select(
     (gitState.branches || []).map((b) => ({ id: b.name, label: b.name })),
   );
@@ -3389,20 +3473,21 @@ function gitForm(action) {
               ? { name: choices.value }
               : { target: choices.value };
       const r = await api("git", action, {
-        ...ctx(),
-        stamp: gitState.stamp,
+        ...context,
+        stamp,
         ...request,
       });
       toast(r.output || tr("İşlem tamamlandı"));
-      await loadGit();
+      await refreshChanges();
     },
     tr("Uygula"),
   );
 }
-async function resolveConflict(file) {
-  const context = ctx(),
-    data = await api("git", "conflict_details", { ...context, path: file.path }),
-    choice = select([
+async function resolveConflict(file, context, stamp, token) {
+  const revision = ++changeRevision;
+  const data = await api("git", "conflict_details", { ...context, path: file.path });
+  if (token !== panelGeneration || revision !== changeRevision || $("#dialog").open) return;
+  const choice = select([
       ...(data.text === null ? [] : [{ id: "manual", label: tr("Elle düzenle") }]),
       { id: "ours", label: tr("Bizim sürümümüz") },
       { id: "theirs", label: tr("Gelen sürüm") },
@@ -3418,28 +3503,62 @@ async function resolveConflict(file) {
     async () => {
       await api("git", "conflict_resolve", {
         ...context,
-        stamp: gitState.stamp,
+        stamp,
         path: file.path,
         choice: choice.value,
         text: editor.value,
         fileStamp: data.hash,
       });
-      await loadGit();
+      await refreshChanges();
     },
     tr("Çöz ve hazırla"),
   );
 }
 async function loadHistory(context = ctx(), token = panelGeneration) {
-  historyCommits = await api("git", "history", {
+  const revision = ++historyRevision;
+  clearReview();
+  $("#history-files").replaceChildren();
+  const root = $("#git-history");
+  root.replaceChildren(el("p", "help", tr("Yükleniyor…")));
+  const from = $("#history-from"), to = $("#history-to"), swap = $("#history-swap");
+  from.disabled = to.disabled = swap.disabled = true;
+  const history = await api("git", "history", {
     ...context,
     branch: $("#history-branch").value,
   });
-  if (token !== panelGeneration) return;
-  const root = $("#git-history");
+  if (token !== panelGeneration || revision !== historyRevision) return;
   root.replaceChildren();
+  const hashes = new Set(history.map((commit) => commit.hash));
+  if (!hashes.has(selectedCommit)) selectedCommit = history[0]?.hash ?? null;
+  if (!hashes.has(baseCommit) || baseCommit === selectedCommit) baseCommit = null;
+  const options = (control, first) => {
+    control.replaceChildren(...(first ? [first] : []),
+      ...history.map((commit) =>
+        new Option(commit.hash.slice(0, 7) + " · " + commit.subject, commit.hash)));
+    control.disabled = !history.length;
+  };
+  options(from, new Option(tr("Önceki commit"), ""));
+  options(to);
+  const selectCommits = async (selected, base = null) => {
+    if (token !== panelGeneration || revision !== historyRevision) return;
+    selectedCommit = selected;
+    baseCommit = base === selected ? null : base;
+    from.value = baseCommit || "";
+    to.value = selectedCommit || "";
+    swap.disabled = !baseCommit;
+    for (const row of root.children) {
+      row.classList.toggle("active", row.dataset.hash === selectedCommit);
+      row.classList.toggle("base", row.dataset.hash === baseCommit);
+    }
+    const parent = history.find((commit) => commit.hash === selectedCommit)?.parents?.[0];
+    if (selectedCommit) await showCommitReview(context, token, parent);
+  };
+  to.onchange = () => selectCommits(to.value, from.value).catch(error);
+  from.onchange = () => selectCommits(to.value, from.value).catch(error);
+  swap.onclick = () => selectCommits(from.value, to.value).catch(error);
   let lanes = [];
   const colors = ["#a6d47e", "#a4bbee", "#d2a0de", "#e4bd78", "#77c6bc"];
-  for (const commit of historyCommits) {
+  for (const commit of history) {
     const previous = [...lanes];
     let lane = lanes.indexOf(commit.hash);
     if (lane < 0) {
@@ -3452,12 +3571,11 @@ async function loadHistory(context = ctx(), token = panelGeneration) {
     for (let i = 0; i < parents.length; i++)
       if (!lanes.includes(parents[i]))
         lanes.splice(Math.min(pointLane + i, lanes.length), 0, parents[i]);
-    const row = el(
-      "div",
-      "history-row" +
-        (selectedCommit === commit.hash ? " active" : "") +
-        (baseCommit === commit.hash ? " base" : ""),
-    );
+    const row = button("", (e) => {
+      $("#git-history-picker").open = false;
+      return e.ctrlKey && selectedCommit && selectedCommit !== commit.hash
+        ? selectCommits(selectedCommit, commit.hash) : selectCommits(commit.hash);
+    }, "history-row");
     row.dataset.hash = commit.hash;
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute(
@@ -3509,68 +3627,34 @@ async function loadHistory(context = ctx(), token = panelGeneration) {
     subject.append(document.createTextNode(commit.subject || ""));
     row.append(svg, subject, el("small", "", commit.hash.slice(0, 7)));
     row.title = commit.subject + "\n" + commit.author + " · " + commit.date;
-    row.onclick = (e) => {
-      if (e.ctrlKey && selectedCommit && selectedCommit !== commit.hash)
-        baseCommit = commit.hash;
-      else {
-        selectedCommit = commit.hash;
-        baseCommit = null;
-      }
-      showCommit().catch(error);
-      loadHistory().catch(error);
-    };
     root.append(row);
   }
+  if (!history.length) root.append(el("p", "empty", tr("Commit geçmişi boş.")));
+  await selectCommits(selectedCommit, baseCommit);
 }
-$("#history-refresh").onclick = () => loadHistory().catch(error);
-$("#history-branch").onchange = () => loadHistory().catch(error);
-async function showCommit() {
-  const context = ctx(),
-    selected = selectedCommit,
-    base = baseCommit,
-    rows = await api("git", "commit_files", {
-      ...context,
-      commit: selected,
-      from: base,
-    });
-  if (selected !== selectedCommit || base !== baseCommit) return;
-  const box = el("div"),
-    filesBox = el("div"),
-    diffBox = el("div");
-  filesBox.style.cssText =
-    "max-height:135px;overflow:auto;border-bottom:1px solid var(--line)";
-  box.append(
-    el(
-      "p",
-      "help",
-      base ? base.slice(0, 8) + " → " + selected.slice(0, 8) : selected,
-    ),
-    filesBox,
-    diffBox,
-  );
-  for (const f of rows) {
-    const row = el("div", "file-row");
-    row.append(el("span", "status", f.status), el("code", "", f.path));
-    row.onclick = async () => {
-      try {
-        const d = await api("git", "commit_diff", {
-          ...context,
-          commit: selected,
-          from: base,
-          path: f.path,
-        });
-        patchView(diffBox, d.patch);
-      } catch (e) {
-        error(e);
-      }
-    };
-    filesBox.append(row);
+$("#history-branch").onchange = () => refreshChanges().catch(error);
+async function showCommitReview(context, token, parent) {
+  clearReview();
+  const revision = changeRevision;
+  const selected = selectedCommit, base = baseCommit;
+  const args = { ...context, commit: selected, from: base };
+  const list = $("#history-files");
+  list.replaceChildren(el("p", "help", tr("Dosyalar karşılaştırılıyor…")));
+  const rows = await api("git", "commit_files", args);
+  if (token !== panelGeneration || revision !== changeRevision) return;
+  const comparison = ((base || parent)?.slice(0, 8) || tr("Boş ağaç")) +
+    " → " + selected.slice(0, 8);
+  const entries = [];
+  list.replaceChildren();
+  for (const item of rows) {
+    const open = (row) => showReview({ kind: "history", path: item.path }, row,
+      comparison, () => api("git", "commit_diff", { ...args, path: item.path }), token);
+    const row = reviewFileRow(item, open);
+    list.append(row);
+    entries.push({ item, row, open });
   }
-  if (!rows.length) filesBox.append(el("p", "empty", tr("Dosya farkı yok.")));
-  $("#git-diff-title").textContent = base
-    ? tr("İki commit arasındaki fark")
-    : tr("Commit değişiklikleri");
-  $("#git-diff").replaceChildren(box);
+  if (!rows.length) list.append(el("p", "empty", tr("Dosya farkı yok.")));
+  await openReviewEntry(entries, "history");
 }
 
 async function openLink(source, target) {
@@ -4390,6 +4474,9 @@ async function initialize() {
       Object.assign(projectFocus, saved.projectFocus);
       if (projectId && focusId) projectFocus[projectId] = focusId;
       panel = saved.panel || "browser";
+      if (["git", "session"].includes(saved.changesPreference))
+        changesPreference = saved.changesPreference;
+      else if (saved.panel === "changes") changesPreference = "session";
       document.body.classList.toggle("no-left", !!saved.noLeft);
       document.body.classList.toggle("no-right", !!saved.noRight);
       $("#providers-section").hidden = !saved.showProviders;

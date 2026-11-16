@@ -216,7 +216,6 @@
           <button class="selected" data-tab="browser">◎ Tarayıcı</button
           ><button data-tab="files">▱ Dosyalar</button
           ><button data-tab="changes">± Değişiklikler</button
-          ><button data-tab="git">⑂ Git</button
           ><button data-tab="links">Oturum Bağlantıları</button
           ><button data-tab="summary">Oturum Özeti</button>
         </nav>
@@ -341,29 +340,18 @@
           </div>
         </section>
         <section class="panel" id="panel-changes" hidden>
-          <div class="toolbar">
-            <button id="transfer-open">Ana projeye aktar ↗</button
-            ><button id="transfer-undo" disabled>Son aktarımı geri al</button
-            ><span class="grow"></span><button id="changes-refresh">↻</button>
+          <div class="toolbar change-modes" role="group" aria-label="Karşılaştırma kapsamı">
+            <button id="changes-mode-git" aria-pressed="false" hidden>Bekleyen Git değişiklikleri</button>
+            <button id="changes-mode-session" aria-pressed="false" hidden>Oturum başlangıcından beri</button>
+            <button id="changes-mode-history" aria-pressed="false" class="quiet" hidden>Git geçmişi</button>
           </div>
-          <div id="change-list" class="section" style="height: 230px"></div>
-          <div
-            class="splitter"
-            data-resize="change-list"
-            role="separator"
-            tabindex="0"
-            aria-label="Değişen dosyalar yüksekliği"
-          ></div>
-          <div class="toolbar">
-            <code class="grow" id="change-file"></code
-            ><button id="restore-file" disabled>Dosyayı geri al</button
-            ><button id="restore-lines" disabled>Seçilenleri geri al</button
-            ><button id="restore-undo" disabled>Geri almayı geri al</button>
+          <p id="changes-empty" class="empty" hidden></p>
+          <div class="toolbar" id="changes-session-actions" hidden>
+            <button id="transfer-open">Ana projeye aktar ↗</button>
+            <button id="transfer-undo" disabled>Son aktarımı geri al</button>
+            <button id="restore-undo" disabled>Geri almayı geri al</button>
           </div>
-          <div class="diff-view section auto" id="change-diff"></div>
-        </section>
-        <section class="panel" id="panel-git" hidden>
-          <div class="toolbar">
+          <div class="toolbar" id="changes-git-actions" hidden>
             <div class="grow">
               <strong id="git-branch"></strong
               ><small
@@ -371,17 +359,12 @@
                 style="display: block; margin-top: 4px"
               ></small>
             </div>
-            <button id="git-fetch">↓ Fetch</button
+            <button id="show-commit" aria-expanded="false" aria-controls="git-commit-section">Commit</button
+            ><button id="git-fetch">↓ Fetch</button
             ><button id="git-push">↑ Push</button
             ><button id="git-more">⋯</button>
           </div>
-          <div id="git-empty" class="empty" hidden>
-            Bu çalışma alanında Git kullanılmıyor. Dosyalar ve Değişiklikler
-            üzerinden çalışabilirsin.
-          </div>
-          <div id="git-sections">
-            <div class="section" id="git-commit-section" style="height: 153px">
-              <div class="section-title">▾ Commit</div>
+          <div class="section" id="git-commit-section" hidden>
               <div class="section-body">
                 <textarea
                   class="commit-input"
@@ -397,68 +380,52 @@
                   ><button id="git-suggest" class="quiet">✧ Ajana öner</button>
                 </div>
               </div>
-            </div>
-            <div
-              class="splitter"
-              data-resize="git-commit-section"
-              role="separator"
-              tabindex="0"
-              aria-label="Commit alanı yüksekliği"
-            ></div>
-            <div class="section" id="git-staged-section" style="height: 160px">
+          </div>
+          <div class="toolbar" id="changes-history-actions" hidden>
+            <select id="history-branch" class="grow" aria-label="Geçmişte gösterilen dal">
+              <option value="--all">Tüm dallar</option>
+            </select>
+            <button id="history-swap" title="Karşılaştırmayı ters çevir" aria-label="Karşılaştırmayı ters çevir" disabled>⇄</button>
+            <select id="history-from" class="grow" aria-label="Karşılaştırmanın başlangıç commit’i"></select>
+            <select id="history-to" class="grow" aria-label="Karşılaştırmanın hedef commit’i"></select>
+          </div>
+          <div class="change-files" id="change-files" hidden>
+            <div id="change-list" hidden></div>
+            <div id="git-lists" hidden>
               <div class="section-title">
                 ▾ Hazırlananlar<span class="count" id="staged-count">0</span
                 ><button class="quiet" id="unstage-all">− Tümü</button>
               </div>
               <div id="git-staged"></div>
-            </div>
-            <div
-              class="splitter"
-              data-resize="git-staged-section"
-              role="separator"
-              tabindex="0"
-              aria-label="Hazırlanan dosyalar yüksekliği"
-            ></div>
-            <div class="section" id="git-working-section" style="height: 230px">
               <div class="section-title">
-                ▾ Değişiklikler<span class="count" id="working-count">0</span
+                Hazırlanmayanlar<span class="count" id="working-count">0</span
                 ><button class="quiet" id="stage-selected">
                   Seçilenleri hazırla</button
                 ><button class="quiet" id="stage-all">+ Tümü</button>
               </div>
               <div id="git-working"></div>
             </div>
-            <div
-              class="splitter"
-              data-resize="git-working-section"
-              role="separator"
-              tabindex="0"
-              aria-label="Değişiklikler yüksekliği"
-            ></div>
-            <div class="section" id="git-diff-section" style="height: 220px">
-              <div class="section-title" id="git-diff-title">Dosya farkı</div>
-              <div id="git-diff"></div>
+            <div id="history-lists" hidden>
+              <details id="git-history-picker">
+                <summary>Commit seç</summary>
+                <div id="git-history"></div>
+              </details>
+              <div id="history-files"></div>
             </div>
-            <div
-              class="splitter"
-              data-resize="git-diff-section"
-              role="separator"
-              tabindex="0"
-              aria-label="Git dosya farkı yüksekliği"
-            ></div>
-            <div class="section" id="git-history-section" style="height: 350px">
-              <div class="section-title">▾ Commit geçmişi</div>
-              <div class="toolbar">
-                <select id="history-branch" class="grow">
-                  <option value="--all">Tüm dallar</option></select
-                ><button id="history-refresh">↻</button>
+          </div>
+          <div id="change-review" hidden>
+            <div class="toolbar change-detail">
+              <div class="change-heading grow">
+                <small id="change-comparison"></small>
+                <code id="change-file"></code>
               </div>
-              <div class="help">
-                Bir commit seç. İki commit karşılaştırmak için Ctrl ile ikinci
-                kaydı seç.
+              <span id="change-stats" class="change-stats" hidden></span>
+              <div class="change-restore" id="change-restore" hidden>
+                <button id="restore-file" disabled>Dosyayı geri al</button>
+                <button id="restore-lines" disabled>Seçilenleri geri al</button>
               </div>
-              <div id="git-history"></div>
             </div>
+            <div id="change-diff" class="diff-view"></div>
           </div>
         </section>
         <section class="panel" id="panel-links" hidden>
@@ -493,6 +460,7 @@
     <script src="vendor/xterm.js"></script>
     <script src="vendor/addon-fit.js"></script>
     <script src="i18n.js"></script>
+    <script src="diff.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

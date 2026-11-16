@@ -32,7 +32,7 @@ fn checkout(root: &Path) -> Checkout {
 
 fn snapshot(root: &Path) -> Result<(Checkout, String, String)> {
     let current = checkout(root);
-    let status = git(root, &["status", "--porcelain=v1", "-z"])?;
+    let status = git(root, &["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
     let staged = git(root, &["diff", "--cached", "--binary"])?;
     if checkout(root) != current {
         bail!(CHANGED)
@@ -60,11 +60,54 @@ fn status_entries(raw: &str) -> impl Iterator<Item = (&str, &str, Option<&str>)>
     })
 }
 
-fn state(root: &Path) -> Result<Value> {
+fn review_stats(root: &Path, staged: bool) -> Result<HashMap<String, Value>> {
+    let mut command = vec![
+        "diff", "--numstat", "-z", "--find-renames", "--no-ext-diff", "--no-textconv",
+    ];
+    if staged {
+        command.push("--cached");
+    }
+    let raw = git(root, &command)?;
+    let mut records = raw.split('\0');
+    let mut stats = HashMap::new();
+    while let Some(record) = records.next() {
+        let values = record.splitn(3, '\t').collect::<Vec<_>>();
+        let [added, removed, path] = values.as_slice() else {
+            continue;
+        };
+        let path = if path.is_empty() {
+            records.next(); // Old path of a rename.
+            records.next().unwrap_or_default()
+        } else {
+            path
+        };
+        if let (Ok(added), Ok(removed)) = (added.parse::<u64>(), removed.parse::<u64>()) {
+            stats.insert(path.to_owned(), json!({"added":added,"removed":removed}));
+        }
+    }
+    Ok(stats)
+}
+
+fn state(root: &Path, include_review_stats: bool) -> Result<Value> {
     let (current, raw, stamp) = snapshot(root)?;
-    let files = status_entries(&raw)
+    let mut files = status_entries(&raw)
         .map(|(xy, name, old)| json!({"path":name,"oldPath":old,"index":&xy[..1],"work":&xy[1..],"untracked":xy=="??","conflict":(["DD","AU","UD","UA","DU","AA","UU"].contains(&xy))}))
         .collect::<Vec<_>>();
+    if include_review_stats {
+        let staged = review_stats(root, true).unwrap_or_default();
+        let working = review_stats(root, false).unwrap_or_default();
+        for file in &mut files {
+            let path = file["path"].as_str().unwrap();
+            let index_stats = staged.get(path).cloned();
+            let work_stats = working.get(path).cloned();
+            if let Some(stats) = index_stats {
+                file["indexStats"] = stats;
+            }
+            if let Some(stats) = work_stats {
+                file["workStats"] = stats;
+            }
+        }
+    }
     let branch = current
         .reference
         .as_deref()
@@ -113,7 +156,7 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
         Err(error) => return Err(error),
     };
     if action == "state" {
-        return state(&root);
+        return state(&root, args["reviewStats"] == true);
     }
     if action == "history" {
         let selector = args["branch"].as_str().unwrap_or("--all");
@@ -170,11 +213,11 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
                 .collect::<Vec<_>>()));
         }
         cmd.push(string(args, "path")?);
-        return Ok(json!({"patch":git(&root,&cmd)?}));
+        return Ok(json!({"patch":String::from_utf8_lossy(&git_bytes(&root,&cmd)?)}));
     }
     if action == "diff" {
         let file = string(args, "path")?;
-        crate::core::safe_path(&root, file)?;
+        let path = safe_path(&root, file)?;
         let staged = args["staged"] == true;
         let mut cmd = vec![
             "--literal-pathspecs",
@@ -182,17 +225,24 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             "--no-ext-diff",
             "--no-textconv",
             "--no-color",
+            "--unified=3",
+            "--find-renames",
         ];
         if staged {
             cmd.push("--cached")
         }
         cmd.extend(["--", file]);
-        let mut patch = git(&root, &cmd)?;
-        if patch.is_empty() && !staged {
-            let p = safe_path(&root, file)?;
-            if p.is_file() {
-                patch = String::from_utf8(fs::read(p)?).unwrap_or_else(|_| "İkili dosya".into())
-            }
+        if let Some(old) = args["oldPath"].as_str() {
+            safe_path(&root, old)?;
+            cmd.push(old);
+        }
+        let bytes = git_bytes(&root, &cmd)?;
+        let patch = String::from_utf8_lossy(&bytes);
+        if patch.is_empty() && !staged && path.is_file()
+            && git(&root, &["--literal-pathspecs", "ls-files", "-z", "--", file])?.is_empty()
+        {
+            let bytes = fs::read(path)?;
+            return Ok(crate::files::diff(None, Some(&bytes)));
         }
         return Ok(json!({"patch":patch}));
     }
@@ -392,7 +442,7 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
         }
         _ => bail!("Geçersiz Git işlemi"),
     };
-    Ok(json!({"output":result,"state":state(&root)?}))
+    Ok(json!({"output":result,"state":state(&root, false)?}))
 }
 fn remote(root: &Path, args: &Value) -> Result<String> {
     let r = args["remote"].as_str().unwrap_or("origin");

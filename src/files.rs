@@ -171,7 +171,7 @@ fn require_restore_checkout(core: &Core, args: &Value, root: &Path) -> Result<()
     }
     Ok(())
 }
-fn diff(before: Option<&[u8]>, after: Option<&[u8]>) -> Value {
+pub(crate) fn diff(before: Option<&[u8]>, after: Option<&[u8]>) -> Value {
     let old = before.and_then(|b| std::str::from_utf8(b).ok());
     let new = after.and_then(|b| std::str::from_utf8(b).ok());
     if before.is_some() && old.is_none()
@@ -184,7 +184,20 @@ fn diff(before: Option<&[u8]>, after: Option<&[u8]>) -> Value {
     let old = old.unwrap_or("");
     let new = new.unwrap_or("");
     let d = TextDiff::from_lines(old, new);
-    let lines=d.iter_all_changes().enumerate().map(|(index,c)|json!({"index":index,"tag":match c.tag(){ChangeTag::Equal=>"equal",ChangeTag::Delete=>"delete",ChangeTag::Insert=>"insert"},"old":c.old_index().map(|n|n+1),"new":c.new_index().map(|n|n+1),"text":c.value()})).collect::<Vec<_>>();
+    let lines = d.iter_all_changes().enumerate().map(|(index, change)| {
+        json!({
+            "index": index,
+            "tag": match change.tag() {
+                ChangeTag::Equal => "equal",
+                ChangeTag::Delete => "delete",
+                ChangeTag::Insert => "insert",
+            },
+            "old": change.old_index().map(|line| line + 1),
+            "new": change.new_index().map(|line| line + 1),
+            "text": change.value(),
+            "noNewline": !change.value().ends_with('\n'),
+        })
+    }).collect::<Vec<_>>();
     json!({"lines":lines,"patch":d.unified_diff().context_radius(3).to_string(),"old":old,"new":new})
 }
 fn comparison(core: &Core, args: &Value) -> Result<(PathBuf, Value, HashMap<String, String>)> {
@@ -195,7 +208,7 @@ fn comparison(core: &Core, args: &Value) -> Result<(PathBuf, Value, HashMap<Stri
     Ok((root, b, current))
 }
 pub fn list_changes(core: &Core, args: &Value) -> Result<Value> {
-    let (_root, b, current) = comparison(core, args)?;
+    let (root, b, current) = comparison(core, args)?;
     let mut names = b
         .as_object()
         .unwrap()
@@ -205,7 +218,60 @@ pub fn list_changes(core: &Core, args: &Value) -> Result<Value> {
         .collect::<Vec<_>>();
     names.sort();
     names.dedup();
-    Ok(json!(names.into_iter().filter_map(|name|{let old=b[&name].as_str();let new=current.get(&name).map(|s|s.as_str());(old!=new).then(||json!({"path":name,"status":if old.is_none(){"A"}else if new.is_none(){"D"}else{"M"},"before":old,"after":new}))}).collect::<Vec<_>>()))
+    let mut changes: Vec<_> = names.into_iter().filter_map(|name| {
+        let old = b[&name].as_str();
+        let new = current.get(&name).map(String::as_str);
+        (old != new).then(|| json!({
+            "path":name, "status":if old.is_none(){"A"}else if new.is_none(){"D"}else{"M"},
+            "before":old, "after":new,
+        }))
+    }).collect();
+    if args["reviewStats"] == true {
+        // Keep totals optional and bound the extra work on large changesets.
+        let mut remaining_bytes = 2 * 1024 * 1024;
+        for item in changes.iter_mut().take(100) {
+            let name = item["path"].as_str().unwrap();
+            let sizes = [
+                item["before"].as_str().and_then(|key| {
+                    fs::metadata(core.directory.join("objects").join(key)).ok()
+                }),
+                safe_path(&root, name).ok().and_then(|path| fs::metadata(path).ok()),
+            ];
+            let size: u64 = sizes.iter().flatten().map(fs::Metadata::len).sum();
+            if size > 256 * 1024 || size > remaining_bytes {
+                continue;
+            }
+            remaining_bytes -= size;
+            let before = blob(core, &item["before"]).ok().flatten();
+            let after = safe_path(&root, name).ok()
+                .and_then(|path| read_optional(&path).ok()).flatten();
+            if before.as_deref().map(hash).as_deref() != item["before"].as_str()
+                || after.as_deref().map(hash).as_deref() != item["after"].as_str()
+            {
+                continue;
+            }
+            if let (Ok(before), Ok(after)) = (
+                std::str::from_utf8(before.as_deref().unwrap_or_default()),
+                std::str::from_utf8(after.as_deref().unwrap_or_default()),
+            ) {
+                if before.contains('\0') || after.contains('\0') {
+                    continue;
+                }
+                let changes = TextDiff::from_lines(before, after);
+                let mut added = 0;
+                let mut removed = 0;
+                for line in changes.iter_all_changes() {
+                    match line.tag() {
+                        ChangeTag::Insert => added += 1,
+                        ChangeTag::Delete => removed += 1,
+                        ChangeTag::Equal => {}
+                    }
+                }
+                item["stats"] = json!({"added":added,"removed":removed});
+            }
+        }
+    }
+    Ok(json!(changes))
 }
 pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
     if matches!(
@@ -540,5 +606,12 @@ mod tests {
         assert!(v["patch"].as_str().unwrap().contains("-b"));
         assert_eq!(v["lines"][1]["tag"], "delete");
         assert_eq!(v["lines"][2]["tag"], "insert");
+    }
+
+    #[test]
+    fn line_diff_marks_a_missing_final_newline() {
+        let v = diff(Some(b"same\r\n"), Some(b"same"));
+        assert_eq!(v["lines"][0]["noNewline"], false);
+        assert_eq!(v["lines"][1]["noNewline"], true);
     }
 }
