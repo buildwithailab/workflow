@@ -157,10 +157,12 @@ function paintTeams(connection) {
   }[connection.state]);
   const status = $("#teams-state");
   if (status.textContent !== label) status.textContent = label;
-  teamsButton.hidden = connection.state === "connected";
+  const connected = connection.state === "connected";
   const signingIn = connection.state === "signing-in";
-  $("#teams-action").textContent = tr(signingIn ? "Devam et" : "Bağlan");
-  teamsButton.setAttribute("aria-label", tr(signingIn ? "Teams girişine devam et" : "Teams’e bağlan"));
+  $("#teams-action").textContent = tr(connected ? "Aç" : signingIn ? "Devam et" : "Bağlan");
+  const actionLabel = tr(connected ? "Teams’i aç" : signingIn ? "Teams girişine devam et" : "Teams’e bağlan");
+  teamsButton.setAttribute("aria-label", actionLabel);
+  teamsButton.title = actionLabel;
   renderTeamsEditor();
 }
 
@@ -209,10 +211,14 @@ teamsEdit.onclick = () => {
 };
 
 teamsButton.onclick = async () => {
-  if (teamsButton.disabled || teamsButton.hidden) return;
+  if (teamsButton.disabled) return;
   teamsButton.disabled = true;
   try {
-    paintTeams(await api("teams", "connect"));
+    if (teamsControl.dataset.state === "connected") {
+      await api("teams", "show");
+    } else {
+      paintTeams(await api("teams", "connect"));
+    }
   } catch (e) {
     error(e);
   } finally {

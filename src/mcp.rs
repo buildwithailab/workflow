@@ -29,12 +29,18 @@ fn tools() -> Value {
         let mut catalog = catalog;
         catalog.as_array_mut().unwrap().push(json!({
             "name": "teams_send_message",
-            "description": "Submit a message to the Teams chat saved for this session through Workflow's signed-in Teams Web connection. Use only when the user explicitly asks to send a Teams message. If the user supplies a Teams chat or message link, pass it exactly so Workflow can verify that it matches the saved destination. A submitted result means Teams Web received the send action. Report submission without claiming delivery and check with the user before retrying.",
+            "description": "Submit a message to the Teams chat saved for this session through Workflow's signed-in Teams Web connection. Use only when the user explicitly asks to send a Teams message. If the user supplies a Teams chat or message link, pass it exactly so Workflow can verify that it matches the saved destination. A submitted result means Teams Web received the send action, and delivery remains unverified. If Workflow opens the Teams window after a send error, ask the user to inspect the chat. Wait for the user to request another attempt.",
             "inputSchema": object(json!({
                 "link": {"type":"string","description":"Include the Teams chat or message link when the user provides one"},
                 "text": {"type":"string","description":"Plain-text message to send"}
             }), vec!["text"]),
             "annotations": {"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true}
+        }));
+        catalog.as_array_mut().unwrap().push(json!({
+            "name": "teams_open",
+            "description": "Show the existing Workflow Teams Web window when the user asks to see it. The window stays on its current page. The tool only makes the window visible so the user can inspect a draft or other issue.",
+            "inputSchema": object(json!({}), vec![]),
+            "annotations": {"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}
         }));
         catalog
     };
@@ -308,6 +314,8 @@ async fn call(core: &Arc<Core>, source: &str, method: &str, mut args: Value) -> 
     match method {
         #[cfg(windows)]
         "teams_send_message" => crate::teams::send_for_session(core, source, &args).await,
+        #[cfg(windows)]
+        "teams_open" => crate::teams::show_for_session(core, source),
         "session_catalog" => {
             let db = core.db.lock().unwrap();
             let sessions = db["sessions"].as_array().unwrap();

@@ -20,6 +20,7 @@ const HOME: &str = "https://teams.microsoft.com/v2/";
 const PAGE: &str = include_str!("teams_web.js");
 const TARGET_ERROR: &str = "Teams sohbeti doğrulanamadı.";
 const LOGIN_ERROR: &str = "Önce Teams hesabına giriş yap.";
+const BUSY_ERROR: &str = "Teams şu anda başka bir işlem yürütüyor.";
 const VERIFY_ERROR: &str =
     "Teams gönderimi doğrulanamadı. Tekrar göndermeden önce sohbeti kontrol et.";
 const SEND_TIMEOUT: Duration = Duration::from_secs(44);
@@ -214,6 +215,27 @@ async fn connection(window: &WebviewWindow, teams: &Teams) -> Result<Value> {
     }))
 }
 
+fn show_window(window: &WebviewWindow, teams: &Teams) -> Result<Value> {
+    window.show()?;
+    teams.hide_after_login.store(false, Ordering::Relaxed);
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+    Ok(json!({"visible": true}))
+}
+
+fn show_existing_window(core: &Core, teams: &Teams) -> Result<Value> {
+    let window = core.app.get_webview_window(WINDOW).context(LOGIN_ERROR)?;
+    show_window(&window, teams)
+}
+
+fn active_teams_session(core: &Core, sid: &str) -> Result<Value> {
+    let session = core.session(sid)?;
+    if session["archived"] == true || session["login"] == true || session["tools"] == false {
+        bail!("Bu oturum Teams aracını kullanamaz.");
+    }
+    Ok(session)
+}
+
 fn message(args: &Value) -> Result<&str> {
     let text = string(args, "text")?;
     if text.trim().is_empty() {
@@ -233,7 +255,7 @@ fn authorized_target(saved: Option<&str>, link: Option<&str>) -> Result<Target> 
     Ok(saved)
 }
 
-async fn send(window: &WebviewWindow, target: Target, text: &str) -> Result<Value> {
+async fn send(window: &WebviewWindow, teams: &Teams, target: Target, text: &str) -> Result<Value> {
     let mut focus_enabled = false;
     let result = tokio::time::timeout(
         SEND_TIMEOUT,
@@ -251,7 +273,22 @@ async fn send(window: &WebviewWindow, target: Target, text: &str) -> Result<Valu
         )
         .await;
     }
-    result.context(VERIFY_ERROR)?
+    let result = result.context(VERIFY_ERROR)??;
+    match result["state"].as_str() {
+        Some("submitted") => Ok(json!({"submitted": true, "deliveryVerified": false})),
+        Some(state @ ("draft" | "unsent")) => {
+            let reason = if state == "draft" {
+                "Teams sohbetinde gönderilmemiş bir taslak var."
+            } else {
+                "Teams mesajı gönderilemedi."
+            };
+            show_window(window, teams)
+                .with_context(|| format!("{reason} Teams penceresi açılamadı."))?;
+            bail!("{reason} Teams penceresi açıldı. Sohbeti ve taslağı kontrol et.");
+        }
+        Some("target") => bail!(TARGET_ERROR),
+        _ => bail!(VERIFY_ERROR),
+    }
 }
 
 async fn send_in_background(
@@ -303,16 +340,9 @@ async fn send_in_background(
         json!({"enabled": true}),
     )
     .await?;
-    let result = compose_and_submit(window, json!({"id": target.id, "text": text}))
+    compose_and_submit(window, json!({"id": target.id, "text": text}))
         .await
-        .context(VERIFY_ERROR)?;
-    match result["state"].as_str() {
-        Some("submitted") => Ok(json!({"submitted": true, "deliveryVerified": false})),
-        Some("draft") => bail!("Teams sohbetinde gönderilmemiş bir taslak var."),
-        Some("unsent") => bail!("Teams mesajı gönderilemedi. Taslağı Teams’te kontrol et."),
-        Some("target") => bail!(TARGET_ERROR),
-        _ => bail!(VERIFY_ERROR),
-    }
+        .context(VERIFY_ERROR)
 }
 
 async fn compose_and_submit(window: &WebviewWindow, input: Value) -> Result<Value> {
@@ -334,23 +364,28 @@ async fn compose_and_submit(window: &WebviewWindow, input: Value) -> Result<Valu
 
 pub async fn send_for_session(core: &Core, sid: &str, args: &Value) -> Result<Value> {
     let teams = core.app.state::<Teams>();
-    let _operation = teams
-        .operation
-        .try_lock()
-        .context("Teams şu anda başka bir işlem yürütüyor.")?;
-    let session = core.session(sid)?;
-    if session["archived"] == true || session["login"] == true || session["tools"] == false {
-        bail!("Bu oturum Teams aracını kullanamaz.");
-    }
+    let _operation = teams.operation.try_lock().context(BUSY_ERROR)?;
+    let session = active_teams_session(core, sid)?;
     let link = args.get("link").map(|_| string(args, "link")).transpose()?;
     let target = authorized_target(session["teamsChatLink"].as_str(), link)?;
     let text = message(args)?;
     let window = core.app.get_webview_window(WINDOW).context(LOGIN_ERROR)?;
-    send(&window, target, text).await
+    send(&window, &teams, target, text).await
+}
+
+pub fn show_for_session(core: &Core, sid: &str) -> Result<Value> {
+    active_teams_session(core, sid)?;
+    let teams = core.app.state::<Teams>();
+    let _operation = teams.operation.try_lock().context(BUSY_ERROR)?;
+    show_existing_window(core, &teams)
 }
 
 pub async fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
     let teams = core.app.state::<Teams>();
+    if action == "show" {
+        let _operation = teams.operation.try_lock().context(BUSY_ERROR)?;
+        return show_existing_window(core, &teams);
+    }
     let _operation = teams.operation.lock().await;
     match action {
         "status" if !profile(core).is_dir() => Ok(json!({"state":"disconnected","visible":false})),
