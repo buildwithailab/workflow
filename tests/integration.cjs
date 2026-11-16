@@ -360,6 +360,12 @@ async function test() {
   };
   assert.equal(await page.evaluate(() => localStorage.getItem("workflow-language")), null);
   await page.getByRole("button", { name: "+ New session", exact: true }).waitFor();
+  await page.locator(".brand strong").click();
+  assert(await page.locator("#dialog").isHidden());
+  assert.equal(await settings.getAttribute("aria-label"), "Settings");
+  await settings.click();
+  await page.getByRole("heading", { name: "Settings", exact: true }).waitFor();
+  await page.locator("#dialog-footer").getByRole("button", { name: "Close", exact: true }).click();
   await page.locator(".sidebar-actions").getByRole("button", { name: "Start from template" }).waitFor();
   await page.locator("#show-providers").click();
   await page.locator("#providers-section").getByRole("button", { name: "Refresh workspace" }).waitFor();
@@ -436,6 +442,13 @@ async function test() {
   assertPanelsFit(await widths());
   await page.locator("#toggle-left").click();
   assert.equal((await widths()).left, 0);
+  await page.locator(".rail-tools #app-settings").waitFor();
+  await page.locator(".rail-tools #addons").click();
+  await page.getByRole("heading", { name: "Eklenti kütüphanesi", exact: true }).waitFor();
+  await page.locator("#dialog-close").click();
+  await page.locator(".rail-tools #archive").click();
+  await page.getByRole("heading", { name: "Geçmiş oturumlar", exact: true }).waitFor();
+  await page.locator("#dialog-close").click();
   assertPanelsFit(await widths());
   await page.locator("#toggle-left").click();
   await page.locator("#toggle-right").click();
@@ -456,7 +469,7 @@ async function test() {
   assertPanelsFit(await widths());
   await page.setViewportSize({ width: 900, height: 740 });
   assertPanelsFit(await widths());
-  assert.equal((await widths()).left, 180);
+  assert.equal((await widths()).left, 132);
   assert.equal((await widths()).right, 310);
   await openTemplateMenu();
   await page.locator("#session-template-items [data-template-id='builtin:1']").waitFor();
@@ -728,7 +741,8 @@ async function test() {
   const savedWorkspace = JSON.parse(fs.readFileSync(path.join(data, "workspace.json"), "utf8"));
   assert.equal(savedWorkspace.projects.find((item) => item.id === reopened.id).removed, false);
   assert(savedWorkspace.sessions.some((item) => item.id === retainedSession.id && item.projectId === reopened.id));
-  await page.locator("#projects").getByText(retainedSession.name, { exact: true }).waitFor();
+  await page.locator(`#project-switcher [data-project-id="${reopened.id}"]`).click();
+  await page.locator("#project-sessions").getByText(retainedSession.name, { exact: true }).waitFor();
   await api("app", "remove_project", { id: reopened.id });
   console.log(
     "PASS clone dialog, existing destination protection, and reopening a removed project with its sessions",
@@ -818,6 +832,23 @@ async function test() {
       data: "marker-" + provider + "\r",
     });
   }
+  const projectButton = (id) => page.locator(`#project-switcher [data-project-id="${id}"]`);
+  const sessionList = page.locator("#project-sessions");
+  await projectButton(p.id).click();
+  const recentSession = sessionList.locator(`[data-session-id="${sessions[1].id}"]`);
+  await recentSession.click();
+  const activeRunIds = async () => (await api("app", "state")).active.map((run) => run.runId).sort();
+  const beforeSwitch = await activeRunIds();
+  assert.equal(await projectButton(p.id).getAttribute("data-running"), "true");
+  await projectButton(gp.id).focus();
+  await page.keyboard.press("Enter");
+  assert.equal(await projectButton(gp.id).getAttribute("aria-pressed"), "true");
+  assert.equal(await sessionList.locator(".session-entry").count(), 0);
+  await projectButton(p.id).click();
+  assert.equal(await sessionList.locator(".session-entry").count(), sessions.length);
+  assert.equal(await recentSession.getAttribute("aria-pressed"), "true");
+  assert.deepEqual(await activeRunIds(), beforeSwitch);
+  console.log("PASS project rail switches projects, scopes sessions, and restores focus without restarting terminals");
   const isolatedFile = { sessionId: sessions[0].id, path: editName };
   const isolatedOriginal = (await api("files", "edit_read", isolatedFile)).text;
   await saveText(isolatedFile, "Sadece oturum\n");
@@ -2192,17 +2223,8 @@ async function test() {
   const getRules = (projectId) => api("app", "project_instructions_read", { projectId });
   const saveRules = (projectId, text, revision) => api("app", "project_instructions_save", { projectId, text, revision });
   await page.evaluate((id) => window.workflow.selectProject(id), rulesProject.id);
-  const projectRow = page.locator(".project-row.active");
-  const projectLayout = await projectRow.evaluate((row) => {
-    const rect = (name) => row.querySelector(name).getBoundingClientRect();
-    const name = rect(".project-name");
-    const count = rect(".project-session-count");
-    const rules = rect(".project-rules");
-    return { ordered: name.right < count.left && count.right < rules.left,
-      centerOffset: Math.abs((count.top + count.bottom - rules.top - rules.bottom) / 2) };
-  });
-  assert(projectLayout.ordered && projectLayout.centerOffset <= 1);
-  await projectRow.getByRole("button", { name: "Proje talimatları" }).click();
+  const sessionHeader = page.locator(".session-list-heading");
+  await sessionHeader.getByRole("button", { name: "Proje talimatları" }).click();
   await dialog.getByLabel("Ortak talimatlar").fill("Run the project checks.");
   await dialog.getByRole("button", { name: "Kaydet" }).click();
   await dialog.waitFor({ state: "hidden" });
@@ -2309,7 +2331,7 @@ async function test() {
   await api("terminal", "stop", { id: claudeRules.session.id, runId: clearedClaudeRules.runId });
   await until(async () => !(await api("app", "state")).active.some((run) =>
     [...ruleSessions.map(({ session }) => session.id), worktreeRules.id, directGitRules.id, directRules.id].includes(run.id)), "shared instructions test terminals stopped");
-  console.log("PASS project row alignment, external instructions for all three providers, unchanged Git state, reattach, and legacy cleanup");
+  console.log("PASS project session actions, external instructions for all three providers, unchanged Git state, reattach, and legacy cleanup");
   const securityProjectPath = path.join(temporary, "security-template-project");
   fs.mkdirSync(securityProjectPath);
   const securityProject = await api("app", "add_project", { directory: securityProjectPath });

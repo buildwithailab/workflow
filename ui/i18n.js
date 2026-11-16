@@ -3,7 +3,10 @@
 // Turkish source text is the default. Translate only messages authored by Workflow.
 const english = {
   "Proje talimatları": "Project instructions",
-  "Proje oturumları": "Project sessions",
+  "Projeler": "Projects",
+  "Oturumlar": "Sessions",
+  "Uygulama araçları": "App tools",
+  "Açık oturum var": "Open sessions",
   "Ortak talimatlar": "Shared instructions",
   "Bu talimatlar Workflow’da saklanır ve Codex, Claude Code ve Copilot oturumlarına bir sonraki başlatmada uygulanır.": "Workflow stores these instructions locally. Codex, Claude Code, and Copilot receive them the next time a session starts.",
   "Proje talimatları kaydedildi.": "Project instructions saved.",

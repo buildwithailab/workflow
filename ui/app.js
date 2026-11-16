@@ -27,7 +27,6 @@ let db = {
   camera = { x: 25, y: 40, z: 0.75 },
   gesture = null,
   connecting = null,
-  expanded = {},
   browserPage = null,
   browserTabs = [],
   browserJson = null,
@@ -55,6 +54,7 @@ const views = new Map(),
   activity = new Map(),
   starting = new Set(),
   gitSelected = new Set();
+const projectFocus = Object.create(null);
 let previews = {};
 const ctx = () => ({ projectId, ...(focusId ? { sessionId: focusId } : {}) });
 const session = (id) => db.sessions.find((s) => s.id === id),
@@ -300,10 +300,11 @@ function stateBadge(id) {
   return n;
 }
 function selectProject(id) {
+  if (!db.projects.some((p) => p.id === id && !p.removed)) return;
   projectId = id;
   const sessions = visibleSessions();
   if (!sessions.some((s) => s.id === focusId))
-    focusId = sessions[0]?.id || null;
+    focusId = sessions.find((s) => s.id === projectFocus[id])?.id || sessions[0]?.id || null;
   fileDirectory = "";
   browserPage = null;
   render();
@@ -336,7 +337,8 @@ function render() {
   )
     focusId = visibleSessions()[0]?.id || null;
   renderTeamsEditor();
-  renderProjects();
+  renderProjectRail();
+  renderSessionList();
   renderCards();
   renderProviderCards();
   $("#project-title").textContent = project()?.name || tr("Çalışma alanı");
@@ -361,87 +363,74 @@ function render() {
   paintBrowserPermission();
   if (panel === "links") renderLinks();
 }
-function renderProjects() {
-  const root = $("#projects");
-  root.replaceChildren();
-  for (const p of db.projects.filter((p) => !p.removed)) {
-    const item = el("section", "project-item"),
-      row = el("div", "project-row" + (p.id === projectId ? " active" : ""));
-    const sessions = db.sessions.filter(
-      (s) => s.projectId === p.id && !s.archived,
-    );
-    const open = expanded[p.id] !== false;
-    const expandProject = button("", () => {
-      expanded[p.id] = !open;
-      renderProjects();
-      remember();
-    }, "icon quiet project-expand", tr("Proje oturumları"));
-    expandProject.setAttribute("aria-label", expandProject.title);
-    expandProject.setAttribute("aria-expanded", String(open));
-    const instructions = button(
-      "",
-      () => editProjectInstructions(p),
-      "icon quiet project-rules",
-      tr("Proje talimatları"),
-    );
-    instructions.setAttribute("aria-label", instructions.title);
-    const name = el("span", "project-name", p.name);
-    name.title = p.name;
-    const count = el("small", "project-session-count", sessions.length);
-    count.title = countLabel(sessions.length, "{count} oturum");
-    const actions = el("div", "project-actions");
-    actions.append(
-      count,
-      instructions,
-      button(
-        "×",
-        () => {
-          modal(
-            tr("Projeyi listeden kaldır"),
-            el(
-              "p",
-              "help",
-              p.name +
-                tr(" listeden kaldırılacak. Proje dosyaları korunur. Açık oturumlarını önce durdur."),
-            ),
-            async () => {
-              await api("app", "remove_project", { id: p.id });
-              if (projectId === p.id) projectId = null;
-              await sync();
-            },
-            tr("Kaldır"),
-          );
-        },
-        "icon quiet",
-        tr("Projeyi kaldır"),
-      ),
-    );
-    row.append(expandProject, el("span", "project-folder"), name, actions);
-    row.onclick = () => selectProject(p.id);
-    item.append(row);
-    if (open) {
-      const children = el("div", "project-children");
-      if (!sessions.length)
-        children.append(el("p", "help", tr("Henüz oturum yok.")));
-      for (const s of sessions) {
-        const b = button(
-          "",
-          () => selectSession(s.id),
-          "session-entry" + (s.id === focusId ? " active" : ""),
-        );
-        b.append(
-          el("span", "provider-icon " + s.provider, icons[s.provider]),
-          el("span", "name", s.name),
-          stateBadge(s.id),
-        );
-        b.ondblclick = () => rename(s.id);
-        children.append(b);
-      }
-      item.append(children);
-    }
-    root.append(item);
+function projectInitials(name) {
+  const words = name.match(/[\p{L}\p{N}][\p{L}\p{N}\p{M}]*/gu) || [];
+  const initials = words.length > 1
+    ? words.slice(0, 2).map((word) => [...word][0]).join("")
+    : words[0] || "·";
+  return [...initials.toLocaleUpperCase(uiLocale)].slice(0, 2).join("");
+}
+function renderProjectRail() {
+  const root = $("#project-switcher");
+  const focused = root.contains(document.activeElement) ? document.activeElement.dataset.projectId : null;
+  const activeIds = new Set(db.active.map((run) => run.id));
+  const running = new Set(db.sessions.filter((s) => !s.archived && activeIds.has(s.id)).map((s) => s.projectId));
+  const entries = db.projects.filter((p) => !p.removed).map((p) => {
+    const live = running.has(p.id);
+    const label = live ? p.name + " · " + tr("Açık oturum var") : p.name;
+    const b = button(projectInitials(p.name), () => selectProject(p.id), "icon rail-project", label);
+    b.dataset.projectId = p.id;
+    b.dataset.color = String([...p.id].reduce((sum, ch) => sum + ch.charCodeAt(0), 0) % 5);
+    b.dataset.running = String(live);
+    b.setAttribute("aria-label", label);
+    b.setAttribute("aria-pressed", String(p.id === projectId));
+    return b;
+  });
+  root.replaceChildren(...entries);
+  entries.find((b) => b.dataset.projectId === focused)?.focus({ preventScroll: true });
+  if (root.dataset.selected !== projectId) {
+    root.dataset.selected = projectId || "";
+    entries.find((b) => b.dataset.projectId === projectId)?.scrollIntoView({ block: "nearest" });
   }
 }
+function renderSessionList() {
+  const root = $("#project-sessions");
+  const focused = root.contains(document.activeElement) ? document.activeElement.dataset.sessionId : null;
+  const hasProject = !!project();
+  $("#project-rules").hidden = $("#remove-project").hidden = !hasProject;
+  const entries = visibleSessions().map((s) => {
+    const b = button("", () => selectSession(s.id), "session-entry" + (s.id === focusId ? " active" : ""), s.name);
+    b.dataset.sessionId = s.id;
+    b.setAttribute("aria-pressed", String(s.id === focusId));
+    b.append(
+      el("span", "provider-icon " + s.provider, icons[s.provider]),
+      el("span", "name", s.name),
+      stateBadge(s.id),
+    );
+    b.ondblclick = () => rename(s.id);
+    return b;
+  });
+  root.replaceChildren(...(entries.length ? entries : [el("p", "help", tr(hasProject ? "Henüz oturum yok." : "Bir proje seç."))]));
+  entries.find((b) => b.dataset.sessionId === focused)?.focus({ preventScroll: true });
+}
+$("#project-rules").onclick = () => {
+  const p = project();
+  if (p) editProjectInstructions(p).catch(error);
+};
+$("#remove-project").onclick = () => {
+  const p = project();
+  if (!p) return;
+  modal(
+    tr("Projeyi listeden kaldır"),
+    el("p", "help", p.name + tr(" listeden kaldırılacak. Proje dosyaları korunur. Açık oturumlarını önce durdur.")),
+    async () => {
+      await api("app", "remove_project", { id: p.id });
+      if (projectId === p.id) projectId = null;
+      await sync();
+    },
+    tr("Kaldır"),
+  );
+};
 async function editProjectInstructions(project) {
   const saved = await api("app", "project_instructions_read", { projectId: project.id });
   const editor = el("textarea");
@@ -1118,7 +1107,7 @@ function createCard(s, index) {
     if (focusId !== s.id) {
       focusId = s.id;
       renderTeamsEditor();
-      renderProjects();
+      renderSessionList();
       $$(".session-card").forEach((c) =>
         c.classList.toggle("focused", c.dataset.id === s.id),
       );
@@ -1227,7 +1216,7 @@ function detectActivity(id, v) {
   const old = activity.get(id);
   activity.set(id, s);
   if (s.key !== old?.key) {
-    renderProjects();
+    if (session(id)?.projectId === projectId) renderSessionList();
     const view = views.get(id);
     if (view) view.state.replaceWith((view.state = stateBadge(id)));
     if (["permission", "completed"].includes(s.key) && old)
@@ -1866,6 +1855,7 @@ $("#focus-card").onclick = focusCard;
 for (const m of ["map", "grid", "focus"])
   $("#view-" + m).onclick = () => setMode(m);
 function remember() {
+  if (projectId && focusId) projectFocus[projectId] = focusId;
   localStorage.setItem(
     "agentloom-layout",
     JSON.stringify({
@@ -1873,7 +1863,7 @@ function remember() {
       focusId,
       mode,
       camera,
-      expanded,
+      projectFocus,
       panel,
       noLeft: document.body.classList.contains("no-left"),
       noRight: document.body.classList.contains("no-right"),
@@ -1930,7 +1920,7 @@ function setPanelWidth(side, width) {
     panel = sidePanels[side],
     other = sidePanels[side === "left" ? "right" : "left"],
     otherWidth = $(other.selector).getBoundingClientRect().width,
-    dividers = $("#left-resizer").offsetWidth + $("#right-resizer").offsetWidth,
+    fixedWidth = $(".project-rail").offsetWidth + $("#left-resizer").offsetWidth + $("#right-resizer").offsetWidth,
     minimum = parseFloat(style.getPropertyValue(panel.variable + "-min")),
     center = parseFloat(style.getPropertyValue("--main-min"));
   const root = document.documentElement.style;
@@ -1939,7 +1929,7 @@ function setPanelWidth(side, width) {
     panel.variable,
     Math.max(
       minimum,
-      Math.min(width, layout.clientWidth - center - otherWidth - dividers),
+      Math.min(width, layout.clientWidth - center - otherWidth - fixedWidth),
     ) + "px",
   );
 }
@@ -4393,10 +4383,12 @@ async function initialize() {
       localStorage.getItem("agentloom-layout") || "null",
     );
     if (saved) {
-      ({ projectId, focusId, mode, camera, expanded } = Object.assign(
-        { expanded: {}, camera },
+      ({ projectId, focusId, mode, camera } = Object.assign(
+        { camera },
         saved,
       ));
+      Object.assign(projectFocus, saved.projectFocus);
+      if (projectId && focusId) projectFocus[projectId] = focusId;
       panel = saved.panel || "browser";
       document.body.classList.toggle("no-left", !!saved.noLeft);
       document.body.classList.toggle("no-right", !!saved.noRight);

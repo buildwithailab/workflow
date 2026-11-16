@@ -8,8 +8,31 @@
   </head>
   <body>
     <div id="layout">
+      <nav class="project-rail" aria-label="Projeler">
+        <div id="project-switcher"></div>
+        <button class="icon quiet" id="add-project" type="button" title="Proje ekle" aria-label="Proje ekle" aria-haspopup="dialog">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
+        <div class="rail-tools" role="group" aria-label="Uygulama araçları">
+          <button class="icon quiet" id="app-settings" type="button" title="Ayarlar" aria-label="Ayarlar" aria-haspopup="dialog">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M10 3h4l.5 2.6 1.8 1 2.5-.8 2 3.4-2 1.7v2.2l2 1.7-2 3.4-2.5-.8-1.8 1L14 21h-4l-.5-2.6-1.8-1-2.5.8-2-3.4 2-1.7v-2.2l-2-1.7 2-3.4 2.5.8 1.8-1Z"/>
+              <circle cx="12" cy="12" r="3"/>
+            </svg>
+          </button>
+          <button class="icon quiet" id="addons" type="button" title="Eklentiler" aria-label="Eklentiler" aria-haspopup="dialog">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 21 8l-9 5-9-5 9-5Zm-9 9 9 5 9-5M3 16l9 5 9-5"/></svg>
+          </button>
+          <button class="icon quiet" id="archive" type="button" title="Geçmiş oturumlar" aria-label="Geçmiş oturumlar" aria-haspopup="dialog">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 5v5h5M4.6 9.5a8 8 0 1 1 0 5"/>
+              <path d="M12 8v5l3 2"/>
+            </svg>
+          </button>
+        </div>
+      </nav>
       <aside class="sidebar">
-        <button class="brand" id="app-settings" type="button" title="Ayarlar" aria-label="Ayarlar" aria-haspopup="dialog">
+        <div class="brand">
           <svg viewBox="0 0 64 70" aria-hidden="true">
             <path
               d="M6 17 16 54 28 27 39 54 50 17M55 50h3"
@@ -20,7 +43,7 @@
           <span>
             <strong>workflow</strong><small>YOUR AGENTS, CONNECTED</small>
           </span>
-        </button>
+        </div>
         <div class="sidebar-actions" role="group" aria-label="Oturum oluşturma">
           <button class="primary" id="new-session" type="button">+ Yeni oturum</button>
           <button
@@ -64,16 +87,12 @@
             </svg>
           </button>
         </div>
-        <div class="project-heading">
-          <span class="grow">PROJELER</span
-          ><button class="icon quiet" id="addons" title="Eklentiler">◇</button
-          ><button class="icon quiet" id="archive" title="Geçmiş oturumlar">
-            ◷</button
-          ><button class="icon quiet" id="add-project" title="Proje ekle">
-            +
-          </button>
+        <div class="session-list-heading">
+          <h2 id="session-list-title" class="grow">Oturumlar</h2>
+          <button class="icon quiet project-rules" id="project-rules" type="button" title="Proje talimatları" aria-label="Proje talimatları" aria-haspopup="dialog" hidden></button>
+          <button class="icon quiet" id="remove-project" type="button" title="Projeyi kaldır" aria-label="Projeyi kaldır" aria-haspopup="dialog" hidden>×</button>
         </div>
-        <div class="project-list" id="projects"></div>
+        <div class="session-list" id="project-sessions" role="group" aria-labelledby="session-list-title"></div>
       </aside>
       <div
         class="v-resizer"
