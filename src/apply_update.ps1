@@ -23,7 +23,16 @@ try {
     $canRestart = $true
     [IO.File]::Copy($source, $temporary)
     $file = [Diagnostics.FileVersionInfo]::GetVersionInfo($temporary)
-    if ((Get-FileHash -LiteralPath $temporary -Algorithm SHA256).Hash -ine $env:WORKFLOW_UPDATE_SHA256 -or
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    $stream = $null
+    try {
+        $stream = [IO.File]::OpenRead($temporary)
+        $digest = [BitConverter]::ToString($hasher.ComputeHash($stream)).Replace('-', '')
+    } finally {
+        $hasher.Dispose()
+        if ($stream) { $stream.Dispose() }
+    }
+    if ($digest -ine $env:WORKFLOW_UPDATE_SHA256 -or
         $file.ProductName -cne 'Workflow' -or
         $file.ProductVersion -cne $env:WORKFLOW_UPDATE_VERSION) {
         throw 'Invalid update'
