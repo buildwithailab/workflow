@@ -20,6 +20,7 @@ let db = {
     preferences: {},
   },
   projectId = null,
+  folderId = null,
   focusId = null,
   panel = "browser",
   providers = [],
@@ -60,6 +61,9 @@ const views = new Map(),
   starting = new Set(),
   gitSelected = new Set();
 const projectFocus = Object.create(null);
+const projectFolders = Object.create(null);
+const folderLayout = Object.create(null);
+const collapsedSessionFolders = new Set();
 let previews = {};
 const ctx = () => ({ projectId, ...(focusId ? { sessionId: focusId } : {}) });
 const session = (id) => db.sessions.find((s) => s.id === id),
@@ -290,7 +294,23 @@ async function sync() {
   return db;
 }
 function visibleSessions() {
+  return projectSessions().filter((s) => (s.folderId || null) === folderId);
+}
+function projectSessions() {
   return db.sessions.filter((s) => s.projectId === projectId && !s.archived);
+}
+function foldersFor(id) {
+  return db.projects.find((p) => p.id === id)?.sessionFolders || [];
+}
+function knownFolder(pid, id) {
+  return foldersFor(pid).some((folder) => folder.id === id) ? id : null;
+}
+function folderOptions(pid) {
+  return [{ id: "", label: tr("Genel") },
+    ...foldersFor(pid).map((folder) => ({ id: folder.id, label: folder.name }))];
+}
+function folderLayoutKey(project = projectId, folder = folderId) {
+  return JSON.stringify([project, folder]);
 }
 function status(id) {
   if (starting.has(id)) return { key: "working", label: tr("Açılıyor…") };
@@ -306,26 +326,53 @@ function stateBadge(id) {
 }
 function selectProject(id) {
   if (!db.projects.some((p) => p.id === id && !p.removed)) return;
-  projectId = id;
-  const sessions = visibleSessions();
-  if (!sessions.some((s) => s.id === focusId))
-    focusId = sessions.find((s) => s.id === projectFocus[id])?.id || sessions[0]?.id || null;
-  fileDirectory = "";
-  browserPage = null;
+  selectScope(id, projectFolders[id]);
   render();
   refreshPanel();
   remember();
 }
+function selectScope(pid, requestedFolder) {
+  const next = knownFolder(pid, requestedFolder);
+  if (projectId === pid && folderId === next) return;
+  if (projectId) folderLayout[folderLayoutKey()] = { focusId, camera };
+  projectId = pid;
+  folderId = next;
+  const saved = folderLayout[folderLayoutKey()];
+  focusId = saved?.focusId || projectFocus[pid] || null;
+  camera = saved?.camera || { x: 25, y: 40, z: 0.75 };
+  fileDirectory = "";
+  browserPage = null;
+  applyCamera();
+}
+function selectFolder(id) {
+  selectScope(projectId, id);
+  render();
+  remember();
+  refreshPanel().catch(error);
+}
+function clickSessionFolder(id) {
+  const key = folderLayoutKey(projectId, id);
+  if (id !== folderId) {
+    collapsedSessionFolders.delete(key);
+    selectFolder(id);
+    return;
+  }
+  if (!collapsedSessionFolders.delete(key)) collapsedSessionFolders.add(key);
+  renderSessionList();
+  remember();
+}
 function selectSession(id, center = false, tab = null) {
   const s = session(id);
-  if (!s) return;
-  projectId = s.projectId;
+  if (!s || s.archived) return;
+  selectScope(s.projectId, s.folderId);
   focusId = id;
   render();
   if (tab) openPanel(tab).catch(error);
   else refreshPanel();
   remember();
-  if (center) focusCard();
+  if (center && mode === "map") focusCard();
+  if (center && mode === "grid")
+    views.get(id)?.card.scrollIntoView({ block: "nearest", inline: "nearest" });
 }
 function render() {
   db.projects ??= [];
@@ -334,31 +381,39 @@ function render() {
   db.jobs ??= [];
   db.active ??= [];
   if (!project() || project()?.removed)
-    projectId = db.projects.find((p) => !p.removed)?.id || null;
+    selectScope(db.projects.find((p) => !p.removed)?.id || null, null);
+  if (folderId !== knownFolder(projectId, folderId)) selectScope(projectId, null);
+  const sessions = visibleSessions();
   if (
-    !session(focusId) ||
-    session(focusId)?.projectId !== projectId ||
-    session(focusId)?.archived
+    !sessions.some((s) => s.id === focusId)
   )
-    focusId = visibleSessions()[0]?.id || null;
+    focusId = sessions[0]?.id || null;
   renderTeamsEditor();
   renderProjectRail();
   renderSessionList();
+  renderSessionTabs();
   renderCards();
   renderProviderCards();
   $("#project-title").textContent = project()?.name || tr("Çalışma alanı");
   $("#project-title").title = $("#project-title").textContent;
-  const count = visibleSessions().length;
+  const count = sessions.length;
   $("#session-count").textContent = countLabel(count, "{count} oturum");
   $("#panel-context").textContent =
     (project()?.name || "") +
     (session(focusId) ? " · " + session(focusId).name : "");
-  $("#running-status span").textContent = db.active.length
-    ? countLabel(db.active.length, "{count} oturum çalışıyor")
+  const running = sessions.filter((s) => active(s.id)).length;
+  $("#running-status span").textContent = running
+    ? countLabel(running, "{count} oturum çalışıyor")
     : tr("Çalışan oturum yok");
-  $("#empty").hidden = visibleSessions().length > 0;
+  $("#empty").hidden = sessions.length > 0;
+  if (!sessions.length) {
+    $("#empty h2").textContent = tr(projectId ? "Bu klasörde henüz oturum yok." : "Bir sonraki işine yer aç.");
+    $("#empty p").textContent = tr(projectId
+      ? "Bu klasörde çalışmaya başlamak için yeni bir oturum aç."
+      : "Proje ekle, bir sağlayıcı seç ve ilk oturumunu başlat.");
+  }
   $("#empty").style.marginTop = "100px";
-  const options = visibleSessions().map((s) => ({
+  const options = sessions.map((s) => ({
     id: s.id,
     label: names[s.provider] + " · " + s.name,
   }));
@@ -400,10 +455,15 @@ function renderProjectRail() {
 }
 function renderSessionList() {
   const root = $("#project-sessions");
-  const focused = root.contains(document.activeElement) ? document.activeElement.dataset.sessionId : null;
+  const focused = root.contains(document.activeElement) ? document.activeElement : null;
   const hasProject = !!project();
-  $("#project-rules").hidden = $("#remove-project").hidden = !hasProject;
-  const entries = visibleSessions().map((s) => {
+  $("#project-rules").hidden = $("#remove-project").hidden = $("#add-session-folder").hidden = !hasProject;
+  if (!hasProject) {
+    root.replaceChildren(el("p", "help", tr("Bir proje seç.")));
+    return;
+  }
+  const sessions = projectSessions();
+  const entries = collapsedSessionFolders.has(folderLayoutKey()) ? [] : visibleSessions().map((s) => {
     const b = button("", () => selectSession(s.id), "session-entry" + (s.id === focusId ? " active" : ""), s.name);
     b.dataset.sessionId = s.id;
     b.setAttribute("aria-pressed", String(s.id === focusId));
@@ -415,8 +475,134 @@ function renderSessionList() {
     b.ondblclick = () => rename(s.id);
     return b;
   });
-  root.replaceChildren(...(entries.length ? entries : [el("p", "help", tr(hasProject ? "Henüz oturum yok." : "Bir proje seç."))]));
-  entries.find((b) => b.dataset.sessionId === focused)?.focus({ preventScroll: true });
+  root.replaceChildren(...folderOptions(projectId).map((folder) => {
+    const key = folder.id || null;
+    const selected = key === folderId;
+    const expanded = selected && !collapsedSessionFolders.has(folderLayoutKey(projectId, key));
+    const group = el("section", "session-folder");
+    const row = el("div", "session-folder-row");
+    const children = el("div", "session-folder-children");
+    children.id = "session-folder-children-" + folder.id;
+    const choose = button("", () => clickSessionFolder(key), "session-folder-select", folder.label);
+    choose.dataset.folderId = folder.id;
+    choose.setAttribute("aria-expanded", String(expanded));
+    choose.setAttribute("aria-controls", children.id);
+    if (selected) choose.setAttribute("aria-current", "true");
+    const chevron = el("span", "session-folder-chevron");
+    chevron.setAttribute("aria-hidden", "true");
+    choose.append(
+      chevron,
+      el("span", "session-folder-icon"),
+      el("span", "name", folder.label),
+      el("span", "folder-count", sessions.filter((session) => (session.folderId || null) === key).length),
+    );
+    row.append(choose);
+    if (key && selected) {
+      const menu = button("⋯", () => folderMenu(key, folder.label), "icon quiet", tr("Klasör ayarları"));
+      menu.dataset.folderMenu = key;
+      menu.setAttribute("aria-label", tr("Klasör ayarları"));
+      row.append(menu);
+    }
+    children.hidden = !expanded;
+    if (expanded)
+      children.append(...(entries.length ? entries : [el("p", "help", tr("Henüz oturum yok."))]));
+    group.append(row, children);
+    return group;
+  }));
+  if (focused) {
+    const { sessionId, folderId, folderMenu } = focused.dataset;
+    [...root.querySelectorAll("button")].find((b) =>
+      (sessionId !== undefined && b.dataset.sessionId === sessionId) ||
+      (folderId !== undefined && b.dataset.folderId === folderId) ||
+      (folderMenu !== undefined && b.dataset.folderMenu === folderMenu),
+    )?.focus({ preventScroll: true });
+  }
+}
+
+function renderSessionTabs() {
+  const root = $("#session-tabs");
+  const previousFocus = root.contains(document.activeElement) ? document.activeElement.dataset.sessionId : null;
+  const tabs = visibleSessions().map((s) => {
+    const selected = s.id === focusId;
+    const tab = button("", () => selectSession(s.id, true), "session-tab", s.name);
+    tab.id = "session-tab-" + s.id;
+    tab.dataset.sessionId = s.id;
+    tab.setAttribute("role", "tab");
+    tab.setAttribute("aria-selected", String(selected));
+    tab.setAttribute("aria-controls", "viewport");
+    tab.tabIndex = selected ? 0 : -1;
+    tab.append(el("span", "provider-icon " + s.provider, icons[s.provider]),
+      el("span", "name", s.name), stateBadge(s.id));
+    return tab;
+  });
+  root.hidden = !tabs.length;
+  root.replaceChildren(...tabs);
+  const selected = tabs.find((b) => b.dataset.sessionId === focusId);
+  const viewport = $("#viewport");
+  if (selected) {
+    viewport.setAttribute("role", "tabpanel");
+    viewport.setAttribute("aria-labelledby", selected.id);
+    if (root.dataset.selected !== focusId) selected.scrollIntoView({ block: "nearest", inline: "nearest" });
+    if (previousFocus) selected.focus({ preventScroll: true });
+  } else {
+    viewport.removeAttribute("role");
+    viewport.removeAttribute("aria-labelledby");
+  }
+  root.dataset.selected = focusId || "";
+}
+
+$("#session-tabs").onkeydown = (event) => {
+  const keys = ["ArrowLeft", "ArrowRight", "Home", "End"];
+  if (!keys.includes(event.key)) return;
+  const tabs = [...$("#session-tabs").children];
+  const index = tabs.indexOf(event.target);
+  if (index < 0) return;
+  event.preventDefault();
+  const target = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1
+    : (index + tabs.length + (event.key === "ArrowLeft" ? -1 : 1)) % tabs.length;
+  selectSession(tabs[target].dataset.sessionId, true);
+};
+
+function folderNameDialog(key = null, name = "") {
+  if (!projectId) return;
+  const pid = projectId;
+  const fieldName = input(name);
+  fieldName.maxLength = 80;
+  fieldName.required = true;
+  modal(tr(key ? "Klasörü yeniden adlandır" : "Oturum klasörü ekle"),
+    field(tr("Klasör adı"), fieldName), async () => {
+      const folder = await api("app", key ? "folder_rename" : "folder_create",
+        { projectId: pid, folderId: key, name: fieldName.value });
+      await sync();
+      if (pid === projectId) selectFolder(folder.id);
+    }, tr(key ? "Kaydet" : "Klasörü oluştur"));
+  fieldName.focus();
+}
+
+function folderMenu(key, name) {
+  const pid = projectId;
+  modal(name, [
+    button(tr("Klasörü yeniden adlandır"), () => folderNameDialog(key, name)),
+    button(tr("Klasörü kaldır"), () => modal(tr("Klasörü kaldır"),
+      el("p", "help", tr("Oturumlar Genel klasörüne taşınacak.")), async () => {
+        await api("app", "folder_remove", { projectId: pid, folderId: key });
+        collapsedSessionFolders.delete(folderLayoutKey(pid, key));
+        await sync();
+        if (pid === projectId) selectFolder(null);
+      }, tr("Kaldır"))),
+  ]);
+}
+$("#add-session-folder").onclick = () => folderNameDialog();
+
+function moveSessionDialog(s) {
+  const destination = select(folderOptions(s.projectId), s.folderId || "");
+  modal(tr("Klasöre taşı"), field(tr("Oturum klasörü"), destination), async () => {
+    await api("app", "folder_move_session", {
+      projectId: s.projectId, id: s.id, folderId: destination.value || null,
+    });
+    await sync();
+    selectSession(s.id, true);
+  }, tr("Taşı"));
 }
 $("#project-rules").onclick = () => {
   const p = project();
@@ -1113,6 +1299,7 @@ function createCard(s, index) {
       focusId = s.id;
       renderTeamsEditor();
       renderSessionList();
+      renderSessionTabs();
       $$(".session-card").forEach((c) =>
         c.classList.toggle("focused", c.dataset.id === s.id),
       );
@@ -1221,7 +1408,10 @@ function detectActivity(id, v) {
   const old = activity.get(id);
   activity.set(id, s);
   if (s.key !== old?.key) {
-    if (session(id)?.projectId === projectId) renderSessionList();
+    if (session(id)?.projectId === projectId) {
+      renderSessionList();
+      renderSessionTabs();
+    }
     const view = views.get(id);
     if (view) view.state.replaceWith((view.state = stateBadge(id)));
     if (["permission", "completed"].includes(s.key) && old)
@@ -1377,6 +1567,7 @@ async function sessionMenu(id) {
   box.append(
     button(tr("Konuşma geçmişini oku"), () => showTranscript(id)),
     bind,
+    ...(foldersFor(s.projectId).length ? [button(tr("Klasöre taşı"), () => moveSessionDialog(s))] : []),
     ...(s.workspaceKind === "direct"
       ? []
       : [button(tr("Eklentiler"), () => sessionAddons(id))]),
@@ -1860,7 +2051,11 @@ $("#focus-card").onclick = focusCard;
 for (const m of ["map", "grid", "focus"])
   $("#view-" + m).onclick = () => setMode(m);
 function remember() {
-  if (projectId && focusId) projectFocus[projectId] = focusId;
+  if (projectId) {
+    if (focusId) projectFocus[projectId] = focusId;
+    projectFolders[projectId] = folderId;
+    folderLayout[folderLayoutKey()] = { focusId, camera };
+  }
   localStorage.setItem(
     "agentloom-layout",
     JSON.stringify({
@@ -1869,6 +2064,10 @@ function remember() {
       mode,
       camera,
       projectFocus,
+      folderId,
+      projectFolders,
+      folderLayout,
+      collapsedSessionFolders: [...collapsedSessionFolders],
       panel,
       changesPreference,
       noLeft: document.body.classList.contains("no-left"),
@@ -2220,6 +2419,7 @@ async function newSession(provider = "codex") {
         .map((p) => ({ id: p.id, label: p.name })),
       projectId,
     ),
+    folders = select([], ""),
     providerChoice = el("div", "provider-choices"),
     accountChoice = select([]),
     name = input("", tr("Örn. API geliştirme")),
@@ -2299,12 +2499,25 @@ async function newSession(provider = "codex") {
       // Session creation resolves the actual checkout from the selected folder.
     }
   }
-  projects.onchange = workspaceMode.onchange = paintWorkspace;
+  function paintFolders() {
+    const options = folderOptions(projects.value);
+    folders.replaceChildren(...options.map((option) => new Option(option.label, option.id)));
+    folders.value = (projects.value === projectId ? folderId : knownFolder(projects.value, projectFolders[projects.value])) || "";
+    folderField.hidden = options.length === 1;
+  }
+  const folderField = field(tr("Oturum klasörü"), folders);
+  projects.onchange = () => {
+    paintFolders();
+    paintWorkspace();
+  };
+  workspaceMode.onchange = paintWorkspace;
+  paintFolders();
   paintWorkspace();
   modal(
     tr("Yeni oturum"),
     [
       field(tr("Proje"), projects),
+      folderField,
       providerChoice,
       field(tr("Hesap"), accountChoice),
       field(tr("Oturum adı"), name),
@@ -2316,6 +2529,7 @@ async function newSession(provider = "codex") {
     async () => {
       const s = await api("app", "create_session", {
         projectId: projects.value,
+        folderId: folders.value || null,
         provider: selected,
         accountId: accountChoice.value,
         name: name.value || names[selected] + tr(" · Oturum"),
@@ -2490,7 +2704,7 @@ function editTemplate(entry, projectId, destinationId) {
   content.append(field(tr("Şablon adı"), name), fromMap.label, editor);
   modal(tr("Şablonu düzenle"), content, async () => {
     const update = fromMap.input.checked
-      ? { projectId, name: name.value }
+      ? { projectId, folderId, name: name.value }
       : { template: { ...template, name: name.value.trim(), sessions: rows.map((row) => row()), links: permissions.map((read) => read()) } };
     await api("templates", "update", { id: entry.id, revision: entry.revision, ...update });
     $("#dialog").addEventListener("close", () => openTemplates(entry.id, destinationId).catch(error), { once: true });
@@ -2570,7 +2784,7 @@ async function openTemplates(selectedId, destinationId = projectId) {
   const capture = button(tr("Haritayı şablon olarak kaydet"), () => {
     const name = input("", tr("Şablon adı"));
     modal(tr("Haritayı şablon olarak kaydet"), field(tr("Şablon adı"), name), async () => {
-      const entry = await api("templates", "capture", { projectId, name: name.value });
+      const entry = await api("templates", "capture", { projectId, folderId, name: name.value });
       $("#dialog").addEventListener("close", () => openTemplates(entry.id).catch(error), { once: true });
     });
     name.focus();
@@ -2603,7 +2817,8 @@ async function openTemplates(selectedId, destinationId = projectId) {
   content.append(el("p", "help", tr("Oturumlar ve bağlantılar oluşturulur. Oturumları haritadan başlatabilirsin.")));
   modal(tr("İş akışı şablonları"), content, async () => {
     const target = destination.value;
-    await api("templates", "apply", { id: selection().id, projectId: target, providers: choices.map((choice) => choice.value) });
+    const targetFolder = target === projectId ? folderId : knownFolder(target, projectFolders[target]);
+    await api("templates", "apply", { id: selection().id, projectId: target, folderId: targetFolder, providers: choices.map((choice) => choice.value) });
     await sync();
     selectProject(target);
     setMode("map");
@@ -3661,7 +3876,7 @@ async function openLink(source, target) {
   if (!source) {
     source = focusId;
   }
-  const candidates = visibleSessions().filter((s) => s.id !== source),
+  const candidates = projectSessions().filter((s) => s.id !== source),
     choice = select(
       [
         { id: "", label: tr("Hedef oturum seç") },
@@ -4472,6 +4687,12 @@ async function initialize() {
         saved,
       ));
       Object.assign(projectFocus, saved.projectFocus);
+      Object.assign(projectFolders, saved.projectFolders);
+      Object.assign(folderLayout, saved.folderLayout);
+      if (Array.isArray(saved.collapsedSessionFolders))
+        for (const key of saved.collapsedSessionFolders)
+          if (typeof key === "string") collapsedSessionFolders.add(key);
+      folderId = typeof saved.folderId === "string" ? saved.folderId : null;
       if (projectId && focusId) projectFocus[projectId] = focusId;
       panel = saved.panel || "browser";
       if (["git", "session"].includes(saved.changesPreference))

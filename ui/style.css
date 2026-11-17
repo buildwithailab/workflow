@@ -618,6 +618,93 @@ body.no-left .sidebar {
   width: 24px;
   height: 26px;
 }
+#add-session-folder svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.session-folder {
+  margin-bottom: 4px;
+}
+.session-folder-row {
+  display: flex;
+  gap: 3px;
+  align-items: center;
+}
+.session-folder-row .icon {
+  flex: none;
+  width: 24px;
+  height: 26px;
+}
+.session-folder-select {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px;
+  background: transparent;
+  border-color: transparent;
+  text-align: left;
+  color: var(--muted);
+}
+.session-folder-select[aria-current="true"] {
+  background: var(--raised);
+  border-color: var(--line);
+  color: var(--text);
+}
+.session-folder-chevron {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  margin-inline: 1px 3px;
+  border-right: 1px solid;
+  border-bottom: 1px solid;
+  transform: rotate(-45deg);
+}
+.session-folder-select[aria-expanded="true"] .session-folder-chevron {
+  transform: translateY(-2px) rotate(45deg);
+}
+.session-folder-select .name,
+.session-tab .name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-folder-icon {
+  position: relative;
+  width: 13px;
+  height: 10px;
+  flex: none;
+  margin-top: 3px;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+}
+.session-folder-icon::before {
+  content: "";
+  position: absolute;
+  left: -1px;
+  top: -4px;
+  width: 6px;
+  height: 3px;
+  border: 1px solid currentColor;
+  border-radius: 2px 2px 0 0;
+}
+.folder-count {
+  color: var(--muted);
+  font-size: 10px;
+}
+.session-folder-children {
+  margin: 4px 0 6px 7px;
+  padding-left: 5px;
+  border-left: 1px solid var(--line);
+}
 .project-rules::before {
   content: "";
   width: 11px;
@@ -901,6 +988,45 @@ body.no-left .sidebar {
   flex-wrap: wrap;
 }
 
+#session-tabs {
+  display: flex;
+  flex: none;
+  gap: 3px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  padding: 2px 2px 0;
+}
+.session-tab {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 0 0 auto;
+  min-width: 0;
+  max-width: min(200px, 58%);
+  padding: 5px 9px;
+  border-radius: 6px 6px 0 0;
+  background: var(--panel);
+  color: var(--muted);
+}
+.session-tab .provider-icon {
+  font-size: 15px;
+}
+.session-tab .state span {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+.session-tab[aria-selected="true"] {
+  color: var(--text);
+  background: var(--raised);
+  border-top-color: var(--accent);
+}
+#session-tabs:not([hidden]) + #viewport {
+  border-top-left-radius: 3px;
+}
 #viewport {
   flex: 1;
   min-height: 120px;

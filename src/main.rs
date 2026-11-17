@@ -14,6 +14,7 @@ mod models;
 #[cfg(windows)]
 mod preview;
 mod provider_setup;
+mod session_folders;
 mod sharing;
 #[cfg(windows)]
 mod teams;
@@ -86,6 +87,9 @@ fn route(core: &Arc<Core>, domain: &str, action: &str, args: &Value) -> Result<V
 fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
     match action {
         "state" => Ok(core.snapshot()),
+        "folder_create" | "folder_rename" | "folder_remove" | "folder_move_session" => {
+            session_folders::dispatch(core, action, args)
+        }
         "project_instructions_read" | "project_instructions_save" => {
             instructions::edit(core, action, args)
         }
@@ -433,6 +437,7 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
 }
 
 fn prepare_session(core: &Core, project: &Value, args: &Value) -> Result<Value> {
+    let folder_id = session_folders::folder_id(project, &args["folderId"])?;
     let provider = string(args, "provider")?;
     if !["codex", "claude", "copilot"].contains(&provider) {
         bail!("Sağlayıcı geçersiz");
@@ -456,7 +461,7 @@ fn prepare_session(core: &Core, project: &Value, args: &Value) -> Result<Value> 
     let sid = id();
     let w = files::create_workspace(core, project, &sid, direct)?;
     let mut session = json!({
-        "id":sid, "provider":provider, "accountId":account.id, "projectId":project["id"],
+        "id":sid, "provider":provider, "accountId":account.id, "projectId":project["id"], "folderId":folder_id,
         "name":args["name"].as_str().filter(|s|!s.trim().is_empty()).unwrap_or("Yeni oturum"),
         "createdAt":now(), "directory":w["directory"], "workspaceKind":w["kind"], "branch":w["branch"],
         "state":"stopped", "tools":args["tools"]!=false, "browserAccess":true,

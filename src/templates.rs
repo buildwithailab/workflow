@@ -212,7 +212,8 @@ fn capture(core: &Core, args: &Value) -> Result<Template> {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|s| s["projectId"] == project && s["archived"] != true)
+        .filter(|s| s["projectId"] == project && s["archived"] != true
+            && args.get("folderId").is_none_or(|folder| s["folderId"] == *folder))
         .collect();
     if sessions.is_empty() || sessions.len() > 20 {
         bail!("Şablon için 1–20 oturum gerekir.");
@@ -269,6 +270,7 @@ fn apply(core: &Core, args: &Value) -> Result<Value> {
     if project["removed"] == true {
         bail!("Projeyi önce çalışma alanına ekle.");
     }
+    let folder_id = crate::session_folders::folder_id(&project, &args["folderId"])?;
     let template_id = string(args, "id")?;
     let template = local_template(core, template_id)?;
     template.validate()?;
@@ -293,7 +295,7 @@ fn apply(core: &Core, args: &Value) -> Result<Value> {
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter(|s| s["projectId"] == project["id"] && s["archived"] != true)
+                .filter(|s| s["projectId"] == project["id"] && s["archived"] != true && s["folderId"] == folder_id)
                 .enumerate()
                 .map(|(i, s)| {
                     s["position"]["y"]
@@ -318,7 +320,7 @@ fn apply(core: &Core, args: &Value) -> Result<Value> {
                 core,
                 &project,
                 &json!({
-                    "name":entry.name, "provider":provider, "model":model, "workspaceMode":entry.workspace_mode,
+                    "name":entry.name, "provider":provider, "model":model, "workspaceMode":entry.workspace_mode, "folderId":folder_id,
                 }),
             )?;
             session["position"] = json!({

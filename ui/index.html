@@ -89,6 +89,11 @@
         </div>
         <div class="session-list-heading">
           <h2 id="session-list-title" class="grow">Oturumlar</h2>
+          <button class="icon quiet" id="add-session-folder" type="button" title="Oturum klasörü ekle" aria-label="Oturum klasörü ekle" aria-haspopup="dialog" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M3 7V5h7l2 3h9v10H3V7m9 4v5m-2.5-2.5h5" />
+            </svg>
+          </button>
           <button class="icon quiet project-rules" id="project-rules" type="button" title="Proje talimatları" aria-label="Proje talimatları" aria-haspopup="dialog" hidden></button>
           <button class="icon quiet" id="remove-project" type="button" title="Projeyi kaldır" aria-label="Projeyi kaldır" aria-haspopup="dialog" hidden>×</button>
         </div>
@@ -142,6 +147,7 @@
           </div>
           <div id="provider-cards"></div>
         </section>
+        <div id="session-tabs" role="tablist" aria-label="Klasördeki oturumlar" hidden></div>
         <div id="viewport">
           <div class="canvas-hint">
             Boş alandan sürükle · Ctrl + tekerlek ile yakınlaştır
