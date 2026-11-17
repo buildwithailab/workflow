@@ -121,6 +121,15 @@ pub fn executable(provider: &str, custom: Option<&str>) -> Option<PathBuf> {
     let mut folders =
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();
     folders.push(home().join(".local/bin"));
+    #[cfg(windows)]
+    folders.push(
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| home().join("AppData/Roaming"))
+            .join("npm"),
+    );
+    #[cfg(not(windows))]
     folders.push(home().join("AppData/Roaming/npm"));
     #[cfg(windows)]
     if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
@@ -129,20 +138,31 @@ pub fn executable(provider: &str, custom: Option<&str>) -> Option<PathBuf> {
             local.join("Microsoft/WindowsApps"),
         ]);
     }
-    for folder in folders {
-        for ext in if cfg!(windows) {
-            vec![".exe", ".cmd", ".bat", ".ps1", ""]
-        } else {
-            vec![""]
-        } {
-            let p = folder.join(format!("{provider}{ext}"));
-            if p.is_file() {
-                return Some(p);
-            }
-        }
+    if let Some(path) = folders
+        .iter()
+        .find_map(|folder| executable_in(folder, provider))
+    {
+        return Some(path);
+    }
+    #[cfg(windows)]
+    if provider == "copilot" {
+        return crate::provider_setup::npm_prefix().and_then(|prefix| executable_in(&prefix, provider));
     }
     None
 }
+
+fn executable_in(folder: &Path, program: &str) -> Option<PathBuf> {
+    let extensions: &[&str] = if cfg!(windows) {
+        &[".exe", ".cmd", ".bat", ".ps1", ""]
+    } else {
+        &[""]
+    };
+    extensions
+        .iter()
+        .map(|ext| folder.join(format!("{program}{ext}")))
+        .find(|path| path.is_file())
+}
+
 pub(crate) fn uses_windows_script(exe: &Path) -> bool {
     cfg!(windows)
         && exe

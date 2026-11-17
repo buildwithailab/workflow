@@ -92,7 +92,7 @@ let child,
   server,
   pids = [],
   calls = 0;
-async function start(missingProviders = "", profile = data) {
+async function start(missingProviders = "", profile = data, environment = {}) {
   const port = await freePort();
   const env = {
     ...process.env,
@@ -110,6 +110,7 @@ async function start(missingProviders = "", profile = data) {
       "http://127.0.0.1:" + server.address().port + "/usage",
     WORKFLOW_TEST_INPUT_DIR: path.join(data, "test-input"),
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: "--remote-debugging-port=" + port,
+    ...environment,
   };
   child = cp.spawn(exe, [], {
     cwd: process.env.WORKFLOW_TEST_WORKDIR || root,
@@ -266,6 +267,81 @@ async function stop() {
   page = null;
   child = null;
 }
+async function testCopilotNpm() {
+  const base = path.join(temporary, "copilot-npm");
+  const roaming = path.join(base, "roaming");
+  const defaultShim = path.join(roaming, "npm", "copilot.cmd");
+  const prefix = path.join(base, "global dizin " + String.fromCodePoint(0x131));
+  const customShim = path.join(prefix, "copilot.cmd");
+  const bin = path.join(base, "bin");
+  const launcher = "@echo off\r\necho Copilot npm fixture\r\n";
+  for (const dir of [bin, prefix, path.dirname(defaultShim), path.join(base, "local")])
+    fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(defaultShim, launcher);
+  fs.writeFileSync(customShim, launcher);
+  fs.writeFileSync(path.join(bin, "npm.cmd"), '@echo off\r\nnode "%~dp0npm-fixture.cjs" %*\r\nexit /b %errorlevel%\r\n');
+  fs.writeFileSync(path.join(bin, "npm-fixture.cjs"), [
+    'const fs = require("node:fs"), path = require("node:path");',
+    'const args = process.argv.slice(2).join(" ");',
+    'const prefix = process.env.NPM_CONFIG_PREFIX;',
+    'if (args === "prefix -g") console.log(prefix);',
+    'else if (args === "install -g @github/copilot")',
+    '  fs.writeFileSync(path.join(prefix, "copilot.cmd"), ' + JSON.stringify(launcher) + ');',
+    'else process.exitCode = 1;',
+  ].join("\n"));
+  await start("codex,claude", path.join(base, "test-profile"), {
+    PATH: [
+      bin,
+      path.dirname(process.execPath),
+      path.join(process.env.SystemRoot, "System32"),
+      path.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0"),
+    ].join(path.delimiter),
+    APPDATA: roaming,
+    LOCALAPPDATA: path.join(base, "local"),
+    NPM_CONFIG_PREFIX: prefix,
+    WORKFLOW_TEST_PROVIDER: undefined,
+    WORKFLOW_TEST_RPC_EXE: undefined,
+  });
+  const dialog = page.locator("#dialog");
+  await dialog.getByRole("heading", { name: "Provider setup" }).waitFor();
+  await dialog.getByRole("button", { name: "Skip", exact: true }).click();
+  const copilot = async () => (await api("app", "providers")).find(p => p.id === "copilot");
+  assert.equal((await copilot()).executable, defaultShim);
+  fs.unlinkSync(defaultShim);
+  assert.equal((await copilot()).executable, customShim);
+  const login = await api("provider_login", "start", { provider: "copilot" });
+  await until(async () => {
+    const result = await api("provider_login", "poll", { runId: login.runId, since: 0 });
+    return Buffer.from(result.data, "base64").toString().includes("Copilot npm fixture");
+  }, "npm Copilot launcher runs");
+  await api("provider_login", "close", { runId: login.runId });
+  fs.unlinkSync(customShim);
+  assert.equal((await copilot()).installed, false);
+  const options = (await api("app", "provider_install_options")).copilot;
+  assert.equal(options.find(method => method.id === "winget").available, false);
+  const nodeSupported = Number(process.versions.node.split(".")[0]) >= 22;
+  assert.equal(options.find(method => method.id === "npm").available, nodeSupported);
+  await assert.rejects(api("app", "provider_install", { provider: "copilot", method: "npm" }), /önce onayla/);
+  await page.locator("#app-settings").click();
+  await dialog.getByRole("button", { name: "Provider setup", exact: true }).click();
+  await dialog.getByRole("button", { name: "Rescan", exact: true }).click();
+  await dialog.locator(".setup-row").filter({ hasText: "GitHub Copilot" })
+    .getByText(/Not installed/).waitFor();
+  await dialog.getByRole("button", { name: "Next", exact: true }).click();
+  const npmRow = dialog.locator(".setup-command").filter({ hasText: "npm.cmd install -g @github/copilot" });
+  await npmRow.waitFor();
+  const install = npmRow.getByRole("button", { name: "Install", exact: true });
+  assert.equal(await install.isEnabled(), nodeSupported);
+  if (nodeSupported) {
+    await install.click();
+    await dialog.getByRole("button", { name: "Install", exact: true }).click();
+    await until(() => fs.existsSync(customShim), "confirmed npm installation");
+    assert.equal((await copilot()).executable, customShim);
+  }
+  await stop();
+  console.log("PASS Copilot npm discovery, launcher and installation option without WinGet");
+}
+
 async function test() {
   const git = (args) =>
     cp.execFileSync("git", args, {
@@ -343,6 +419,7 @@ async function test() {
     );
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  if (process.platform === "win32") await testCopilotNpm();
   const address = "http://127.0.0.1:" + server.address().port;
   const started = Date.now();
   await start();

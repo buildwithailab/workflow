@@ -4,6 +4,10 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 const WINGET: &str = "winget install --exact --source winget --id ";
 const WINGET_FLAGS: [&str; 3] = [
@@ -12,10 +16,13 @@ const WINGET_FLAGS: [&str; 3] = [
     "--accept-package-agreements",
 ];
 
-fn npm_available() -> bool {
-    cfg!(windows)
-        && terminal::executable("npm", None).is_some()
-        && terminal::executable("node", None).is_some_and(|exe| {
+fn npm_for_install() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let npm = terminal::executable("npm", None).filter(|path| path.is_absolute())?;
+    terminal::executable("node", None)
+        .is_some_and(|exe| {
             run(
                 &std::env::temp_dir(),
                 &exe.to_string_lossy(),
@@ -34,6 +41,81 @@ fn npm_available() -> bool {
             })
             .is_some_and(|major| major >= 22)
         })
+        .then_some(npm)
+}
+
+fn npm_command(npm: &Path, arguments: &str) -> Option<Command> {
+    let powershell = PathBuf::from(std::env::var_os("SystemRoot")?)
+        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let mut command = Command::new(powershell);
+    command
+        .env("WORKFLOW_NPM_PROGRAM", npm)
+        .args(["-NoProfile", "-NonInteractive", "-Command"])
+        .arg(format!(
+            "$ErrorActionPreference = 'Stop'; [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); & $env:WORKFLOW_NPM_PROGRAM {arguments}; exit $LASTEXITCODE"
+        ));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    Some(command)
+}
+
+#[cfg(windows)]
+pub(crate) fn npm_prefix() -> Option<PathBuf> {
+    use std::{
+        io::Read,
+        process::Stdio,
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    let npm = terminal::executable("npm", None).filter(|path| path.is_absolute())?;
+    let mut child = npm_command(&npm, "prefix -g")?
+        .current_dir(std::env::temp_dir())
+        .env_remove("NODE_OPTIONS")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let _job = terminal::Job::new(child.id()).ok();
+    let stdout = child.stdout.take()?;
+    let (send, receive) = mpsc::channel();
+    const MAX_PREFIX_BYTES: usize = 32 * 1024;
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout
+            .take(MAX_PREFIX_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = send.send(result);
+    });
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Ok(Some(_)) => return None,
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let bytes = receive
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()?
+        .ok()?;
+    if bytes.len() > MAX_PREFIX_BYTES {
+        return None;
+    }
+    let mut lines = std::str::from_utf8(&bytes).ok()?.trim().lines();
+    let prefix = PathBuf::from(lines.next()?);
+    (lines.next().is_none() && prefix.is_absolute()).then_some(prefix)
 }
 
 fn winget_option(package: &str, available: bool) -> Value {
@@ -42,14 +124,17 @@ fn winget_option(package: &str, available: bool) -> Value {
 
 pub fn options() -> Value {
     let winget = cfg!(windows) && terminal::executable("winget", None).is_some();
-    let npm = npm_available();
+    let npm = npm_for_install().is_some();
     json!({
         "codex": [
             {"id":"npm","command":"npm.cmd install -g @openai/codex","available":npm},
             winget_option("OpenAI.Codex", winget)
         ],
         "claude":[winget_option("Anthropic.ClaudeCode", winget)],
-        "copilot":[winget_option("GitHub.Copilot", winget)]
+        "copilot":[
+            {"id":"npm","command":"npm.cmd install -g @github/copilot","available":npm},
+            winget_option("GitHub.Copilot", winget)
+        ]
     })
 }
 
@@ -61,25 +146,18 @@ pub fn install(core: &Core, args: &Value) -> Result<Value> {
     }
     let _guard = core.operations.lock().unwrap();
     let output = match (provider, method) {
-        ("codex", "npm") => {
-            if !npm_available() {
-                bail!("npm ve Node.js 22+ gerekli.");
-            }
-            let npm = terminal::executable("npm", None).context("npm bulunamadı.")?;
-            let command = format!(
-                "& '{}' install -g @openai/codex; exit $LASTEXITCODE",
-                npm.to_string_lossy().replace('\'', "''")
-            );
-            run(
-                &core.directory,
-                "powershell.exe",
-                &[
-                    "-NoProfile".into(),
-                    "-NonInteractive".into(),
-                    "-Command".into(),
-                    command,
-                ],
-            )?
+        ("codex" | "copilot", "npm") => {
+            let npm = npm_for_install().context("npm ve Node.js 22+ gerekli.")?;
+            let arguments = if provider == "codex" {
+                "install -g '@openai/codex'"
+            } else {
+                "install -g '@github/copilot'"
+            };
+            npm_command(&npm, arguments)
+                .context("PowerShell bulunamadı.")?
+                .current_dir(crate::core::external_path(&core.directory))
+                .output()
+                .context("npm çalıştırılamadı.")?
         }
         ("codex" | "claude" | "copilot", "winget") => {
             let exe = terminal::executable("winget", None).context("WinGet bulunamadı.")?;
