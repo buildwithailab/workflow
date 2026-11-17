@@ -4,6 +4,10 @@ $ErrorActionPreference = 'Stop'
 $workflowRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $workflowExecutable = if ($Executable) { $Executable } else { Join-Path $workflowRoot 'Workflow.exe' }
 if (-not (Test-Path -LiteralPath $workflowExecutable -PathType Leaf)) { throw 'Workflow.exe was not found. Run Build.cmd first.' }
+$workflowVersion = (Get-Content -Raw -LiteralPath (Join-Path $workflowRoot 'tauri.conf.json') | ConvertFrom-Json).version
+if ((Get-Item -LiteralPath $workflowExecutable).VersionInfo.ProductVersion -cne $workflowVersion) {
+    throw "Build Workflow $workflowVersion before packaging its release."
+}
 
 # Check both byte alignments for UTF-16 Windows strings as well as UTF-8 paths.
 $workflowBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $workflowExecutable).Path)
@@ -61,3 +65,4 @@ $workflowHash = Get-FileHash -LiteralPath $workflowZip -Algorithm SHA256
 "$($workflowHash.Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($workflowZip))" |
     Set-Content -LiteralPath "$workflowZip.sha256" -Encoding ascii
 $workflowHash | Select-Object Algorithm,Hash,Path
+Copy-Item -LiteralPath $workflowExecutable -Destination (Join-Path $workflowRoot 'dist\Workflow-Update-Windows-x64.exe') -Force

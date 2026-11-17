@@ -94,6 +94,7 @@ async function test() {
   }
   await page.keyboard.press("Control+Shift+C");
   assert.deepEqual(await flush(), [], "copy without a selection does not interrupt");
+  assert.deepEqual(await page.evaluate(() => errors.splice(0)), ["Error: Kopyalamak için terminalde metin seç."]);
   console.log("PASS copy shortcuts and standard CLI control keys");
   await externalCopy("first\r\nsecond\tthird");
   await page.keyboard.press("Control+v");
@@ -130,6 +131,7 @@ async function test() {
   await page.keyboard.press("Control+c");
   await page.waitForTimeout(30);
   assert.deepEqual(await page.evaluate(() => sent), [], "stopped provider receives no input");
+  assert.deepEqual(await page.evaluate(() => errors.splice(0)), ["Yapıştırmak için oturumun terminalini başlat."]);
   await page.evaluate(() => { run = "replacement"; failClipboard = true; });
   await page.keyboard.press("Control+v");
   assert.deepEqual(await flush(), [], "failed clipboard read does not send control codes");

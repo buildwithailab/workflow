@@ -134,6 +134,10 @@ Terminals that enable bracketed paste keep the original line breaks. Otherwise, 
 
 Workflow stores projects, session metadata, terminal output, layout, and conversation IDs locally. Closing the app stops its terminals and preview servers. Reopening restores the workspace, and the play button on a session card resumes a verified conversation. The default profile is `%LOCALAPPDATA%\local.workflow.desktop`. Set `WORKFLOW_DATA_DIR` before launch to use a separate profile.
 
+## Updates
+
+Open **Settings → About and updates** to see the installed version, check for a newer release, and read the release notes. Automatic updates are on by default and can be turned off here. Workflow checks once a day while it is open. When a verified update is ready, choose **Update and restart** from the notification or the settings screen, or let Workflow install it when you close the app. Restarting stops open terminals and keeps your existing profile.
+
 ## Build and test
 
 Install the Rust toolchain pinned in `rust-toolchain.toml`, the MSVC build tools, and the Windows SDK. From the project root:
@@ -145,6 +149,10 @@ cargo test --locked
 ```
 
 The packaging script produces `dist/Workflow-Windows-x64.zip` and a SHA-256 checksum. The integration suite in `tests/integration.cjs` uses Playwright Core and a temporary data profile to exercise Windows terminals, Git, browser actions, previews, and shutdown. Set `WORKFLOW_TEST_EXE` to the executable to test and `WORKFLOW_PLAYWRIGHT` to the Playwright Core module path if installed outside the repository.
+
+### Publish an update
+
+Match the version in `Cargo.toml`, `Cargo.lock`, and `tauri.conf.json` to the intended stable GitHub tag, such as `v0.1.2`. Enable immutable releases on the repository. Create a draft release, write the release notes, and attach the ZIP, its checksum, and `dist/Workflow-Update-Windows-x64.exe` before publishing. Workflow offers automatic installation for the Windows x64 executable on immutable releases and verifies it against GitHub's SHA-256 asset digest.
 
 ## License
 

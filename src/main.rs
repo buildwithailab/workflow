@@ -20,6 +20,8 @@ mod sharing;
 mod teams;
 mod templates;
 mod terminal;
+#[cfg(windows)]
+mod updates;
 mod usage;
 use crate::core::*;
 use anyhow::{bail, Context, Result};
@@ -42,6 +44,24 @@ async fn dispatch(
         return Err("Bu sayfa uygulama araçlarına erişemez".into());
     }
     let core = state.inner().clone();
+    #[cfg(windows)]
+    if domain == "clipboard" {
+        return tauri::async_runtime::spawn_blocking(move || {
+            let owner = if action == "write" {
+                let hwnd = webview
+                    .window()
+                    .hwnd()
+                    .context("Metin panoya kopyalanamadı")?;
+                Some(windows::Win32::Foundation::HWND(hwnd.0 as _))
+            } else {
+                None
+            };
+            clipboard::dispatch(owner, &action, &args)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string());
+    }
     #[cfg(windows)]
     if domain == "teams" {
         return teams::dispatch(&core, &action, &args)
@@ -66,12 +86,6 @@ fn route(core: &Arc<Core>, domain: &str, action: &str, args: &Value) -> Result<V
     match domain {
         "app" => app_action(core, action, args),
         "terminal" => terminal::dispatch(core, action, args),
-        #[cfg(windows)]
-        "clipboard" => {
-            let window = core.app.get_webview_window("main").context("Pencere kapalı")?;
-            let owner = windows::Win32::Foundation::HWND(window.hwnd()?.0 as _);
-            clipboard::dispatch(owner, action, args)
-        }
         "provider_login" => terminal::login(core, action, args),
         "files" => files::dispatch(core, action, args),
         "git" => git::dispatch(core, action, args),
@@ -81,6 +95,8 @@ fn route(core: &Arc<Core>, domain: &str, action: &str, args: &Value) -> Result<V
         "templates" => templates::dispatch(core, action, args),
         #[cfg(windows)]
         "preview" => preview::dispatch(core, action, args),
+        #[cfg(windows)]
+        "updates" => updates::dispatch(core, action, args),
         _ => bail!("Uygulama işlemi bulunamadı"),
     }
 }
@@ -660,6 +676,8 @@ fn main() {
         if let Some(config) = &config {
             tauri::WebviewWindowBuilder::from_config(app, config)?.data_directory(webview_directory).build()?;
         }
+        #[cfg(windows)]
+        updates::start(&core);
         {use tauri_plugin_notification::NotificationExt;let weak=Arc::downgrade(&core);app.notification().on_action(move|event|{if let(Some(core),Some(note))=(weak.upgrade(),event.notification()){let sid=core.pending.lock().unwrap().get(&format!("notification:{}",note.id())).and_then(Value::as_str).map(str::to_string);if let Some(sid)=sid{if let Some(w)=core.app.get_webview_window("main"){let _=w.unminimize();let _=w.set_focus();}core.emit("notification-session",json!(sid));}}})?;}
         if std::env::var("WORKFLOW_TEST_MODE").ok().as_deref()==Some("1"){let _=atomic(&core.directory.join("ready.json"),&serde_json::to_vec(&json!({"pid":std::process::id(),"endpoint":*core.endpoint.lock().unwrap()}))?);}
         Ok(())
@@ -701,7 +719,8 @@ fn main() {
             label,
             event: tauri::WindowEvent::CloseRequested { .. },
             ..
-        } = &event {
+        } = &event
+        {
             if label == "main" {
                 teams::close(app);
             }
@@ -711,6 +730,8 @@ fn main() {
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
         ) {
             if let Some(core) = app.try_state::<Arc<Core>>() {
+                #[cfg(windows)]
+                core.updates.install_on_exit();
                 core.shutdown();
             }
         }

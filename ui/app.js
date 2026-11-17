@@ -1030,18 +1030,23 @@ function terminalClipboard(term, host, writableRun, onInput) {
   });
   const copy = async () => {
     const text = term.getSelection();
-    if (text) await api("clipboard", "write", { text });
+    if (!text) throw Error(tr("Kopyalamak için terminalde metin seç."));
+    await api("clipboard", "write", { text });
   };
   const paste = (readText = () => api("clipboard", "read")) => {
     const run = writableRun();
-    if (!run) return;
+    if (!run || term.options.disableStdin) {
+      error(tr("Yapıştırmak için oturumun terminalini başlat."));
+      return;
+    }
     const generation = inputGeneration;
     return enqueue(async () => {
       const canPaste = () => host.isConnected && writableRun() === run && !term.options.disableStdin;
       if (generation !== inputGeneration || !canPaste()) return;
       let text = await readText();
       // A stopped, replaced or detached terminal must not receive a pending paste.
-      if (!canPaste() || !text) return;
+      if (!canPaste()) return;
+      if (!text) throw Error(tr("Windows panosundan yapıştırılabilir metin alınamadı."));
       if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(text)) {
         inputGeneration++;
         throw Error(tr("Pano metninde terminal denetim karakterleri var. Metni temizleyip tekrar dene."));
@@ -1067,7 +1072,7 @@ function terminalClipboard(term, host, writableRun, onInput) {
     e.preventDefault();
     e.stopPropagation();
     const text = e.clipboardData?.getData("text/plain");
-    if (text) paste(() => text);
+    paste(() => text);
   }, true);
   term.attachCustomKeyEventHandler((e) => {
     const key = e.key.toLowerCase();
@@ -1113,7 +1118,7 @@ function terminalClipboard(term, host, writableRun, onInput) {
     e.preventDefault();
     e.stopPropagation();
     copyButton.disabled = !term.hasSelection();
-    pasteButton.disabled = !writableRun();
+    pasteButton.disabled = !writableRun() || term.options.disableStdin;
     menu.showPopover();
     const rect = host.getBoundingClientRect();
     const x = e.clientX || rect.left + 12, y = e.clientY || rect.top + 12;
@@ -2090,9 +2095,118 @@ $("#app-settings").onclick = () => {
   modal(tr("Ayarlar"), [
     field(tr("Arayüz dili"), language),
     button(tr("Sağlayıcı kurulumu"), () => openProviderSetup()),
+    button(tr("Hakkında ve güncellemeler"), openAbout),
   ]);
   $("#dialog-footer button").textContent = tr("Kapat");
 };
+
+async function openAbout() {
+  const panel = el("div", "about-updates");
+  panel.id = "about-updates";
+  panel.textContent = tr("Yükleniyor…");
+  modal(tr("Hakkında ve güncellemeler"), panel);
+  $("#dialog-footer button").textContent = tr("Kapat");
+  paintUpdate(await api("updates", "status"), panel);
+}
+
+const updateNotice = $("#update-notice");
+let dismissedUpdateVersion;
+
+async function restartForUpdate() {
+  if (dialogCloseGuard && !dialogCloseGuard()) return;
+  await api("updates", "install");
+}
+
+$("#update-now").onclick = busy($("#update-now"), restartForUpdate);
+$("#dismiss-update").onclick = () => {
+  dismissedUpdateVersion = updateNotice.dataset.version;
+  updateNotice.hidden = true;
+};
+
+function paintUpdate(state, panel) {
+  renderAbout(state, panel);
+  const version = state.pendingVersion;
+  if (!version || version === dismissedUpdateVersion) {
+    updateNotice.hidden = true;
+    return;
+  }
+  if (updateNotice.dataset.version !== version) {
+    updateNotice.dataset.version = version;
+    updateNotice.querySelector("[role=status]").textContent = tr("{version} güncellemesi hazır.", { version });
+  }
+  updateNotice.hidden = false;
+}
+
+function renderAbout(state, panel = $("#about-updates")) {
+  if (!panel?.isConnected || !$("#dialog").open || panel.getAttribute("aria-busy") === "true") return;
+  const snapshot = JSON.stringify(state);
+  if (panel.dataset.snapshot === snapshot) return;
+  panel.dataset.snapshot = snapshot;
+  const run = async (action, args) => {
+    panel.setAttribute("aria-busy", "true");
+    panel.querySelectorAll("button, input").forEach(control => { control.disabled = true; });
+    status.textContent = tr("Güncelleme işlemi devam ediyor…");
+    try {
+      await api("updates", action, args);
+    } catch (e) {
+      error(e);
+    } finally {
+      panel.removeAttribute("aria-busy");
+      delete panel.dataset.snapshot;
+      paintUpdate(await api("updates", "status"), panel);
+    }
+  };
+  const installed = el("strong", "", tr("Kurulu sürüm {version}", { version: state.version }));
+  const auto = el("input");
+  auto.type = "checkbox";
+  auto.checked = state.automatic;
+  auto.disabled = !state.supported;
+  auto.onchange = () => run("automatic", { enabled: auto.checked }).catch(error);
+  const toggle = el("label", "update-toggle");
+  toggle.append(auto, document.createTextNode(tr("Otomatik güncelle")));
+  const help = el("p", "help", tr(state.supported
+    ? "Workflow açıkken her gün kontrol eder. İndirilen güncelleme uygulama kapatıldığında kurulur."
+    : "Otomatik güncelleme Windows x64 release derlemesinde kullanılabilir."));
+  const status = el("p", "update-status");
+  status.setAttribute("role", "status");
+  const actions = el("div", "update-actions");
+  actions.append(
+    button(tr("Güncellemeleri kontrol et"), () => run("check")),
+    button(tr("GitHub sürümleri"), () => api("updates", "open_releases"), "quiet"),
+  );
+  if (state.available?.downloadable && state.pendingVersion !== state.available.version) {
+    actions.append(button(tr("Güncellemeyi indir"), () => run("download"), "primary"));
+  }
+  if (state.pendingVersion) {
+    const install = button(tr("Güncelle ve yeniden başlat"), () => {}, "primary");
+    install.onclick = busy(install, restartForUpdate);
+    actions.append(install);
+    status.textContent = tr("{version} güncellemesi hazır.", { version: state.pendingVersion });
+  } else if (state.available) {
+    status.textContent = tr("{version} güncellemesi var.", { version: state.available.version });
+  } else if (state.checkedAt && !state.error) {
+    status.textContent = tr("Daha yeni bir sürüm bulunamadı.");
+  }
+  panel.replaceChildren(installed, toggle, help, actions, status);
+  if (state.pendingVersion) {
+    panel.append(el("p", "help", tr("Yeniden başlatma açık oturumları durdurur.")));
+  }
+  if (state.error) panel.append(el("p", "dialog-error", tr(state.error)));
+  if (state.checkedAt) {
+    const time = new Date(state.checkedAt * 1000).toLocaleString(uiLanguage);
+    panel.append(el("p", "help", tr("Son kontrol {time}", { time })));
+  }
+  const addNotes = (label, notes) => {
+    if (!notes?.trim()) return;
+    const section = el("section", "update-notes");
+    section.append(el("strong", "", label), el("p", "", notes));
+    panel.append(section);
+  };
+  addNotes(tr("Bu sürümdeki yenilikler"), state.installedNotes);
+  if (state.available) {
+    addNotes(tr("{version} sürümündeki yenilikler", { version: state.available.version }), state.available.notes);
+  }
+}
 function panelToggle(side) {
   document.body.classList.toggle("no-" + side);
   remember();
@@ -4720,6 +4834,8 @@ async function initialize() {
     selectSession(payload, true),
   );
   await listen("terminal", ({ payload }) => terminalPacket(payload));
+  await listen("workflow-update", ({ payload }) => paintUpdate(payload));
+  api("updates", "status").then(state => paintUpdate(state)).catch(() => {});
   await listen("browser-trace", ({ payload }) => {
     if (traceDialog?.sid === payload.sessionId && $("#dialog").open)
       renderTrace(traceDialog).catch(error);

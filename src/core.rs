@@ -166,6 +166,8 @@ pub struct Core {
     pub browsers: Mutex<BrowserState>,
     #[cfg(windows)]
     pub previews: crate::preview::Previews,
+    #[cfg(windows)]
+    pub updates: crate::updates::Updates,
     pub operations: Mutex<()>,
     pub app: AppHandle,
     pub endpoint: Mutex<String>,
@@ -195,6 +197,8 @@ impl Core {
             json!({"version":1,"projects":[],"sessions":[],"links":[],"jobs":[],"preferences":{},"providers":{}})
         };
         Ok(Arc::new(Self {
+            #[cfg(windows)]
+            updates: crate::updates::Updates::load(&directory),
             directory,
             db: Mutex::new(db),
             terms: Mutex::new(HashMap::new()),

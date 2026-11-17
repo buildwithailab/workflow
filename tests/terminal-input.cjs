@@ -26,7 +26,7 @@ function fixture() {
     term, host, writableRun: () => run,
     confirmTerminalPaste: () => state.confirm?.() ?? true,
     onInput: data => { sent.push(data); return state.write?.(); },
-    el: node, button: node, tr: value => value, error: e => errors.push(e.message),
+    el: node, button: node, tr: value => value, error: e => errors.push(typeof e === "string" ? e : e.message),
     api: async (domain, action, args) => {
       calls.push({ domain, action, args });
       if (action === "read") return state.read ? state.read() : state.text;
@@ -64,7 +64,7 @@ test("xterm focus reports do not block actions on an empty draft", async () => {
   assert.deepEqual(f.sent, ["\x1b[I", "\x1b[O", "draft"]);
   assert.equal(f.hasPendingInput(), false);
 });
-test("unselected Ctrl+C and ordinary CLI shortcuts remain with xterm", () => {
+test("unselected Ctrl+C and ordinary CLI shortcuts remain with xterm", async () => {
   const f = fixture();
   for (const key of ["c", "a", "d", "l", "z", "r"]) {
     assert.deepEqual(f.key(key, {ctrlKey:true}), { handled:false, prevented:false });
@@ -75,6 +75,8 @@ test("unselected Ctrl+C and ordinary CLI shortcuts remain with xterm", () => {
   assert.equal(f.key("v", {ctrlKey:true,altKey:true}).handled, false);
   assert.equal(f.key("C", {ctrlKey:true,shiftKey:true}).handled, true);
   assert.deepEqual(f.calls, []);
+  await tick();
+  assert.deepEqual(f.errors, ["Kopyalamak için terminalde metin seç."]);
 });
 test("paste shortcuts route text through xterm once, without appending Enter", async () => {
   const f = fixture(); f.state.text = "ilk\r\nikinci 🦖";
@@ -110,8 +112,16 @@ test("stopped and detached terminals never receive paste", async () => {
   assert.equal(f.key("v", {ctrlKey:true}).handled, true);
   f.data("\r"); await tick();
   assert.deepEqual(f.calls, []); assert.deepEqual(f.sent, []);
+  assert.deepEqual(f.errors, ["Yapıştırmak için oturumun terminalini başlat."]);
   f.run("run-2"); f.host.isConnected = false;
   f.key("v", {ctrlKey:true}); await tick(); assert.deepEqual(f.pastes, []);
+});
+test("an empty Windows clipboard reports the problem and keeps normal terminal input working", async () => {
+  const f = fixture(); f.state.text = "";
+  f.key("v", {ctrlKey:true}); f.data("normal typing"); await tick();
+  assert.deepEqual(f.errors, ["Windows panosundan yapıştırılabilir metin alınamadı."]);
+  assert.deepEqual(f.sent, ["normal typing"]);
+  assert.deepEqual(f.pastes, []);
 });
 test("clipboard errors are visible and do not block further terminal input", async () => {
   const f = fixture(); f.state.read = () => Promise.reject(Error("busy clipboard"));

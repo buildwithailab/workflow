@@ -34,22 +34,20 @@ impl Drop for OwnedMemory {
     }
 }
 
-pub fn dispatch(owner: HWND, action: &str, args: &Value) -> Result<Value> {
+pub fn dispatch(owner: Option<HWND>, action: &str, args: &Value) -> Result<Value> {
     if !matches!(action, "read" | "write") {
         bail!("Pano işlemi bulunamadı");
     }
     let _lock = CLIPBOARD.lock().unwrap();
-    // Other Windows apps may hold the clipboard briefly while copying.
-    let mut opened = false;
-    for _ in 0..10 {
-        if unsafe { OpenClipboard(Some(owner)) }.is_ok() {
-            opened = true;
+    // Remote clipboard redirection can hold the clipboard briefly after a copy.
+    for attempt in 0..=20 {
+        if unsafe { OpenClipboard(owner) }.is_ok() {
             break;
         }
-        thread::sleep(Duration::from_millis(10));
-    }
-    if !opened {
-        bail!("Pano şu anda kullanılıyor. Tekrar dene.");
+        if attempt == 20 {
+            bail!("Pano şu anda kullanılıyor. Tekrar dene.");
+        }
+        thread::sleep(Duration::from_millis(20));
     }
     let _clipboard = OpenClipboardGuard;
     match action {
@@ -57,7 +55,11 @@ pub fn dispatch(owner: HWND, action: &str, args: &Value) -> Result<Value> {
             if IsClipboardFormatAvailable(UNICODE_TEXT).is_err() {
                 return Ok(json!(""));
             }
-            let handle = HGLOBAL(GetClipboardData(UNICODE_TEXT)?.0);
+            let handle = HGLOBAL(
+                GetClipboardData(UNICODE_TEXT)
+                    .context("Panodaki metin okunamadı")?
+                    .0,
+            );
             let count = GlobalSize(handle) / size_of::<u16>();
             if count == 0 {
                 return Ok(json!(""));
@@ -91,8 +93,9 @@ pub fn dispatch(owner: HWND, action: &str, args: &Value) -> Result<Value> {
             std::ptr::copy_nonoverlapping(text.as_ptr(), pointer, text.len());
             let _ = GlobalUnlock(memory.0);
             // Allocate and fill first, so an allocation failure preserves the clipboard.
-            EmptyClipboard()?;
-            SetClipboardData(UNICODE_TEXT, Some(HANDLE(memory.0.0)))?;
+            EmptyClipboard().context("Metin panoya kopyalanamadı")?;
+            SetClipboardData(UNICODE_TEXT, Some(HANDLE(memory.0.0)))
+                .context("Metin panoya kopyalanamadı")?;
             std::mem::forget(memory); // Windows owns the allocation after success.
             Ok(json!(true))
         },

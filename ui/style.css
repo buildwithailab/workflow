@@ -2220,6 +2220,34 @@ dialog::backdrop {
   font-size: 12px;
   line-height: 1.7;
 }
+.about-updates {
+  display: grid;
+  gap: 10px;
+}
+.update-toggle,
+.update-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.update-toggle input {
+  accent-color: var(--accent);
+}
+.update-status:empty {
+  display: none;
+}
+.update-notes {
+  display: grid;
+  gap: 6px;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+.update-notes p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.55;
+}
 .provider-choices {
   display: flex;
   gap: 8px;
@@ -2284,6 +2312,32 @@ dialog::backdrop {
   border: 0;
   font-size: 18px;
   padding: 0;
+}
+#update-notice {
+  position: fixed;
+  z-index: 999;
+  right: 25px;
+  bottom: 20px;
+  max-width: calc(100vw - 50px);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 12px 14px;
+  border: 1px solid #596f45;
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 10px 50px #0008;
+}
+#toast:not([hidden]) + #update-notice {
+  bottom: 86px;
+}
+#update-notice .help,
+#update-now {
+  grid-column: 1 / -1;
+}
+#update-now {
+  justify-self: start;
 }
 .working {
   animation: pulse 1s infinite;
