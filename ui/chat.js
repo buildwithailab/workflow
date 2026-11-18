@@ -95,6 +95,7 @@ function syncChatBinding(selected, view) {
   view.terminalOutput = null;
   view.terminalRunId = null;
   view.terminalPreviewOpen = false;
+  view.questionReply = null;
   return true;
 }
 
@@ -115,7 +116,7 @@ async function readChat() {
     view.mismatch = update.mismatch;
     view.ticket = update.ticket;
     view.liveApproval = update.liveApprovalMode;
-    view.terminalPrompt = update.terminalPrompt;
+    if (!view.answeringPrompt) view.terminalPrompt = update.terminalPrompt;
     view.terminalOutput = update.terminalOutput;
     view.terminalRunId = update.terminalRunId;
     view.loadError = !!update.logError;
@@ -198,22 +199,33 @@ function paintChatComposer(selected, chat) {
   const choiceArea = $("#chat-terminal-choices");
   const menu = prompt?.menu;
   const choiceKey = menu ? `${id}:${terminal.runId}:${menu.key}` : "";
-  if (choiceArea.dataset.key !== choiceKey) {
-    choiceArea.dataset.key = choiceKey;
-    choiceArea.replaceChildren(...(menu?.choices || []).map((label, index) => {
-      const button = el("button", "", `${index + 1} · ${label}`);
-      button.type = "button";
-      button.onclick = () => answerTerminalChoice(id, choiceKey, index + 1).catch(error);
-      return button;
-    }));
+  const questionCard = prompt?.kind === "question" && menu;
+  choiceArea.classList.toggle("chat-choices", !questionCard);
+  const renderKey = `${choiceKey}:${uiLanguage}`;
+  if (choiceArea.dataset.key !== renderKey) {
+    choiceArea.dataset.key = renderKey;
+    choiceArea.replaceChildren();
+    if (menu && questionCard) {
+      choiceArea.append(createChatQuestion(chat, choiceKey, menu.question,
+        menu.choices.map((label, index) => ({ number: index + 1, label, description: menu.descriptions?.[index] || "" }))
+          .filter(choice => choice.number !== menu.customChoice),
+        response => answerTerminalChoice(id, choiceKey, response), !!menu.customChoice));
+    } else if (menu) {
+      for (const [index, label] of menu.choices.entries()) {
+        const button = el("button", "", `${index + 1} · ${label}`);
+        button.type = "button";
+        button.onclick = () => answerTerminalChoice(id, choiceKey, { choice: index + 1 }).catch(error);
+        choiceArea.append(button);
+      }
+    }
   }
+  $("#chat-terminal-prompt").classList.toggle("question-card", !!questionCard);
+  promptText.hidden = !!questionCard;
   choiceArea.hidden = !menu;
-  for (const button of choiceArea.children) {
-    button.disabled = !!chat.answeringPrompt || !!terminalInputPending || !!terminal?.replaying;
-  }
-  for (const button of $("#chat-turns").querySelectorAll(".chat-reply-choices button")) {
-    button.disabled = !ready || terminalInputPending || chat.sending || !!chat.pending || !!chat.loadError
-      || !!chat.applyingModel || !!chat.applyingApproval || !!chat.attaching;
+  updateQuestionControls(choiceArea, !!chat.answeringPrompt || !!terminalInputPending || !!terminal?.replaying);
+  for (const card of $("#chat-turns").querySelectorAll(".chat-question-card")) {
+    updateQuestionControls(card, !ready || terminalInputPending || chat.sending || !!chat.pending || !!chat.loadError
+      || !!chat.applyingModel || !!chat.applyingApproval || !!chat.attaching);
   }
   const peek = running && !ready && !prompt && !chat.mismatch;
   const expanded = peek && !!chat.terminalPreviewOpen;
@@ -229,21 +241,22 @@ function paintChatComposer(selected, chat) {
   paintChatApproval(selected, chat);
 }
 
-async function answerTerminalChoice(id, key, choice) {
+async function answerTerminalChoice(id, key, response) {
   const chat = chatView(id);
   const terminal = views.get(id);
   const menu = chat.terminalPrompt?.menu;
   if (shownChatId !== id || !active(id) || chat.answeringPrompt || !menu || terminal?.replaying
     || terminal?.hasPendingInput() || chat.terminalRunId !== terminal?.runId
-    || key !== `${id}:${terminal.runId}:${menu.key}`) return;
+    || key !== `${id}:${terminal.runId}:${menu.key}`) return false;
   chat.answeringPrompt = true;
   paintChatComposer(session(id), chat);
   try {
     await api("chat", "answer_prompt", {
       id, runId: terminal.runId, key: menu.key, inputRevision: menu.inputRevision,
-      selected: menu.selected, choice,
+      selected: menu.selected, ...response,
     });
     if (chat.terminalPrompt?.menu?.key === menu.key) delete chat.terminalPrompt.menu;
+    return true;
   } finally {
     chat.answeringPrompt = false;
     if (shownChatId === id) {
@@ -251,6 +264,108 @@ async function answerTerminalChoice(id, key, choice) {
       readChat().catch(error);
     }
   }
+}
+
+function questionOption(label, description = "") {
+  const bold = label.match(/^\*\*(.+?)\*\*\s*[—–:.\-]?\s*(.*)$/);
+  if (bold) return { label: bold[1], description: [bold[2], description].filter(Boolean).join(" ") };
+  const parts = label.match(/^(.*?)\s+[—–]\s+([\s\S]*)$/);
+  return { label: parts ? parts[1] : label, description: [parts?.[2], description].filter(Boolean).join(" ") };
+}
+
+function updateQuestionControls(card, disabled) {
+  card.dataset.disabled = String(!!disabled);
+  for (const nested of card.querySelectorAll(".chat-question-card")) nested.dataset.disabled = String(!!disabled);
+  for (const control of card.querySelectorAll("input, button")) {
+    control.disabled = !!disabled || (control.classList.contains("chat-custom-send")
+      && !card.querySelector(".chat-custom-input")?.value.trim()) || (control.classList.contains("chat-choice-send")
+      && !card.querySelector('input[type="radio"]:checked'));
+  }
+}
+
+function createChatQuestion(view, key, question, choices, respond, custom = true) {
+  const card = el("section", "chat-question-card");
+  card.dataset.questionKey = key;
+  const heading = el("div", "chat-question-heading");
+  const mark = el("span", "chat-question-mark", "?");
+  mark.setAttribute("aria-hidden", "true");
+  heading.append(mark, el("strong", "", tr("Soru · Birini seç")));
+  card.append(heading, el("p", "chat-question-title", question));
+  const group = el("div", "chat-question-options");
+  group.setAttribute("role", "radiogroup");
+  group.setAttribute("aria-label", question);
+  const submit = async response => {
+    if (card.dataset.disabled === "true" || !card.isConnected) return;
+    updateQuestionControls(card, true);
+    try {
+      if (await respond(response) !== true) return;
+      if (view.questionReply?.key === key) view.questionReply = null;
+    } catch (err) {
+      error(err);
+    } finally {
+      if (shownChatId) paintChatComposer(session(shownChatId), chatView(shownChatId));
+    }
+  };
+  for (const [index, choice] of choices.entries()) {
+    const number = choice.number || index + 1;
+    const option = questionOption(choice.label, choice.description);
+    const row = el("label", "chat-question-option");
+    const radio = el("input");
+    radio.type = "radio";
+    radio.name = "question-" + key;
+    radio.value = String(number);
+    radio.checked = view.questionReply?.key === key && view.questionReply.choice === number;
+    radio.onchange = () => {
+      view.questionReply = { key, text: card.querySelector(".chat-custom-input")?.value || "", choice: number };
+      choiceSend.hidden = false;
+      updateQuestionControls(card, card.dataset.disabled === "true");
+    };
+    const content = el("span", "chat-choice-content");
+    content.append(el("span", "chat-choice-title", option.label));
+    if (option.description) content.append(el("span", "chat-choice-description", option.description));
+    row.append(radio, content);
+    group.append(row);
+  }
+  card.append(group);
+  const choiceSend = el("button", "chat-choice-send primary", tr("Seçimi gönder"));
+  choiceSend.type = "button";
+  choiceSend.hidden = !group.querySelector('input:checked');
+  choiceSend.onclick = () => {
+    const choice = Number(group.querySelector('input:checked')?.value);
+    if (choice) submit({ choice });
+  };
+  card.append(choiceSend);
+  if (custom) {
+    const entry = el("div", "chat-custom-answer");
+    const input = el("input", "chat-custom-input");
+    input.type = "text";
+    input.maxLength = 4000;
+    input.placeholder = tr("Kendi yanıtını yaz…");
+    input.setAttribute("aria-label", tr("Kendi yanıtın"));
+    input.value = view.questionReply?.key === key ? view.questionReply.text : "";
+    const button = el("button", "chat-custom-send", "↑");
+    button.type = "button";
+    button.setAttribute("aria-label", tr("Yanıtı gönder"));
+    button.title = tr("Yanıtı gönder");
+    input.oninput = () => {
+      view.questionReply = { key, text: input.value };
+      for (const radio of group.querySelectorAll("input")) radio.checked = false;
+      choiceSend.hidden = true;
+      button.disabled = card.dataset.disabled === "true" || !input.value.trim();
+    };
+    button.onclick = () => { if (input.value.trim()) submit({ text: input.value.trim() }); };
+    input.onkeydown = event => {
+      if (event.key === "Enter" && !event.isComposing) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!button.disabled) button.click();
+      }
+    };
+    entry.append(input, button);
+    card.append(entry);
+  }
+  updateQuestionControls(card, true);
+  return card;
 }
 
 const approvalLabels = {
@@ -593,28 +708,23 @@ function paintChatTurns(view, initial = false) {
     if (entry.answer) {
       const answer = el("div", "chat-answer");
       const provider = session(shownChatId)?.provider;
-      answer.append(el("strong", "chat-answer-name", `${icons[provider]} ${names[provider]}`), renderChatText(entry.answer));
-      if (!view.pending && entry === view.turns.at(-1) && entry.state === "completed") {
-        const choices = chatReplyChoices(entry.answer);
-        if (choices.length) {
-          const buttons = el("div", "chat-choices chat-reply-choices");
-          for (const [index, label] of choices.entries()) {
-            const number = index + 1;
-            const button = el("button", "", `${number} · ${label}`);
-            button.type = "button";
-            button.disabled = true;
-            button.onclick = () => {
-              const selected = selectedChatSession();
-              const latest = view.turns.at(-1);
-              if (button.disabled || !button.isConnected || selected?.id !== shownChatId
-                || chatViews.get(selected.id) !== view || latest?.position !== entry.position
-                || latest?.answer !== entry.answer) return;
-              sendChat(selected, view, String(number)).catch(error);
-            };
-            buttons.append(button);
-          }
-          answer.append(buttons);
-        }
+      const question = !view.pending && entry === view.turns.at(-1) && entry.state === "completed"
+        ? chatReplyQuestion(entry.answer) : null;
+      answer.append(el("strong", "chat-answer-name", `${icons[provider]} ${names[provider]}`));
+      if (!question || question.before) answer.append(renderChatText(question ? question.before : entry.answer));
+      if (question) {
+        const id = shownChatId;
+        const key = `${id}:${view.conversation}:${entry.position}:${entry.answer}`;
+        const card = createChatQuestion(view, key, question.question, question.choices, response => {
+          const selected = selectedChatSession();
+          const latest = view.turns.at(-1);
+          if (selected?.id !== id || shownChatId !== id || chatViews.get(id) !== view
+            || latest?.position !== entry.position || latest?.answer !== entry.answer
+            || view.loadError || view.sending || view.pending) throw Error(tr("Soru değişti. Güncel seçeneklerden birini seç."));
+          return sendChat(selected, view, response.text || String(response.choice));
+        });
+        card.classList.add("chat-reply-question");
+        answer.append(card);
       }
       turn.append(answer);
     } else if (entry.state === "interrupted") {
@@ -630,27 +740,37 @@ function paintChatTurns(view, initial = false) {
   if (follow) scroll.scrollTop = scroll.scrollHeight;
 }
 
-function chatReplyChoices(answer) {
-  const lines = answer.trim().split(/\r?\n/).map(line => line.trim());
+function chatReplyQuestion(answer) {
+  const lines = answer.split(/\r?\n/);
   const matchChoice = line => line.match(/^([1-9])(?:[.)]\s+|\s+[-–—]\s+)(.+)$/);
   // Only offer choices from an explicit question at the end of the latest reply.
   // Numbered instructions and code samples remain ordinary message text.
-  if (lines.some(line => /^(```|~~~)/.test(line))) return [];
-  while (lines.at(-1) === "") lines.pop();
-  const questionAfter = lines.at(-1)?.endsWith("?");
-  if (questionAfter) lines.pop();
-  while (lines.at(-1) === "") lines.pop();
+  if (lines.some(line => /^\s*(```|~~~)/.test(line))) return null;
+  while (lines.length && !lines.at(-1).trim()) lines.pop();
+  const last = lines.at(-1);
+  const questionAfter = last && !/^\s/.test(last) && !matchChoice(last) && last.endsWith("?") ? lines.pop() : null;
+  while (lines.length && !lines.at(-1).trim()) lines.pop();
+  const start = lines.findLastIndex(line => matchChoice(line)?.[1] === "1");
+  if (start < 0) return null;
   const choices = [];
-  while (lines.length) {
-    const choice = matchChoice(lines.at(-1));
-    if (!choice) break;
-    choices.unshift(choice);
-    lines.pop();
+  let gap = false;
+  for (const line of lines.slice(start)) {
+    const choice = matchChoice(line);
+    if (choice) {
+      if (Number(choice[1]) !== choices.length + 1 || !choice[2].trim()) return null;
+      choices.push({ label: choice[2], description: "" });
+      gap = false;
+    } else if (line.trim()) {
+      const current = choices.at(-1);
+      if (!current || gap || !/^[ \t]+\S/.test(line)) return null;
+      current.description = [current.description, line.trim()].filter(Boolean).join(" ");
+    } else gap = true;
   }
-  while (lines.at(-1) === "") lines.pop();
-  if (choices.length < 2 || (!questionAfter && !lines.at(-1)?.endsWith("?"))) return [];
-  return choices.every((choice, index) => Number(choice[1]) === index + 1)
-    ? choices.map(choice => choice[2]) : [];
+  const before = lines.slice(0, start);
+  while (before.length && !before.at(-1).trim()) before.pop();
+  const question = questionAfter || (before.at(-1)?.trim().endsWith("?") ? before.pop().trim() : null);
+  const asksForChoice = question && /\b(?:which|choose|select|prefer|would you|do you want|should (?:i|we)|how should)\b|hangisi|hangileri|hangi |neyi |neleri |seç|tercih|ister misin|nasıl (?:ilerle|yap|devam)/i.test(question);
+  return choices.length >= 2 && asksForChoice ? { question, choices, before: before.join("\n").trimEnd() } : null;
 }
 
 function renderChatText(text) {
@@ -729,7 +849,7 @@ async function sendChat(selected, view, text, composer) {
   paintChatComposer(selected, view);
   try {
     await api("chat", "send", { id, ...view.ticket, text });
-    if (view.bindingRevision !== bindingRevision) return;
+    if (view.bindingRevision !== bindingRevision) return false;
     view.pending = pending;
     reconcileChatPrompt(view);
     if (composer && view.draft === composer.draft) {
@@ -741,8 +861,7 @@ async function sendChat(selected, view, text, composer) {
       if (shownChatId === id) paintChatImages(view);
     }
     if (shownChatId === id) paintChatTurns(view);
-  } catch (err) {
-    error(err);
+    return true;
   } finally {
     view.ticket = null;
     view.sending = false;
@@ -794,7 +913,7 @@ function initChatControls() {
   $("#chat-start").onclick = () => {
     if (shownChatId && !active(shownChatId)) toggleTerminal(shownChatId).catch(error);
   };
-  $("#chat-composer").onsubmit = sendChatMessage;
+  $("#chat-composer").onsubmit = event => sendChatMessage(event).catch(error);
   initAttachmentDrop();
   $("#chat-input").addEventListener("paste", (event) => {
     const image = [...(event.clipboardData?.files || [])].find(file => file.type.startsWith("image/"));

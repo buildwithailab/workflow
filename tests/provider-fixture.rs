@@ -261,7 +261,7 @@ fn chat_terminal(provider: &str) -> io::Result<()> {
             _ => "Would you like to run the following command?\r\n$ echo 'Read the sample notes'\r\n› 1. Yes, proceed\r\n  2. No\r\nPress enter to confirm or esc to cancel",
         };
         let (heading, marker, hint) = match provider {
-            "claude" => ("", '❯', "Tab/Arrow keys to navigate · Esc to cancel"),
+            "claude" => ("", '❯', "Enter to select · ↑/↓ to navigate · Esc to cancel"),
             "copilot" => ("Question 1/1\r\n", '❯', "Enter to select"),
             _ => (
                 "Question 1/1 (1 unanswered)\r\n",
@@ -280,16 +280,85 @@ fn chat_terminal(provider: &str) -> io::Result<()> {
                 break;
             }
         }
-        for (index, title) in ["Apply the change where?", "Apply the test where?"]
-            .iter()
-            .enumerate()
-        {
-            let mut selected = 1;
+        let titles = [
+            "Apply the change where?",
+            "Apply the test where?",
+            "What should I do instead?",
+        ];
+        for (index, title) in titles.iter().enumerate() {
+            let mut selected: usize = 1;
             let mut keys = Vec::new();
+            let custom = index == 2;
+            let mut notes = false;
+            let mut draft = String::new();
+            let descriptions = "\r\n    Leave the remaining files unchanged.";
             loop {
                 let first = if selected == 1 { marker } else { ' ' };
                 let second = if selected == 2 { marker } else { ' ' };
-                print!("\x1b[2J\x1b[H{heading}{title}\r\n{first} 1 - Only one\r\n{second} 2 - All of them\r\n{hint}");
+                let other = if custom {
+                    let label = match provider {
+                        "claude" => {
+                            if draft.is_empty() {
+                                "Type something."
+                            } else {
+                                &draft
+                            }
+                        }
+                        "copilot" => {
+                            if draft.is_empty() {
+                                "Other (type your answer)"
+                            } else {
+                                &draft
+                            }
+                        }
+                        _ => "None of the above",
+                    };
+                    let description = match provider {
+                        "claude" => "\r\n  4. Chat about this",
+                        "copilot" => "",
+                        _ => "\r\n    Optionally, add details in notes (tab)",
+                    };
+                    format!(
+                        "\r\n{} 3. {label}{description}",
+                        if selected == 3 { marker } else { ' ' }
+                    )
+                } else {
+                    String::new()
+                };
+                let note = if notes && provider == "codex" {
+                    format!("\r\n────────\r\n› {}\r\n────────\r\nTab or Esc to clear notes · Enter to submit answer", if draft.is_empty() { "\x1b[2mAdd notes\x1b[22m" } else { &draft })
+                } else {
+                    format!("\r\n{hint}")
+                };
+                let mut display = format!("{heading}{title}\r\n{first} 1 - Only one{descriptions}\r\n{second} 2 - All of them\r\n    Apply the change to every file.{other}{note}");
+                if custom && selected == 3 && provider != "codex" && draft.is_empty() {
+                    let placeholder = if provider == "claude" {
+                        "Type something."
+                    } else {
+                        "Other (type your answer)"
+                    };
+                    display =
+                        display.replace(placeholder, &format!("\x1b[2m{placeholder}\x1b[22m"));
+                }
+                print!("\x1b[2J\x1b[H{display}");
+                if custom && selected == 3 && (provider != "codex" || notes) {
+                    let row = display
+                        .split("\r\n")
+                        .enumerate()
+                        .filter(|(_, line)| {
+                            if provider == "codex" {
+                                line.starts_with("› ")
+                            } else {
+                                line.contains("3. ")
+                            }
+                        })
+                        .map(|(row, _)| row)
+                        .last()
+                        .unwrap()
+                        + 1;
+                    let col = (if provider == "codex" { 3 } else { 6 }) + draft.chars().count();
+                    print!("\x1b[{row};{col}H");
+                }
                 io::stdout().flush()?;
                 loop {
                     let size = input.read(&mut packet)?;
@@ -300,6 +369,8 @@ fn chat_terminal(provider: &str) -> io::Result<()> {
                     if keys.ends_with(b"\x1b[B")
                         || keys.ends_with(b"\x1b[A")
                         || keys.ends_with(b"\r")
+                        || keys.ends_with(b"\t")
+                        || keys.ends_with(b"\x1b[201~")
                     {
                         break;
                     }
@@ -309,9 +380,27 @@ fn chat_terminal(provider: &str) -> io::Result<()> {
                         folder.join(format!("{provider}-choice-{index}.txt")),
                         selected.to_string(),
                     )?;
+                    if notes {
+                        fs::write(folder.join(format!("{provider}-custom.txt")), &draft)?;
+                    }
+                    // Keep the answered dialog visible during the provider's redraw delay.
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
                     break;
                 }
-                selected = if keys.ends_with(b"\x1b[B") { 2 } else { 1 };
+                if keys.ends_with(b"\t") && custom {
+                    notes = true;
+                } else if notes && keys.starts_with(b"\x1b[200~") && keys.ends_with(b"\x1b[201~") {
+                    draft = String::from_utf8_lossy(&keys[6..keys.len() - 6]).to_string();
+                } else {
+                    selected = if keys.ends_with(b"\x1b[B") {
+                        (selected + 1).min(if custom { 3 } else { 2 })
+                    } else {
+                        selected.saturating_sub(1).max(1)
+                    };
+                    if custom && selected == 3 && provider != "codex" {
+                        notes = true;
+                    }
+                }
                 keys.clear();
                 print!("\x1b[2J\x1b[H");
                 io::stdout().flush()?;

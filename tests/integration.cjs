@@ -608,14 +608,24 @@ async function testAdditionalProviderChats() {
 }
 
 async function testPendingChatInteraction() {
-  for (const provider of ["codex", "claude", "copilot"]) {
-    const profile = path.join(temporary, provider + "-interaction-profile");
-    const folder = path.join(temporary, provider + "-interaction-workspace");
+  for (const [provider, replyMode] of [["codex", "choice"], ["claude", "choice"], ["copilot", "choice"], ["codex", "custom"]]) {
+    const profile = path.join(temporary, provider + "-" + replyMode + "-interaction-profile");
+    const folder = path.join(temporary, provider + "-" + replyMode + "-interaction-workspace");
+    for (const name of [`${provider}-interaction.bin`, `${provider}-custom.txt`]) {
+      fs.rmSync(path.join(data, "test-input", name), { force: true });
+    }
     fs.mkdirSync(folder);
     for (const name of ["chat-terminal-fixture", "chat-interaction-fixture"]) {
       fs.writeFileSync(path.join(folder, name), "");
     }
     await start("", profile);
+    assert(await page.evaluate(() => {
+      const valid = chatReplyQuestion("  - Existing detail\n\nWhich change should I make?\n1. **One**\n   Keep other files.\n2. Everything?");
+      if (!valid || valid.before !== "  - Existing detail" || valid.choices[1].label !== "Everything?") return false;
+      if (questionOption("One — first — second").description !== "first — second") return false;
+      return ["Why did it fail?\n1. A timeout\n2. Invalid input", "Which change?\n1. One\n2. Both\n\nUnrelated paragraph", "Which change?\n1.   \n2. Both"]
+        .every(text => chatReplyQuestion(text) === null);
+    }), "question parser preserves content and rejects ordinary explanations");
     const p = await api("app", "add_project", { directory: folder });
     const s = await api("app", "create_session", { projectId: p.id, provider, tools: false });
     if (provider === "codex") {
@@ -625,7 +635,7 @@ async function testPendingChatInteraction() {
         { type: "session_meta", payload: { id: "chat-choice-test", cwd: s.directory, timestamp: new Date().toISOString() } },
         { type: "event_msg", payload: { type: "task_started" } },
         { type: "event_msg", payload: { type: "user_message", message: "What can I change?" } },
-        { type: "event_msg", payload: { type: "task_complete", last_agent_message: "Which changes should I make?\n\n1 - Only one\n2 - All of them" } },
+        { type: "event_msg", payload: { type: "task_complete", last_agent_message: "Which changes should I make?\n\n1 - **Only one**\n   Leave the remaining files unchanged.\n2 - **All of them**\n   Apply the change to every file." } },
       ].map(entry => JSON.stringify(entry)).join("\n") + "\n");
       await api("history", "bind", { id: s.id, conversationId: "chat-choice-test" });
     }
@@ -642,21 +652,53 @@ async function testPendingChatInteraction() {
     const input = page.locator("#chat-input");
     const send = page.locator("#chat-send");
     const card = page.locator("#chat-terminal-prompt");
+    assert(await page.evaluate(async () => {
+      const view = {};
+      let result = false, attempts = 0;
+      const demo = createChatQuestion(view, "local-retry-test", "Which file?", [{ label: "One" }, { label: "All" }], async () => { attempts++; return result; });
+      document.body.append(demo);
+      updateQuestionControls(demo, false);
+      const field = demo.querySelector(".chat-custom-input");
+      field.value = "Keep my typed response";
+      field.dispatchEvent(new Event("input"));
+      demo.querySelector(".chat-custom-send").click();
+      await new Promise(resolve => setTimeout(resolve, 0));
+      const retained = view.questionReply?.text === field.value;
+      updateQuestionControls(demo, false);
+      result = true;
+      demo.querySelector(".chat-custom-send").click();
+      await new Promise(resolve => setTimeout(resolve, 0));
+      const done = retained && attempts === 2 && view.questionReply === null;
+      demo.remove();
+      return done;
+    }), "unsubmitted custom answer is retained for retry");
     if (provider === "codex") {
       await input.fill("Keep my original draft.");
-      const plainChoice = page.locator(".chat-reply-choices").getByRole("button", { name: "2 · All of them" });
+      const plainChoice = page.locator(".chat-reply-question").getByRole("radio", { name: /All of them/ });
       await plainChoice.waitFor();
       assert(await page.evaluate(id => {
         const view = chatView(id);
         view.loadError = true;
         paintChatComposer(session(id), view);
-        const disabled = [...document.querySelectorAll(".chat-reply-choices button")].every(button => button.disabled);
+        const controls = [...document.querySelectorAll(".chat-reply-question input, .chat-reply-question button")];
+        const disabled = controls.length > 0 && controls.every(control => control.disabled);
         return disabled;
       }, s.id));
-      await plainChoice.click();
+      const reply = replyMode === "custom" ? "Use the shared validator." : "2";
+      if (replyMode === "custom") {
+        const plainCard = page.locator(".chat-reply-question");
+        await plainCard.getByRole("textbox", { name: "Your own answer", exact: true }).fill(reply);
+        const captures = path.join(root, "target", "question-card-qa");
+        fs.mkdirSync(captures, { recursive: true });
+        await plainCard.screenshot({ path: path.join(captures, "chat-question.png") });
+        await plainCard.getByRole("button", { name: "Send answer", exact: true }).click();
+      } else {
+        await plainChoice.click();
+        await page.locator(".chat-reply-question").getByRole("button", { name: "Send selection", exact: true }).click();
+      }
       const submitted = path.join(data, "test-input", "codex-interaction.bin");
       await until(() => fs.existsSync(submitted), "clicking the plain chat option sends the chosen number");
-      assert.equal(fs.readFileSync(submitted, "utf8"), "\x1b[200~2\x1b[201~\r");
+      assert.equal(fs.readFileSync(submitted, "utf8"), "\x1b[200~" + reply + "\x1b[201~\r");
       assert.equal(await input.inputValue(), "Keep my original draft.");
     } else {
       await input.fill("Prepare the sample output.");
@@ -668,6 +710,7 @@ async function testPendingChatInteraction() {
     const live = await api("chat", "read", { id: s.id });
     assert.equal(live.ticket, null);
     assert.equal(!!live.terminalPrompt.menu, provider === "codex");
+    if (live.terminalPrompt.menu) await assert.rejects(api("chat", "answer_prompt", { id: s.id, runId, ...live.terminalPrompt.menu, text: "Skip this operation" }), /özel yanıtı/);
     await input.fill("Keep this separate draft.");
     assert(await send.isDisabled());
     await card.getByRole("button", { name: "Respond in Terminal" }).click();
@@ -679,22 +722,52 @@ async function testPendingChatInteraction() {
 
     const answerFixture = () => api("terminal", "write", { id: s.id, runId, data: "1\r" });
     await answerFixture();
-    await card.locator("pre").filter({ hasText: "Apply the change where" }).waitFor();
+    await card.getByRole("radiogroup", { name: "Apply the change where?" }).waitFor();
     const choiceMenu = async () => (await api("chat", "read", { id: s.id })).terminalPrompt?.menu;
     const first = await choiceMenu();
     assert.deepEqual(first.choices, ["Only one", "All of them"]);
+    assert.deepEqual(first.descriptions, ["Leave the remaining files unchanged.", "Apply the change to every file."]);
+    await card.getByText("Apply the change to every file.", { exact: true }).waitFor();
     assert(await send.isDisabled());
     const answerPrompt = (menu, choice, expectedRun = runId) =>
       api("chat", "answer_prompt", { id: s.id, ...menu, runId: expectedRun, choice });
     await assert.rejects(answerPrompt(first, 2, "stale"), /çalıştırması değişti/);
     await assert.rejects(answerPrompt(first, 8), /Soru değişti/);
-    await card.getByRole("button", { name: "2 · All of them", exact: true }).click();
-    await card.locator("pre").filter({ hasText: "Apply the test where" }).waitFor();
+    const radio = card.getByRole("radio", { name: /Only one/ });
+    await radio.focus();
+    await radio.press("ArrowDown");
+    assert.equal(await card.getByRole("radio", { name: /All of them/ }).isChecked(), true);
+    assert.equal((await choiceMenu()).key, first.key, "arrow navigation does not send a reply");
+    await card.getByRole("button", { name: "Send selection", exact: true }).click();
+    await card.getByRole("radiogroup", { name: "Apply the test where?" }).waitFor();
     const second = await choiceMenu();
     assert.notEqual(first.key, second.key);
     await assert.rejects(answerPrompt({ ...second, key: first.key }, 2), /Soru değişti/);
     await assert.rejects(answerPrompt(first, 2), /Soru değişti/);
-    await card.getByRole("button", { name: "1 · Only one", exact: true }).click();
+    await card.getByRole("radio", { name: /Only one/ }).click();
+    await card.getByRole("button", { name: "Send selection", exact: true }).click();
+    {
+      await card.getByRole("radiogroup", { name: "What should I do instead?" }).waitFor();
+      const customMenu = await choiceMenu();
+      assert.equal(customMenu.customChoice, 3);
+      assert.equal(await card.getByRole("radio").count(), 2);
+      const customInput = card.getByRole("textbox", { name: "Your own answer", exact: true });
+      const customAnswer = "Yalnızca yapılandırma dosyasını güncelle.";
+      await customInput.fill(customAnswer);
+      const captures = path.join(root, "target", "question-card-qa");
+      fs.mkdirSync(captures, { recursive: true });
+      await card.screenshot({ path: path.join(captures, provider + "-native-question.png") });
+      await assert.rejects(api("chat", "answer_prompt", { id: s.id, runId, ...customMenu, text: "invalid\nreply" }), /Özel yanıt/);
+      await assert.rejects(api("chat", "answer_prompt", { id: s.id, runId, ...customMenu, key: first.key, text: customAnswer }), /Soru değişti/);
+      await customInput.press("Enter");
+      await until(async () => !(await choiceMenu()), "answered custom menu stays consumed before provider redraw");
+      const echoed = await api("chat", "read", { id: s.id });
+      assert.equal(echoed.terminalPrompt?.menu, undefined);
+      const received = path.join(data, "test-input", provider + "-custom.txt");
+      await until(() => fs.existsSync(received), provider + " native question receives the custom answer");
+      assert.equal(fs.readFileSync(received, "utf8"), customAnswer);
+      await assert.rejects(api("chat", "answer_prompt", { id: s.id, runId, ...customMenu, text: customAnswer }), /Soru değişti/);
+    }
     await card.waitFor({ state: "hidden" });
     assert(await page.locator("#chat-view").isVisible());
     assert.equal((await api("terminal", "attach", { id: s.id })).runId, runId);

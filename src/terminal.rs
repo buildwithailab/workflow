@@ -41,7 +41,26 @@ struct TerminalInput {
     chat_pending: bool,
     terminal_slash: bool,
     thread_uncertain: bool,
-    answered_prompt: Option<String>,
+    answered_prompt: Option<AnsweredPrompt>,
+}
+
+struct AnsweredPrompt {
+    key: String,
+    question_context: Option<String>,
+    custom_choice: Option<usize>,
+}
+
+impl AnsweredPrompt {
+    fn matches(&self, prompt: &TerminalPrompt) -> bool {
+        prompt
+            .menu
+            .as_ref()
+            .is_some_and(|menu| menu.key == self.key)
+            || self.question_context.as_ref().is_some_and(|context| {
+                prompt.kind == "question"
+                    && custom_prompt_context(&prompt.text, self.custom_choice) == *context
+            })
+    }
 }
 
 impl TerminalInput {
@@ -673,9 +692,10 @@ fn read_terminal(
                         let mut input = tt.input.lock().unwrap();
                         input.chat_pending = false;
                         if let Some(answered) = &input.answered_prompt {
-                            let different_menu = terminal_prompt(parser.screen(), &tt.provider)
-                                .and_then(|prompt| prompt.menu)
-                                .is_some_and(|menu| &menu.key != answered);
+                            let different_menu = !input.chat_pasting
+                                && terminal_prompt(parser.screen(), &tt.provider).is_some_and(
+                                    |prompt| prompt.menu.is_some() && !answered.matches(&prompt),
+                                );
                             if different_menu
                                 || provider_prompt_ready(parser.screen(), &tt.provider)
                             {
@@ -997,6 +1017,10 @@ pub(crate) struct TerminalPrompt {
     text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     menu: Option<TerminalMenu>,
+    #[serde(skip)]
+    first_row: usize,
+    #[serde(skip)]
+    end_row: usize,
 }
 
 #[derive(serde::Serialize)]
@@ -1005,7 +1029,133 @@ struct TerminalMenu {
     key: String,
     selected: usize,
     choices: Vec<String>,
+    descriptions: Vec<String>,
+    question: String,
+    custom_choice: Option<usize>,
+    #[serde(skip)]
+    context: String,
     input_revision: u64,
+}
+
+fn question_context(text: &str) -> String {
+    text.lines()
+        .take_while(|line| {
+            !(line.trim_start().starts_with('›') && menu_line(line).is_none())
+                && !question_footer(line)
+        })
+        .filter(|line| {
+            !line.trim().is_empty() && !line.trim().chars().all(|ch| "─│╭╮╰╯".contains(ch))
+        })
+        .map(|line| {
+            if let Some((number, label, _)) = menu_line(line) {
+                format!("{number}. {label}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn question_counter(line: &str) -> bool {
+    let lower = line.trim().to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("question ") else {
+        return false;
+    };
+    let Some((index, rest)) = rest.split_once('/') else {
+        return false;
+    };
+    let total = rest.split_whitespace().next().unwrap_or("");
+    !index.is_empty()
+        && index.bytes().all(|b| b.is_ascii_digit())
+        && !total.is_empty()
+        && total.bytes().all(|b| b.is_ascii_digit())
+        && (rest == total || rest[total.len()..].trim().starts_with('('))
+}
+
+fn question_footer(line: &str) -> bool {
+    let line = line
+        .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '│')
+        .to_ascii_lowercase();
+    [
+        "enter to ",
+        "press enter to ",
+        "tab to ",
+        "tab/arrow keys to ",
+        "tab or esc to ",
+        "esc to ",
+        "escape to ",
+        "↑/↓ to navigate",
+        "↑↓ to navigate",
+        "use ↑",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+}
+
+fn custom_prompt_context(text: &str, custom: Option<usize>) -> String {
+    if let Some(custom) = custom {
+        return inline_question_context(text, custom).0;
+    }
+    let rows = text.lines().collect::<Vec<_>>();
+    let frames = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| frame_line(line))
+        .map(|(row, _)| row)
+        .collect::<Vec<_>>();
+    if frames.len() >= 2 {
+        question_context(&rows[..frames[frames.len() - 2]].join("\n"))
+    } else {
+        question_context(text)
+    }
+}
+
+fn frame_line(line: &str) -> bool {
+    let line = line.trim();
+    line.chars().count() >= 5 && line.chars().all(|ch| "─╭╮╰╯".contains(ch))
+}
+
+fn inline_question_context(text: &str, custom_choice: usize) -> (String, Option<(String, bool)>) {
+    let mut context = Vec::new();
+    let mut draft: Option<(String, bool)> = None;
+    let mut in_input = false;
+    for line in text.lines().take_while(|line| !question_footer(line)) {
+        if let Some((number, label, focused)) = menu_line(line) {
+            in_input = number == custom_choice;
+            if in_input {
+                if draft.is_some() {
+                    return (String::new(), None);
+                }
+                draft = Some((label.to_owned(), focused));
+                context.push(format!("{number}. <custom>"));
+            } else {
+                context.push(format!("{number}. {label}"));
+            }
+        } else if !line.trim().is_empty() && !line.trim().chars().all(|ch| "─│╭╮╰╯".contains(ch))
+        {
+            if in_input {
+                if let Some((draft, _)) = &mut draft {
+                    draft.push_str(line.trim());
+                }
+            } else {
+                context.push(line.to_owned());
+            }
+        }
+    }
+    (context.join("\n"), draft)
+}
+
+fn custom_question_placeholder(provider: &str, label: &str) -> bool {
+    match provider {
+        "codex" => label == "None of the above",
+        "claude" => matches!(label, "Type something." | "Type something"),
+        "copilot" => matches!(
+            label,
+            "Other (type your answer)" | "Other (type to respond)"
+        ),
+        _ => false,
+    }
 }
 
 fn menu_line(line: &str) -> Option<(usize, &str, bool)> {
@@ -1045,7 +1195,9 @@ fn terminal_menu(lines: &[&str], footer: &str, kind: &str, provider: &str) -> Op
             footer.contains("tab to add notes")
                 && (enter_hint("submit answer") || enter_hint("submit all"))
         }
-        ("question", "claude") => footer.contains("tab/arrow keys to navigate"),
+        ("question", "claude") => {
+            footer.contains("tab/arrow keys to navigate") || enter_hint("select")
+        }
         ("question", "copilot") => enter_hint("select"),
         ("approval", _) => enter_hint("confirm"),
         _ => false,
@@ -1069,12 +1221,27 @@ fn terminal_menu(lines: &[&str], footer: &str, kind: &str, provider: &str) -> Op
     let mut choices = Vec::new();
     let mut selected = None;
     let mut identity = String::new();
+    let mut previous_number = 0;
+    let mut options_ended = false;
     for line in lines {
         if let Some((number, text, focused)) = menu_line(line) {
-            if number != choices.len() + 1 || (focused && selected.replace(number).is_some()) {
+            if number != previous_number + 1 || (focused && selected.replace(number).is_some()) {
                 return None;
             }
-            choices.push(text.to_owned());
+            previous_number = number;
+            if provider == "claude"
+                && kind == "question"
+                && matches!(
+                    text,
+                    "Chat about this" | "Skip interview and plan immediately"
+                )
+            {
+                options_ended = true;
+            } else if options_ended {
+                return None;
+            } else {
+                choices.push(text.to_owned());
+            }
             identity.push_str(&format!("{number}. {text}"));
         } else {
             identity.push_str(line);
@@ -1082,10 +1249,64 @@ fn terminal_menu(lines: &[&str], footer: &str, kind: &str, provider: &str) -> Op
         identity.push('\n');
     }
     (choices.len() >= 2).then_some(())?;
+    let selected = selected.filter(|number| *number <= choices.len())?;
+    let first = lines.iter().position(|line| menu_line(line).is_some())?;
+    let mut descriptions = vec![String::new(); choices.len()];
+    let mut current = None;
+    for line in &lines[first..] {
+        if let Some((number, _, _)) = menu_line(line) {
+            if number > choices.len() {
+                break;
+            }
+            current = Some(number - 1);
+        } else if !line.trim().is_empty() {
+            let lower = line.to_ascii_lowercase();
+            if question_footer(&lower) {
+                break;
+            }
+            if let Some(index) = current {
+                if !descriptions[index].is_empty() {
+                    descriptions[index].push(' ');
+                }
+                descriptions[index].push_str(line.trim());
+            }
+        }
+    }
+    let question = lines[..first]
+        .iter()
+        .filter(|line| {
+            let line = line.trim().to_ascii_lowercase();
+            !line.is_empty() && !question_counter(&line)
+        })
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned();
+    if kind == "question" && question.is_empty() {
+        return None;
+    }
+    let custom_choice = if kind == "question" {
+        choices
+            .iter()
+            .position(|label| custom_question_placeholder(provider, label))
+            .map(|index| index + 1)
+    } else {
+        None
+    };
+    let context = if let Some(custom) = custom_choice.filter(|_| provider != "codex") {
+        inline_question_context(&lines.join("\n"), custom).0
+    } else {
+        question_context(&lines.join("\n"))
+    };
     Some(TerminalMenu {
         key: format!("{:x}", Sha256::digest(identity.as_bytes())),
-        selected: selected?,
+        selected,
         choices,
+        descriptions,
+        question,
+        custom_choice,
+        context,
         input_revision: 0,
     })
 }
@@ -1153,15 +1374,7 @@ fn terminal_prompt(screen: &vt100::Screen, provider: &str) -> Option<TerminalPro
     let selected_option = visible.iter().zip(&cues).any(|(line, cue)| {
         line.trim_start().starts_with(['›', '❯', '>', '▸']) && menu_line(cue).is_some()
     });
-    let question_header = cues.iter().rposition(|line| {
-        line.strip_prefix("question ").is_some_and(|rest| {
-            rest.split_once('/').is_some_and(|(index, total)| {
-                !index.is_empty()
-                    && index.bytes().all(|b| b.is_ascii_digit())
-                    && total.starts_with(|ch: char| ch.is_ascii_digit())
-            })
-        })
-    });
+    let question_header = cues.iter().rposition(|line| question_counter(line));
     let question_footer = [
         "to submit answer",
         "to submit all",
@@ -1223,6 +1436,12 @@ fn terminal_prompt(screen: &vt100::Screen, provider: &str) -> Option<TerminalPro
         menu: can_choose
             .then(|| terminal_menu(&lines, &menu_footer, kind, provider))
             .flatten(),
+        first_row: if kind == "approval" {
+            display_start
+        } else {
+            display_start.max(end.saturating_sub(30)) + first
+        },
+        end_row: end,
     })
 }
 
@@ -1262,10 +1481,11 @@ pub(crate) fn chat_state(core: &Core, session: &Value, include_output: bool) -> 
     state.prompt = terminal_prompt(screen.screen(), &terminal.provider);
     if let Some(prompt) = &mut state.prompt {
         if !chat_is_bound(session)
-            || prompt
-                .menu
+            || input.chat_pasting
+            || input
+                .answered_prompt
                 .as_ref()
-                .is_some_and(|menu| input.answered_prompt.as_ref() == Some(&menu.key))
+                .is_some_and(|answered| answered.matches(prompt))
         {
             prompt.menu = None;
         } else if let Some(menu) = &mut prompt.menu {
@@ -1317,10 +1537,21 @@ pub(crate) fn answer_chat_prompt(core: &Core, args: &Value) -> Result<Value> {
         .as_u64()
         .context("Seçim güncel değil.")?;
     let mut selected = args["selected"].as_u64().context("Seçim güncel değil.")? as usize;
-    let choice = args["choice"]
-        .as_u64()
-        .filter(|n| (1..=9).contains(n))
-        .context("Geçersiz seçim.")? as usize;
+    let text = args["text"]
+        .as_str()
+        .map(custom_question_text)
+        .transpose()?;
+    if text.is_some() && !args["choice"].is_null() {
+        bail!("Geçersiz seçim.");
+    }
+    let choice = if text.is_some() {
+        0
+    } else {
+        args["choice"]
+            .as_u64()
+            .filter(|n| (1..=9).contains(n))
+            .context("Geçersiz seçim.")? as usize
+    };
     let mut awaiting = None;
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -1330,7 +1561,10 @@ pub(crate) fn answer_chat_prompt(core: &Core, args: &Value) -> Result<Value> {
             let terminal = get(core, args)?;
             let screen = terminal.screen.lock().unwrap();
             let mut input = terminal.input.lock().unwrap();
-            if input.answered_prompt.as_deref() == Some(key)
+            if input
+                .answered_prompt
+                .as_ref()
+                .is_some_and(|answered| answered.key == key)
                 || input.revision != revision
                 || input.thread_uncertain
                 || input.chat_pasting
@@ -1343,9 +1577,23 @@ pub(crate) fn answer_chat_prompt(core: &Core, args: &Value) -> Result<Value> {
             {
                 bail!("Soru değişti. Güncel seçeneklerden birini seç.");
             }
-            let menu =
-                terminal_prompt(screen.screen(), &terminal.provider).and_then(|prompt| prompt.menu);
+            let prompt = terminal_prompt(screen.screen(), &terminal.provider);
+            if prompt.as_ref().is_some_and(|prompt| {
+                input
+                    .answered_prompt
+                    .as_ref()
+                    .is_some_and(|answered| answered.matches(prompt))
+            }) {
+                bail!("Soru değişti. Güncel seçeneklerden birini seç.");
+            }
+            let menu = prompt.and_then(|prompt| prompt.menu);
             if let Some(menu) = menu {
+                let choice = if text.is_some() {
+                    menu.custom_choice
+                        .context("Bu soru için özel yanıtı Terminalde yaz.")?
+                } else {
+                    choice
+                };
                 if awaiting == Some(menu.selected) {
                     selected = menu.selected;
                     awaiting = None;
@@ -1355,7 +1603,28 @@ pub(crate) fn answer_chat_prompt(core: &Core, args: &Value) -> Result<Value> {
                 }
                 if awaiting.is_none() {
                     if selected == choice {
-                        input.answered_prompt = Some(menu.key);
+                        if let Some(text) = &text {
+                            input.chat_pasting = true;
+                            let opened = if terminal.provider == "codex" {
+                                input.write(b"\t")
+                            } else {
+                                Ok(())
+                            };
+                            let revision = input.revision;
+                            drop(input);
+                            drop(screen);
+                            drop(_guard);
+                            let result = opened.and_then(|()| {
+                                submit_question_text(core, args, text, &menu, revision)
+                            });
+                            terminal.input.lock().unwrap().chat_pasting = false;
+                            return result;
+                        }
+                        input.answered_prompt = Some(AnsweredPrompt {
+                            key: menu.key,
+                            question_context: None,
+                            custom_choice: None,
+                        });
                         input.write(b"\r")?;
                         return Ok(json!(true));
                     }
@@ -1378,6 +1647,223 @@ pub(crate) fn answer_chat_prompt(core: &Core, args: &Value) -> Result<Value> {
             bail!("Sağlayıcı seçimi doğrulamadı. Terminali kontrol et.");
         }
         std::thread::sleep(Duration::from_millis(35));
+    }
+}
+
+fn custom_question_text(text: &str) -> Result<String> {
+    let text = text.trim();
+    if text.is_empty()
+        || text.len() > 8000
+        || text.chars().count() > 4000
+        || text.chars().any(char::is_control)
+    {
+        bail!("Özel yanıt boş, çok uzun veya birden fazla satır içeriyor.");
+    }
+    Ok(text.to_owned())
+}
+
+fn question_notes(screen: &vt100::Screen, context: &str) -> Option<String> {
+    let prompt = terminal_prompt(screen, "codex")?;
+    if prompt.kind != "question" || custom_prompt_context(&prompt.text, None) != context {
+        return None;
+    }
+    let rows = screen.rows(0, screen.size().1).collect::<Vec<_>>();
+    let footer = (prompt.first_row..prompt.end_row).rfind(|&row| {
+        rows[row]
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("tab or esc to clear notes")
+    })?;
+    let bottom = (prompt.first_row..footer).rfind(|&row| frame_line(&rows[row]))?;
+    let top = (prompt.first_row..bottom).rfind(|&row| frame_line(&rows[row]))?;
+    let row = top + 1;
+    let line = rows.get(row)?.trim_start();
+    let value = line.strip_prefix("› ")?;
+    let column = rows[row].len() - value.len();
+    let column = rows[row][..column].chars().count();
+    verified_question_field(
+        screen,
+        row,
+        column,
+        bottom,
+        &["Add notes", "Type your answer (optional)"],
+    )
+}
+
+fn verified_question_field(
+    screen: &vt100::Screen,
+    row: usize,
+    column: usize,
+    end: usize,
+    placeholders: &[&str],
+) -> Option<String> {
+    if !screen.bracketed_paste() || screen.hide_cursor() {
+        return None;
+    }
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    let cursor_row = usize::from(cursor_row);
+    let cursor_col = usize::from(cursor_col);
+    let width = usize::from(screen.size().1);
+    if !(row..end).contains(&cursor_row)
+        || column > width
+        || (cursor_row == row && cursor_col < column)
+        || (row..cursor_row).any(|previous| !screen.row_wrapped(previous as u16))
+    {
+        return None;
+    }
+    let mut draft = String::new();
+    for index in row..=cursor_row {
+        let start = if index == row { column } else { 0 };
+        let limit = if index == cursor_row {
+            cursor_col
+        } else {
+            width
+        };
+        for col in start..limit {
+            let cell = screen.cell(index as u16, col as u16)?;
+            if !cell.is_wide_continuation() {
+                if cell.contents().is_empty() {
+                    draft.push(' ');
+                } else {
+                    draft.push_str(cell.contents());
+                }
+            }
+        }
+    }
+    let tail = screen
+        .rows(cursor_col as u16, (width - cursor_col) as u16)
+        .nth(cursor_row)?;
+    let later_empty = screen
+        .rows(0, width as u16)
+        .skip(cursor_row + 1)
+        .take(end.saturating_sub(cursor_row + 1))
+        .all(|line| line.trim().is_empty());
+    if !later_empty {
+        return None;
+    }
+    if tail.trim().is_empty() {
+        return Some(draft);
+    }
+    // A placeholder is only empty when the visible native caret is at the
+    // beginning and the provider renders the remaining text as a placeholder.
+    let placeholder_style = screen
+        .cell(row as u16, column as u16)
+        .is_some_and(|cell| cell.dim() || cell.fgcolor() == vt100::Color::Idx(8));
+    (draft.is_empty() && placeholder_style && placeholders.contains(&tail.trim())).then_some(draft)
+}
+
+fn inline_question_input(
+    screen: &vt100::Screen,
+    provider: &str,
+    menu: &TerminalMenu,
+) -> Option<String> {
+    let custom = menu.custom_choice?;
+    let prompt = terminal_prompt(screen, provider)?;
+    if prompt.kind != "question" {
+        return None;
+    }
+    let (context, input) = inline_question_context(&prompt.text, custom);
+    let (_, focused) = input?;
+    if context != menu.context || !focused {
+        return None;
+    }
+    let rows = screen.rows(0, screen.size().1).collect::<Vec<_>>();
+    let row = rows
+        .iter()
+        .enumerate()
+        .take(prompt.end_row)
+        .skip(prompt.first_row)
+        .find_map(|(index, line)| {
+            menu_line(line)
+                .filter(|(number, _, selected)| *number == custom && *selected)
+                .map(|_| index)
+        })?;
+    let end = rows
+        .iter()
+        .enumerate()
+        .skip(row + 1)
+        .find_map(|(index, line)| {
+            (menu_line(line).is_some() || question_footer(line)).then_some(index)
+        })
+        .unwrap_or(prompt.end_row)
+        .min(prompt.end_row);
+    let line = rows[row].trim_start_matches(|ch: char| ch.is_whitespace() || ch == '│');
+    let rest = line.strip_prefix(['›', '❯', '>', '▸'])?.trim_start();
+    let rest = &rest[1..];
+    let value = [". ", ") ", " - ", " – ", " — "]
+        .iter()
+        .find_map(|separator| rest.strip_prefix(separator))?;
+    let column = rows[row][..rows[row].len() - value.len()].chars().count();
+    let placeholder = menu.choices.get(custom - 1)?;
+    verified_question_field(screen, row, column, end, &[placeholder])
+}
+
+fn submit_question_text(
+    core: &Core,
+    args: &Value,
+    text: &str,
+    menu: &TerminalMenu,
+    mut revision: u64,
+) -> Result<Value> {
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut pasted = false;
+    loop {
+        {
+            let _guard = core.operations.lock().unwrap();
+            let session = core.session(string(args, "id")?)?;
+            let terminal = get(core, args)?;
+            let screen = terminal.screen.lock().unwrap();
+            let mut input = terminal.input.lock().unwrap();
+            if terminal.exited.load(Ordering::SeqCst)
+                || input.revision != revision
+                || input.thread_uncertain
+                || !chat_is_bound(&session)
+                || !chat_thread_matches(&terminal, &session)
+                || session["archived"] == true
+            {
+                bail!("Soru değişti. Güncel seçeneklerden birini seç.");
+            }
+            let draft = if terminal.provider == "codex" {
+                question_notes(screen.screen(), &menu.context)
+            } else {
+                inline_question_input(screen.screen(), &terminal.provider, menu)
+            };
+            if let Some(draft) = draft {
+                let empty = draft.is_empty();
+                if !pasted && empty {
+                    input.write(format!("\x1b[200~{text}\x1b[201~").as_bytes())?;
+                    revision = input.revision;
+                    pasted = true;
+                } else if pasted && draft == text {
+                    input.answered_prompt = Some(AnsweredPrompt {
+                        key: string(args, "key")?.to_owned(),
+                        question_context: Some(menu.context.clone()),
+                        custom_choice: if terminal.provider == "codex" {
+                            None
+                        } else {
+                            menu.custom_choice
+                        },
+                    });
+                    input.write(b"\r")?;
+                    return Ok(json!(true));
+                } else if !(pasted && (empty || text.starts_with(&draft))) {
+                    bail!("Özel yanıt alanı doğrulanamadı. Terminali kontrol et.");
+                }
+            } else if terminal_prompt(screen.screen(), &terminal.provider).is_some_and(|prompt| {
+                let current = if terminal.provider == "codex" {
+                    custom_prompt_context(&prompt.text, None)
+                } else {
+                    inline_question_context(&prompt.text, menu.custom_choice.unwrap_or(0)).0
+                };
+                current != menu.context
+            }) {
+                bail!("Soru değişti. Güncel seçeneklerden birini seç.");
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!("Özel yanıt alanı doğrulanamadı. Terminali kontrol et.");
+        }
+        std::thread::sleep(Duration::from_millis(80));
     }
 }
 
@@ -1903,6 +2389,141 @@ mod tests {
         }
         assert!(terminal_menu(&["› 1. One", "› 2. Two"], footer, "question", "codex").is_none());
         assert!(terminal_menu(&["› 1. One", "  3. Three"], footer, "question", "codex").is_none());
+    }
+
+    #[test]
+    fn custom_question_reply_requires_the_same_question_and_a_verified_note_field() {
+        let question = "Question 1/1 (1 unanswered)\r\nWhat should I do instead?\r\n  1. Only one\r\n    Leave other files unchanged.\r\n  2. All of them\r\n    Apply to every file.\r\n› 3. None of the above\r\n    Optionally, add details in notes (tab)";
+        let mut parser = vt100::Parser::new(25, 110, 0);
+        parser.process(format!("\x1b[?2004h{question}\r\nTab to add notes · Enter to submit answer · Esc to interrupt").as_bytes());
+        let menu = terminal_prompt(parser.screen(), "codex")
+            .unwrap()
+            .menu
+            .unwrap();
+        assert_eq!(menu.custom_choice, Some(3));
+        assert_eq!(menu.question, "What should I do instead?");
+        assert_eq!(menu.descriptions[0], "Leave other files unchanged.");
+        for note in [
+            "",
+            "Change only the configuration file.",
+            "1. Change one file",
+            "a b",
+            "Show me how to select a profile",
+        ] {
+            let visible = if note.is_empty() {
+                "\x1b[2mAdd notes\x1b[22m"
+            } else {
+                note
+            };
+            parser.process(format!("\x1b[2J\x1b[H{question}\r\n────────\r\n› {visible}\r\n────────\r\nTab or Esc to clear notes · Enter to submit answer\x1b[10;{}H", 3 + note.chars().count()).as_bytes());
+            assert_eq!(
+                question_notes(parser.screen(), &menu.context).as_deref(),
+                Some(note)
+            );
+            assert!(question_notes(parser.screen(), "different question").is_none());
+            let prompt = terminal_prompt(parser.screen(), "codex").unwrap();
+            let answered = AnsweredPrompt {
+                key: menu.key.clone(),
+                question_context: Some(menu.context.clone()),
+                custom_choice: None,
+            };
+            assert!(answered.matches(&prompt));
+            parser.process(b"\x1b[?25l");
+            assert!(question_notes(parser.screen(), &menu.context).is_none());
+            parser.process(b"\x1b[?25h");
+        }
+        for invalid in ["", "two\nlines", "unsafe\x1b", "control\ttext"] {
+            assert!(custom_question_text(invalid).is_err());
+        }
+        assert_eq!(
+            custom_question_text("   Kendi yanıtım  ").unwrap(),
+            "Kendi yanıtım"
+        );
+    }
+
+    #[test]
+    fn provider_inline_question_inputs_preserve_the_question_and_require_a_text_cursor() {
+        for (provider, placeholder) in [
+            ("claude", "Type something."),
+            ("copilot", "Other (type your answer)"),
+        ] {
+            let question = "Question 1/2\r\nWhich files should I change?\r\n  1. Only one\r\n    Keep the others unchanged.\r\n  2. All of them";
+            let actions = if provider == "claude" {
+                "\r\n  4. Chat about this"
+            } else {
+                ""
+            };
+            let footer = "\r\nEnter to select · ↑/↓ to navigate · Esc to cancel";
+            let mut parser = vt100::Parser::new(20, 110, 0);
+            let show = |parser: &mut vt100::Parser, draft: &str| {
+                parser.process(
+                    format!(
+                        "\x1b[?2004h\x1b[2J\x1b[H{question}\r\n❯ 3. {}{actions}{footer}\x1b[6;{}H",
+                        if draft.is_empty() {
+                            format!("\x1b[2m{placeholder}\x1b[22m")
+                        } else {
+                            draft.to_owned()
+                        },
+                        6 + draft.chars().count()
+                    )
+                    .as_bytes(),
+                );
+            };
+            show(&mut parser, "");
+            let menu = terminal_prompt(parser.screen(), provider)
+                .unwrap()
+                .menu
+                .unwrap();
+            assert_eq!(menu.custom_choice, Some(3));
+            assert_eq!(menu.choices.len(), 3);
+            assert_eq!(
+                inline_question_input(parser.screen(), provider, &menu).as_deref(),
+                Some("")
+            );
+            let reply = "Yalnızca yapılandırma dosyasını güncelle.";
+            show(&mut parser, reply);
+            assert_eq!(
+                inline_question_input(parser.screen(), provider, &menu).as_deref(),
+                Some(reply)
+            );
+            let prompt = terminal_prompt(parser.screen(), provider).unwrap();
+            let answered = AnsweredPrompt {
+                key: menu.key.clone(),
+                question_context: Some(menu.context.clone()),
+                custom_choice: Some(3),
+            };
+            assert!(answered.matches(&prompt));
+            for exact in [
+                "a b",
+                "ab",
+                "1. One file",
+                "Show me how to select a profile",
+                "Other: keep the files",
+                placeholder,
+            ] {
+                show(&mut parser, exact);
+                assert_eq!(
+                    inline_question_input(parser.screen(), provider, &menu).as_deref(),
+                    Some(exact)
+                );
+            }
+            show(&mut parser, reply);
+            parser.process(b"\x1b[?25l");
+            assert!(inline_question_input(parser.screen(), provider, &menu).is_none());
+            parser.process(b"\x1b[?25h\x1b[?2004l");
+            assert!(inline_question_input(parser.screen(), provider, &menu).is_none());
+            show(&mut parser, reply);
+            parser.process(b"\x1b[12;1H");
+            assert!(inline_question_input(parser.screen(), provider, &menu).is_none());
+            show(&mut parser, reply);
+            parser.process(b"\x1b[2;1HWhich tests should I run?\x1b[K\x1b[6;6H");
+            assert!(inline_question_input(parser.screen(), provider, &menu).is_none());
+            parser.process(format!("\x1b[2J\x1b[HDo you want to proceed?\r\n❯ 1. Yes\r\n  2. No\r\n  3. {placeholder}\r\nEnter to confirm · Esc to cancel").as_bytes());
+            assert!(terminal_prompt(parser.screen(), provider)
+                .unwrap()
+                .menu
+                .is_none());
+        }
     }
 
     #[test]
