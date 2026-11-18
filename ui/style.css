@@ -1198,6 +1198,51 @@ body.no-left .sidebar {
   padding: 7px;
   background: var(--panel);
 }
+#chat-terminal-prompt {
+  margin-bottom: 7px;
+  padding: 8px;
+  border: 1px solid #776143;
+  border-radius: 7px;
+  background: var(--raised);
+}
+.chat-terminal-header {
+  display: flex;
+  gap: 6px 10px;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+}
+#chat-terminal-prompt-title {
+  color: #f1c98b;
+}
+.chat-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.chat-choices button {
+  min-width: 0;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.chat-choices button:hover:not(:disabled),
+.chat-choices button:focus-visible {
+  border-color: var(--accent);
+}
+#chat-terminal-prompt-text,
+#chat-terminal-output {
+  max-height: min(24vh, 220px);
+  margin: 6px 0 0;
+  padding: 7px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font: 12px/1.45 Consolas, "Cascadia Code", monospace;
+}
 #chat-input {
   display: block;
   width: 100%;

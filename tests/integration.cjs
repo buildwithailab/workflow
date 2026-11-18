@@ -607,6 +607,110 @@ async function testAdditionalProviderChats() {
   console.log("PASS Claude and Copilot Chat retain native conversation, file references, draft and approval settings");
 }
 
+async function testPendingChatInteraction() {
+  for (const provider of ["codex", "claude", "copilot"]) {
+    const profile = path.join(temporary, provider + "-interaction-profile");
+    const folder = path.join(temporary, provider + "-interaction-workspace");
+    fs.mkdirSync(folder);
+    for (const name of ["chat-terminal-fixture", "chat-interaction-fixture"]) {
+      fs.writeFileSync(path.join(folder, name), "");
+    }
+    await start("", profile);
+    const p = await api("app", "add_project", { directory: folder });
+    const s = await api("app", "create_session", { projectId: p.id, provider, tools: false });
+    if (provider === "codex") {
+      const logs = path.join(profile, "test-codex-home", "sessions");
+      fs.mkdirSync(logs, { recursive: true });
+      fs.writeFileSync(path.join(logs, "rollout-choice-test.jsonl"), [
+        { type: "session_meta", payload: { id: "chat-choice-test", cwd: s.directory, timestamp: new Date().toISOString() } },
+        { type: "event_msg", payload: { type: "task_started" } },
+        { type: "event_msg", payload: { type: "user_message", message: "What can I change?" } },
+        { type: "event_msg", payload: { type: "task_complete", last_agent_message: "Which changes should I make?\n\n1 - Only one\n2 - All of them" } },
+      ].map(entry => JSON.stringify(entry)).join("\n") + "\n");
+      await api("history", "bind", { id: s.id, conversationId: "chat-choice-test" });
+    }
+    const skip = page.locator("#dialog").getByRole("button", { name: "Skip", exact: true });
+    if (await skip.isVisible()) await skip.click();
+    await page.evaluate(async id => {
+      await window.workflow.refresh();
+      window.workflow.selectSession(id, true);
+    }, s.id);
+    await page.locator("#session-chat-view").click();
+    await page.locator("#chat-start").click();
+    await until(async () => !!(await api("chat", "read", { id: s.id })).ticket, provider + " composer ready");
+    const runId = (await api("terminal", "attach", { id: s.id })).runId;
+    const input = page.locator("#chat-input");
+    const send = page.locator("#chat-send");
+    const card = page.locator("#chat-terminal-prompt");
+    if (provider === "codex") {
+      await input.fill("Keep my original draft.");
+      const plainChoice = page.locator(".chat-reply-choices").getByRole("button", { name: "2 · All of them" });
+      await plainChoice.waitFor();
+      assert(await page.evaluate(id => {
+        const view = chatView(id);
+        view.loadError = true;
+        paintChatComposer(session(id), view);
+        const disabled = [...document.querySelectorAll(".chat-reply-choices button")].every(button => button.disabled);
+        return disabled;
+      }, s.id));
+      await plainChoice.click();
+      const submitted = path.join(data, "test-input", "codex-interaction.bin");
+      await until(() => fs.existsSync(submitted), "clicking the plain chat option sends the chosen number");
+      assert.equal(fs.readFileSync(submitted, "utf8"), "\x1b[200~2\x1b[201~\r");
+      assert.equal(await input.inputValue(), "Keep my original draft.");
+    } else {
+      await input.fill("Prepare the sample output.");
+      await send.click();
+    }
+    await card.getByText("Approval required", { exact: true }).waitFor();
+    assert.match(await card.locator("pre").textContent(), /Read the sample notes/);
+    assert.match(await card.locator("pre").textContent(), /2\. No/);
+    const live = await api("chat", "read", { id: s.id });
+    assert.equal(live.ticket, null);
+    assert.equal(!!live.terminalPrompt.menu, provider === "codex");
+    await input.fill("Keep this separate draft.");
+    assert(await send.isDisabled());
+    await card.getByRole("button", { name: "Respond in Terminal" }).click();
+    assert(await page.locator("#chat-view").isHidden());
+    assert.equal((await api("terminal", "attach", { id: s.id })).runId, runId);
+    await page.locator("#session-chat-view").click();
+    await card.getByText("Approval required", { exact: true }).waitFor();
+    assert.equal(await input.inputValue(), "Keep this separate draft.");
+
+    const answerFixture = () => api("terminal", "write", { id: s.id, runId, data: "1\r" });
+    await answerFixture();
+    await card.locator("pre").filter({ hasText: "Apply the change where" }).waitFor();
+    const choiceMenu = async () => (await api("chat", "read", { id: s.id })).terminalPrompt?.menu;
+    const first = await choiceMenu();
+    assert.deepEqual(first.choices, ["Only one", "All of them"]);
+    assert(await send.isDisabled());
+    const answerPrompt = (menu, choice, expectedRun = runId) =>
+      api("chat", "answer_prompt", { id: s.id, ...menu, runId: expectedRun, choice });
+    await assert.rejects(answerPrompt(first, 2, "stale"), /çalıştırması değişti/);
+    await assert.rejects(answerPrompt(first, 8), /Soru değişti/);
+    await card.getByRole("button", { name: "2 · All of them", exact: true }).click();
+    await card.locator("pre").filter({ hasText: "Apply the test where" }).waitFor();
+    const second = await choiceMenu();
+    assert.notEqual(first.key, second.key);
+    await assert.rejects(answerPrompt({ ...second, key: first.key }, 2), /Soru değişti/);
+    await assert.rejects(answerPrompt(first, 2), /Soru değişti/);
+    await card.getByRole("button", { name: "1 · Only one", exact: true }).click();
+    await card.waitFor({ state: "hidden" });
+    assert(await page.locator("#chat-view").isVisible());
+    assert.equal((await api("terminal", "attach", { id: s.id })).runId, runId);
+    assert.equal(fs.readFileSync(path.join(data, "test-input", `${provider}-choice-0.txt`), "utf8"), "2");
+    assert.equal(fs.readFileSync(path.join(data, "test-input", `${provider}-choice-1.txt`), "utf8"), "1");
+    await page.getByRole("button", { name: "Show live Terminal output" }).click();
+    await page.locator("#chat-terminal-output").getByText("Fixture interaction uses a different layout.").waitFor();
+    await answerFixture();
+    await page.locator("#chat-terminal-output").waitFor({ state: "hidden" });
+    assert.equal(await input.inputValue(), "Keep this separate draft.");
+    assert(await card.isHidden());
+    await stop();
+  }
+  console.log("PASS clickable Chat choices for text and native menus, stale choice rejection, approval display and fallback for all three providers");
+}
+
 async function test() {
   const git = (args) =>
     cp.execFileSync("git", args, {
@@ -687,6 +791,7 @@ async function test() {
   if (process.platform === "win32") {
     await testCodexChat();
     await testAdditionalProviderChats();
+    await testPendingChatInteraction();
   }
   if (process.platform === "win32") await testCopilotNpm();
   const address = "http://127.0.0.1:" + server.address().port;

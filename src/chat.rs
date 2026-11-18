@@ -366,18 +366,36 @@ fn parse_log(data: &[u8], start: u64, provider: &str) -> VecDeque<Turn> {
     turns
 }
 
-fn read(core: &Core, session: &Value, previous: &Value) -> Result<Value> {
-    let (ticket, mismatch, approval_mode) = terminal::chat_state(core, session);
+fn read(core: &Core, session: &Value, args: &Value) -> Result<Value> {
+    let terminal = terminal::chat_state(core, session, args["terminalOutput"] == true);
     let thread = session["conversationId"].as_str();
-    let mut result = json!({"conversationId":thread,"found":false,"turns":[],"ticket":ticket,"mismatch":mismatch,"liveApprovalMode":approval_mode});
-    if mismatch {
+    let mut result = json!({
+        "conversationId":thread,"found":false,"turns":[],"ticket":terminal.ticket,
+        "mismatch":terminal.mismatch,"liveApprovalMode":terminal.approval_mode,
+        "terminalPrompt":terminal.prompt,"terminalOutput":terminal.output,"terminalRunId":terminal.run_id,
+    });
+    if terminal.mismatch {
         return Ok(result);
     }
     let Some(thread) = thread else {
         return Ok(result);
     };
+    if read_turns(core, session, thread, &args["revision"], &mut result).is_err() {
+        result["turns"] = Value::Null;
+        result["logError"] = json!(true);
+    }
+    Ok(result)
+}
+
+fn read_turns(
+    core: &Core,
+    session: &Value,
+    thread: &str,
+    previous: &Value,
+    result: &mut Value,
+) -> Result<()> {
     let Some(path) = locate_log(core, session, thread)? else {
-        return Ok(result);
+        return Ok(());
     };
     let mut file = File::open(path)?;
     let stat = file.metadata()?;
@@ -397,7 +415,7 @@ fn read(core: &Core, session: &Value, previous: &Value) -> Result<Value> {
         file.take(stat.len() - start).read_to_end(&mut bytes)?;
         result["turns"] = json!(parse_log(&bytes, start, string(session, "provider")?));
     }
-    Ok(result)
+    Ok(())
 }
 
 pub(crate) fn dispatch(core: &Core, action: &str, args: &Value) -> Result<Value> {
@@ -411,8 +429,9 @@ pub(crate) fn dispatch(core: &Core, action: &str, args: &Value) -> Result<Value>
         bail!("Sohbet bu oturumda kullanılamıyor.");
     }
     match action {
-        "read" => read(core, &session, &args["revision"]),
+        "read" => read(core, &session, args),
         "send" => terminal::send_chat(core, args),
+        "answer_prompt" => terminal::answer_chat_prompt(core, args),
         "image_reference" => file_reference(&session, string(args, "path")?, true),
         "file_reference" => file_reference(&session, string(args, "path")?, false),
         #[cfg(windows)]

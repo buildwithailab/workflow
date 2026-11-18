@@ -203,6 +203,14 @@
               <div id="chat-turns"></div>
             </div>
             <form id="chat-composer">
+              <section id="chat-terminal-prompt" aria-labelledby="chat-terminal-prompt-title" hidden>
+                <div class="chat-terminal-header">
+                  <strong id="chat-terminal-prompt-title" role="status"></strong>
+                  <button id="chat-answer-terminal" type="button">Terminalde yanıtla</button>
+                </div>
+                <pre id="chat-terminal-prompt-text" tabindex="0"></pre>
+                <div id="chat-terminal-choices" class="chat-choices" hidden></div>
+              </section>
               <textarea id="chat-input" aria-label="Sohbet mesajı" placeholder="Bu oturuma mesaj yaz…" rows="2" maxlength="16000"></textarea>
               <div id="chat-images" hidden></div>
               <div class="chat-compose-actions">
@@ -217,6 +225,10 @@
                 <button id="chat-send" type="submit" class="primary">Gönder</button>
               </div>
               <span id="chat-status" role="status"></span>
+              <div id="chat-terminal-peek" hidden>
+                <button id="chat-show-terminal-output" type="button" class="quiet" aria-expanded="false" aria-controls="chat-terminal-output"></button>
+                <pre id="chat-terminal-output" tabindex="0" hidden></pre>
+              </div>
               <div id="chat-model-menu" popover role="group"></div>
             </form>
           </section>

@@ -249,7 +249,98 @@ fn chat_terminal(provider: &str) -> io::Result<()> {
     }
     let folder = PathBuf::from(env::var_os("WORKFLOW_TEST_INPUT_DIR").unwrap());
     fs::create_dir_all(&folder)?;
-    fs::write(folder.join(format!("{provider}-chat.bin")), bytes)?;
+    let interaction = env::current_dir()?
+        .join("chat-interaction-fixture")
+        .is_file();
+    let output = if interaction { "interaction" } else { "chat" };
+    fs::write(folder.join(format!("{provider}-{output}.bin")), bytes)?;
+    if interaction {
+        let approval = match provider {
+            "claude" => "Do you want to proceed?\r\nRead the sample notes\r\n❯ 1. Yes\r\n  2. No\r\nEsc to cancel",
+            "copilot" => "Approval required\r\nRead the sample notes\r\n❯ 1. Yes\r\n  2. No, and tell Copilot what to do differently (Esc)",
+            _ => "Would you like to run the following command?\r\n$ echo 'Read the sample notes'\r\n› 1. Yes, proceed\r\n  2. No\r\nPress enter to confirm or esc to cancel",
+        };
+        let (heading, marker, hint) = match provider {
+            "claude" => ("", '❯', "Tab/Arrow keys to navigate · Esc to cancel"),
+            "copilot" => ("Question 1/1\r\n", '❯', "Enter to select"),
+            _ => (
+                "Question 1/1 (1 unanswered)\r\n",
+                '›',
+                "Tab to add notes · Enter to submit answer · Esc to interrupt",
+            ),
+        };
+        print!("\x1b[2J\x1b[H{approval}");
+        io::stdout().flush()?;
+        loop {
+            let size = input.read(&mut packet)?;
+            if size == 0 {
+                return Ok(());
+            }
+            if packet[..size].contains(&b'\r') {
+                break;
+            }
+        }
+        for (index, title) in ["Apply the change where?", "Apply the test where?"]
+            .iter()
+            .enumerate()
+        {
+            let mut selected = 1;
+            let mut keys = Vec::new();
+            loop {
+                let first = if selected == 1 { marker } else { ' ' };
+                let second = if selected == 2 { marker } else { ' ' };
+                print!("\x1b[2J\x1b[H{heading}{title}\r\n{first} 1 - Only one\r\n{second} 2 - All of them\r\n{hint}");
+                io::stdout().flush()?;
+                loop {
+                    let size = input.read(&mut packet)?;
+                    if size == 0 {
+                        return Ok(());
+                    }
+                    keys.extend_from_slice(&packet[..size]);
+                    if keys.ends_with(b"\x1b[B")
+                        || keys.ends_with(b"\x1b[A")
+                        || keys.ends_with(b"\r")
+                    {
+                        break;
+                    }
+                }
+                if keys.ends_with(b"\r") {
+                    fs::write(
+                        folder.join(format!("{provider}-choice-{index}.txt")),
+                        selected.to_string(),
+                    )?;
+                    break;
+                }
+                selected = if keys.ends_with(b"\x1b[B") { 2 } else { 1 };
+                keys.clear();
+                print!("\x1b[2J\x1b[H");
+                io::stdout().flush()?;
+                std::thread::sleep(std::time::Duration::from_millis(120));
+            }
+        }
+        {
+            let screen = "Fixture interaction uses a different layout.";
+            print!("\x1b[2J\x1b[H{screen}");
+            io::stdout().flush()?;
+            loop {
+                let size = input.read(&mut packet)?;
+                if size == 0 {
+                    return Ok(());
+                }
+                if packet[..size].contains(&b'\r') {
+                    break;
+                }
+            }
+        }
+        if native {
+            show("", footer);
+        } else {
+            print!("{ready}");
+        }
+        io::stdout().flush()?;
+        while input.read(&mut packet)? > 0 {}
+        return Ok(());
+    }
     print!("{ready}\x1b[2;1HWorking (test) · esc to interrupt\x1b[1;3H");
     io::stdout().flush()?;
     // Keep the same process available so the renderer can reattach to it.

@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{Read, Write},
@@ -40,6 +41,7 @@ struct TerminalInput {
     chat_pending: bool,
     terminal_slash: bool,
     thread_uncertain: bool,
+    answered_prompt: Option<String>,
 }
 
 impl TerminalInput {
@@ -612,6 +614,7 @@ fn spawn_terminal(
             chat_pending: false,
             terminal_slash: false,
             thread_uncertain: false,
+            answered_prompt: None,
         }),
         chat_thread: Mutex::new(None),
         provider: provider.to_owned(),
@@ -667,7 +670,18 @@ fn read_terminal(
                             }
                         }
                         // A fast turn can redraw straight from the verified draft to the empty composer.
-                        tt.input.lock().unwrap().chat_pending = false;
+                        let mut input = tt.input.lock().unwrap();
+                        input.chat_pending = false;
+                        if let Some(answered) = &input.answered_prompt {
+                            let different_menu = terminal_prompt(parser.screen(), &tt.provider)
+                                .and_then(|prompt| prompt.menu)
+                                .is_some_and(|menu| &menu.key != answered);
+                            if different_menu
+                                || provider_prompt_ready(parser.screen(), &tt.provider)
+                            {
+                                input.answered_prompt = None;
+                            }
+                        }
                     }
                     let mut seq = tt.seq.lock().unwrap();
                     *seq += n as u64;
@@ -858,6 +872,10 @@ fn codex_prompt_ready(screen: &vt100::Screen) -> bool {
 }
 
 fn provider_prompt_ready(screen: &vt100::Screen, provider: &str) -> bool {
+    native_prompt_ready(screen, provider) && terminal_prompt(screen, provider).is_none()
+}
+
+fn native_prompt_ready(screen: &vt100::Screen, provider: &str) -> bool {
     if provider == "codex" {
         return codex_prompt_ready(screen);
     }
@@ -973,25 +991,300 @@ fn chat_thread_matches(terminal: &LiveTerminal, session: &Value) -> bool {
     terminal.chat_thread.lock().unwrap().as_deref() == session["conversationId"].as_str()
 }
 
-pub(crate) fn chat_state(core: &Core, session: &Value) -> (Value, bool, Option<&'static str>) {
+#[derive(serde::Serialize)]
+pub(crate) struct TerminalPrompt {
+    kind: &'static str,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    menu: Option<TerminalMenu>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalMenu {
+    key: String,
+    selected: usize,
+    choices: Vec<String>,
+    input_revision: u64,
+}
+
+fn menu_line(line: &str) -> Option<(usize, &str, bool)> {
+    let line = line.trim_matches(|ch: char| ch.is_whitespace() || ch == '│');
+    let mut selected = false;
+    let line = if let Some(rest) = line.strip_prefix(['›', '❯', '>', '▸']) {
+        selected = true;
+        rest.trim_start()
+    } else {
+        line
+    };
+    let number = usize::from(*line.as_bytes().first()?).checked_sub(usize::from(b'0'))?;
+    if !(1..=9).contains(&number) {
+        return None;
+    }
+    let text = [". ", ") ", " - ", " – ", " — "]
+        .iter()
+        .find_map(|separator| line[1..].strip_prefix(separator))?
+        .trim();
+    (!text.is_empty()).then_some((number, text, selected))
+}
+
+fn terminal_menu(lines: &[&str], footer: &str, kind: &str, provider: &str) -> Option<TerminalMenu> {
+    // Require an identifiable keyboard menu. Leave notes, multi-select, custom
+    // submit bindings, and incomplete or ambiguous lists to the native view.
+    let enter_hint = |action: &str| {
+        let hint = format!("enter to {action}");
+        footer.split(['|', '·', '│']).any(|part| {
+            let part = part.trim();
+            part.strip_prefix("press ")
+                .unwrap_or(part)
+                .starts_with(&hint)
+        })
+    };
+    let supported = match (kind, provider) {
+        ("question", "codex") => {
+            footer.contains("tab to add notes")
+                && (enter_hint("submit answer") || enter_hint("submit all"))
+        }
+        ("question", "claude") => footer.contains("tab/arrow keys to navigate"),
+        ("question", "copilot") => enter_hint("select"),
+        ("approval", _) => enter_hint("confirm"),
+        _ => false,
+    };
+    if !supported
+        || [
+            "space to toggle",
+            "select all that apply",
+            "select multiple",
+            "clear notes",
+            "ctrl+enter",
+            "⌃enter",
+            "shift+enter",
+            "alt+enter",
+        ]
+        .iter()
+        .any(|hint| footer.contains(hint))
+    {
+        return None;
+    }
+    let mut choices = Vec::new();
+    let mut selected = None;
+    let mut identity = String::new();
+    for line in lines {
+        if let Some((number, text, focused)) = menu_line(line) {
+            if number != choices.len() + 1 || (focused && selected.replace(number).is_some()) {
+                return None;
+            }
+            choices.push(text.to_owned());
+            identity.push_str(&format!("{number}. {text}"));
+        } else {
+            identity.push_str(line);
+        }
+        identity.push('\n');
+    }
+    (choices.len() >= 2).then_some(())?;
+    Some(TerminalMenu {
+        key: format!("{:x}", Sha256::digest(identity.as_bytes())),
+        selected: selected?,
+        choices,
+        input_revision: 0,
+    })
+}
+
+fn terminal_prompt(screen: &vt100::Screen, provider: &str) -> Option<TerminalPrompt> {
+    let rows = screen.rows(0, screen.size().1).collect::<Vec<_>>();
+    let end = rows.iter().rposition(|line| !line.trim().is_empty())? + 1;
+    let mut display_start = 0;
+    // An already answered dialog can remain visible above the normal Codex input.
+    if provider == "codex" && empty_codex_prompt(screen) {
+        display_start = usize::from(screen.cursor_position().0) + 1;
+    } else if provider != "codex" && native_prompt_ready(screen, provider) {
+        // Ignore old dialogs above the input while still checking for overlays
+        // drawn below an otherwise recognizable native composer.
+        if let Some(frame) = rows[..end].windows(3).rposition(|rows| {
+            rows[0].trim_start().starts_with("─────")
+                && rows[1].trim() == "❯"
+                && rows[2].trim_start().starts_with("─────")
+        }) {
+            display_start = frame + 3;
+        }
+    }
+    let visible = rows.get(display_start.max(end.saturating_sub(30))..end)?;
+    let cues = visible
+        .iter()
+        .map(|line| {
+            line.trim_start_matches(|ch: char| ch.is_whitespace() || "│›❯>●•▸".contains(ch))
+                .trim_end()
+                .to_ascii_lowercase()
+        })
+        .collect::<Vec<_>>();
+    let footer = cues[cues.len().saturating_sub(5)..].join(" ");
+    let cancel = ["esc to cancel", "cancel with esc", "esc to reject"]
+        .iter()
+        .any(|hint| footer.contains(hint));
+    let confirm = footer.contains("to confirm") && footer.contains("to cancel");
+    let approval_header = cues.iter().rposition(|line| {
+        [
+            "would you like to run",
+            "would you like to make",
+            "would you like to grant",
+            "would you like to send input to",
+            "do you want to approve",
+            "do you want to proceed",
+            "do you want to make this edit",
+            "do you trust",
+            "this command requires approval",
+            "permission request",
+            "approval required",
+        ]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+            || line.ends_with("needs your approval.")
+    });
+    let decisions = cues
+        .iter()
+        .filter_map(|line| menu_line(line).map(|(_, text, _)| text))
+        .collect::<Vec<_>>();
+    let yes_no = decisions
+        .iter()
+        .any(|line| line.starts_with("yes") || line.starts_with("allow"))
+        && decisions
+            .iter()
+            .any(|line| line.starts_with("no") || line.starts_with("deny"));
+    let selected_option = visible.iter().zip(&cues).any(|(line, cue)| {
+        line.trim_start().starts_with(['›', '❯', '>', '▸']) && menu_line(cue).is_some()
+    });
+    let question_header = cues.iter().rposition(|line| {
+        line.strip_prefix("question ").is_some_and(|rest| {
+            rest.split_once('/').is_some_and(|(index, total)| {
+                !index.is_empty()
+                    && index.bytes().all(|b| b.is_ascii_digit())
+                    && total.starts_with(|ch: char| ch.is_ascii_digit())
+            })
+        })
+    });
+    let question_footer = [
+        "to submit answer",
+        "to submit all",
+        "to navigate questions",
+        "tab/arrow keys to navigate",
+        "tab/arrow keys to switch",
+        "enter to select",
+    ]
+    .iter()
+    .any(|hint| footer.contains(hint));
+
+    let (kind, first) =
+        if approval_header.is_some() && (cancel || confirm || (yes_no && selected_option)) {
+            ("approval", 0)
+        } else if question_footer
+            && (question_header.is_some()
+                || !decisions.is_empty()
+                || footer.contains("to submit answer"))
+        {
+            (
+                "question",
+                question_header.unwrap_or(visible.len().saturating_sub(18)),
+            )
+        } else if yes_no && (cancel || confirm) {
+            ("approval", 0)
+        } else {
+            return None;
+        };
+    let lines = visible[first..]
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let menu_footer = cues[cues.len().saturating_sub(5)..].join(" | ");
+    // Generic approvals may describe their target above the visible question.
+    // Only offer action buttons when a recognized heading frames a visible target.
+    let can_choose = kind == "question"
+        || approval_header.is_some_and(|header| {
+            let heading = &cues[header];
+            let target = cues[header + 1..]
+                .iter()
+                .take_while(|line| menu_line(line).is_none());
+            provider == "codex"
+                && heading == "would you like to run the following command?"
+                && target.clone().any(|line| {
+                    line.strip_prefix("$ ")
+                        .is_some_and(|cmd| !cmd.trim().is_empty())
+                })
+                && !target.clone().any(|line| line.contains('…'))
+        });
+    Some(TerminalPrompt {
+        kind,
+        text: if kind == "approval" {
+            rows[display_start..end].join("\n")
+        } else {
+            lines.join("\n")
+        }
+        .trim()
+        .to_owned(),
+        menu: can_choose
+            .then(|| terminal_menu(&lines, &menu_footer, kind, provider))
+            .flatten(),
+    })
+}
+
+#[derive(Default)]
+pub(crate) struct ChatTerminalState {
+    pub ticket: Value,
+    pub mismatch: bool,
+    pub approval_mode: Option<&'static str>,
+    pub prompt: Option<TerminalPrompt>,
+    pub output: Option<String>,
+    pub run_id: Option<String>,
+}
+
+fn chat_is_bound(session: &Value) -> bool {
+    session["workspaceKind"] != "direct" || !session["conversationId"].is_null()
+}
+
+pub(crate) fn chat_state(core: &Core, session: &Value, include_output: bool) -> ChatTerminalState {
+    let mut state = ChatTerminalState::default();
     let Ok(terminal) = get(core, &json!({"id":session["id"]})) else {
-        return (Value::Null, false, None);
+        return state;
     };
     if terminal.exited.load(Ordering::SeqCst) {
-        return (Value::Null, false, None);
+        return state;
     }
     if !chat_thread_matches(&terminal, session) {
-        return (Value::Null, true, None);
-    }
-    if session["workspaceKind"] == "direct" && session["conversationId"].is_null() {
-        return (Value::Null, false, None);
+        state.mismatch = true;
+        return state;
     }
     let screen = terminal.screen.lock().unwrap();
     let input = terminal.input.lock().unwrap();
     if input.thread_uncertain {
-        return (Value::Null, true, None);
+        state.mismatch = true;
+        return state;
     }
-    let mode = if terminal.provider == "copilot" {
+    state.run_id = Some(terminal.run_id.clone());
+    state.prompt = terminal_prompt(screen.screen(), &terminal.provider);
+    if let Some(prompt) = &mut state.prompt {
+        if !chat_is_bound(session)
+            || prompt
+                .menu
+                .as_ref()
+                .is_some_and(|menu| input.answered_prompt.as_ref() == Some(&menu.key))
+        {
+            prompt.menu = None;
+        } else if let Some(menu) = &mut prompt.menu {
+            menu.input_revision = input.revision;
+        }
+    }
+    if include_output && state.prompt.is_none() {
+        let mut rows = screen
+            .screen()
+            .rows(0, screen.screen().size().1)
+            .collect::<Vec<_>>();
+        rows.truncate(
+            rows.iter()
+                .rposition(|line| !line.trim().is_empty())
+                .map_or(0, |row| row + 1),
+        );
+        state.output = Some(rows[rows.len().saturating_sub(24)..].join("\n"));
+    }
+    state.approval_mode = if terminal.provider == "copilot" {
         provider_composer(screen.screen()).and_then(|(_, footer)| {
             if footer.contains("assisted approval") {
                 Some("auto")
@@ -1004,18 +1297,88 @@ pub(crate) fn chat_state(core: &Core, session: &Value) -> (Value, bool, Option<&
     } else {
         None
     };
-    if input.chat_pasting
-        || input.chat_pending
-        || input.terminal_slash
-        || !provider_prompt_ready(screen.screen(), &terminal.provider)
+    if chat_is_bound(session)
+        && !input.chat_pasting
+        && !input.chat_pending
+        && !input.terminal_slash
+        && state.prompt.is_none()
+        && native_prompt_ready(screen.screen(), &terminal.provider)
     {
-        return (Value::Null, false, mode);
+        state.ticket = json!({"runId":terminal.run_id,"inputRevision":input.revision});
     }
-    (
-        json!({"runId":terminal.run_id,"inputRevision":input.revision}),
-        false,
-        mode,
-    )
+    state
+}
+
+pub(crate) fn answer_chat_prompt(core: &Core, args: &Value) -> Result<Value> {
+    let id = string(args, "id")?;
+    let _ = string(args, "runId")?;
+    let key = string(args, "key")?;
+    let mut revision = args["inputRevision"]
+        .as_u64()
+        .context("Seçim güncel değil.")?;
+    let mut selected = args["selected"].as_u64().context("Seçim güncel değil.")? as usize;
+    let choice = args["choice"]
+        .as_u64()
+        .filter(|n| (1..=9).contains(n))
+        .context("Geçersiz seçim.")? as usize;
+    let mut awaiting = None;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        {
+            let _guard = core.operations.lock().unwrap();
+            let session = core.session(id)?;
+            let terminal = get(core, args)?;
+            let screen = terminal.screen.lock().unwrap();
+            let mut input = terminal.input.lock().unwrap();
+            if input.answered_prompt.as_deref() == Some(key)
+                || input.revision != revision
+                || input.thread_uncertain
+                || input.chat_pasting
+                || input.terminal_slash
+                || terminal.exited.load(Ordering::SeqCst)
+                || session["archived"] == true
+                || session["login"] == true
+                || !chat_is_bound(&session)
+                || !chat_thread_matches(&terminal, &session)
+            {
+                bail!("Soru değişti. Güncel seçeneklerden birini seç.");
+            }
+            let menu =
+                terminal_prompt(screen.screen(), &terminal.provider).and_then(|prompt| prompt.menu);
+            if let Some(menu) = menu {
+                if awaiting == Some(menu.selected) {
+                    selected = menu.selected;
+                    awaiting = None;
+                }
+                if menu.key != key || selected != menu.selected || choice > menu.choices.len() {
+                    bail!("Soru değişti. Güncel seçeneklerden birini seç.");
+                }
+                if awaiting.is_none() {
+                    if selected == choice {
+                        input.answered_prompt = Some(menu.key);
+                        input.write(b"\r")?;
+                        return Ok(json!(true));
+                    }
+                    // Move one row at a time and verify the provider highlights
+                    // the requested option before sending Enter.
+                    let (key, next): (&[u8], usize) = if choice > selected {
+                        (b"\x1b[B", selected + 1)
+                    } else {
+                        (b"\x1b[A", selected - 1)
+                    };
+                    input.write(key)?;
+                    revision = input.revision;
+                    awaiting = Some(next);
+                }
+            } else if awaiting.is_none() {
+                bail!("Soru değişti. Güncel seçeneklerden birini seç.");
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!("Sağlayıcı seçimi doğrulamadı. Terminali kontrol et.");
+        }
+        std::thread::sleep(Duration::from_millis(35));
+    }
 }
 
 fn chat_input(text: &str) -> Result<String> {
@@ -1216,9 +1579,7 @@ fn submit_chat_input(
     }
     let _ = string(args, "runId")?;
     let terminal = get(core, args)?;
-    if !chat_thread_matches(&terminal, &s)
-        || s["workspaceKind"] == "direct" && s["conversationId"].is_null()
-    {
+    if !chat_thread_matches(&terminal, &s) || !chat_is_bound(&s) {
         bail!("Bu konuşmayı Terminal görünümünde bağlayıp yeniden başlat.");
     }
     let screen = terminal.screen.lock().unwrap();
@@ -1281,7 +1642,9 @@ fn submit_chat_draft(
             {
                 bail!("Terminal değişti. Göndermeden önce terminaldeki taslağı kontrol et.");
             }
-            let verified = if current.provider == "codex" {
+            let verified = if terminal_prompt(screen.screen(), &current.provider).is_some() {
+                false
+            } else if current.provider == "codex" {
                 codex_draft_visible(screen.screen(), text, indent)
             } else {
                 provider_composer(screen.screen()).is_some_and(|(draft, _)| {
@@ -1428,6 +1791,121 @@ mod tests {
     }
 
     #[test]
+    fn chat_distinguishes_live_requests_and_old_terminal_output() {
+        for provider in ["codex", "claude", "copilot"] {
+            let approval = "\x1b[?2004hWould you like to run the following command?\r\nRead build notes\r\n› 1. Yes\r\n  2. No\r\nEnter to confirm · Esc to cancel";
+            let mut parser = vt100::Parser::new(14, 100, 0);
+            parser.process(approval.as_bytes());
+            let prompt = terminal_prompt(parser.screen(), provider).unwrap();
+            assert_eq!(prompt.kind, "approval");
+            assert!(prompt.text.contains("Read build notes"));
+            let composer = match provider {
+                "codex" => "\r\n› Ask Codex to do anything\x1b[6;3H",
+                "claude" => "\r\n─────────\r\n❯ \r\n─────────\r\n? for shortcuts",
+                _ => "\r\n─────────\r\n❯ \r\n─────────\r\nInteractive · Manual Approval",
+            };
+            parser.process(composer.as_bytes());
+            assert!(terminal_prompt(parser.screen(), provider).is_none());
+            assert!(provider_prompt_ready(parser.screen(), provider));
+
+            parser.process("\x1b[2J\x1b[HQuestion 1/1 (1 unanswered)\r\nWhich format should we use?\r\n› 1. CSV\r\n  2. JSON\r\nEnter to submit answer · Esc to interrupt".as_bytes());
+            let prompt = terminal_prompt(parser.screen(), provider).unwrap();
+            assert_eq!(prompt.kind, "question");
+            assert!(prompt.text.contains("Which format"));
+            assert!(!provider_prompt_ready(parser.screen(), provider));
+
+            parser.process("\x1b[2J\x1b[HThe guide says:\r\nWould you like to run a command?\r\n1. Yes\r\n2. No\r\nWorking…".as_bytes());
+            assert!(terminal_prompt(parser.screen(), provider).is_none());
+        }
+    }
+
+    #[test]
+    fn approval_below_the_copilot_composer_prevents_chat_submission() {
+        let mut parser = vt100::Parser::new(14, 100, 0);
+        parser.process("\x1b[?2004h─────────\r\n❯ \r\n─────────\r\nInteractive · Manual Approval\r\nApproval required\r\n❯ 1. Yes\r\n  2. No".as_bytes());
+        assert!(native_prompt_ready(parser.screen(), "copilot"));
+        assert!(!provider_prompt_ready(parser.screen(), "copilot"));
+        assert_eq!(
+            terminal_prompt(parser.screen(), "copilot").unwrap().kind,
+            "approval"
+        );
+    }
+
+    #[test]
+    fn approval_choices_require_a_recognized_visible_target() {
+        let mut parser = vt100::Parser::new(38, 100, 0);
+        let choices = "› 1. Yes\r\n  2. No\r\nEnter to confirm · Esc to cancel";
+        let recognized = "Would you like to run the following command?";
+        let mut show = |input: &str| {
+            parser.process(format!("\x1b[2J\x1b[H{input}").as_bytes());
+            terminal_prompt(parser.screen(), "codex").unwrap()
+        };
+        let generic = show(&format!(
+            "Read sample A\r\nDo you want to proceed?\r\n{choices}"
+        ));
+        assert!(generic.text.contains("Read sample A"));
+        assert!(generic.menu.is_none());
+        let a = show(&format!("{recognized}\r\n$ echo sample A\r\n{choices}"));
+        let b = show(&format!("{recognized}\r\n$ echo sample B\r\n{choices}"));
+        assert_ne!(a.menu.unwrap().key, b.menu.unwrap().key);
+        let a = show(&format!(
+            "{recognized}\r\n$ echo sample\r\n  continuation\r\n{choices}"
+        ));
+        let b = show(&format!(
+            "{recognized}\r\n$ echo sample\r\n continuation\r\n{choices}"
+        ));
+        assert_ne!(a.menu.unwrap().key, b.menu.unwrap().key);
+        for incomplete in ["Reason: Read the notes", "────────", "$ echo sample…"]
+        {
+            assert!(show(&format!("{recognized}\r\n{incomplete}\r\n{choices}"))
+                .menu
+                .is_none());
+        }
+        let cropped = show(&format!(
+            "{recognized}\r\n$ echo sample A\r\n{}Limited output\r\n{choices}",
+            "more context\r\n".repeat(31)
+        ));
+        assert_eq!(cropped.kind, "approval");
+        assert!(cropped.text.contains("$ echo sample A"));
+        assert!(cropped.menu.is_none());
+
+        assert!(!chat_is_bound(
+            &json!({"workspaceKind":"direct","conversationId":null})
+        ));
+        assert!(chat_is_bound(
+            &json!({"workspaceKind":"direct","conversationId":"fixture"})
+        ));
+    }
+
+    #[test]
+    fn native_choice_menu_requires_numbered_options_and_one_highlight() {
+        let initial = [
+            "Which should I change?",
+            "› 1 - Only one",
+            "  2 - Both. Include tests.",
+        ];
+        let moved = [
+            "Which should I change?",
+            "  1 - Only one",
+            "› 2 - Both. Include tests.",
+        ];
+        let footer = "tab to add notes | enter to submit answer";
+        let first = terminal_menu(&initial, footer, "question", "codex").unwrap();
+        let second = terminal_menu(&moved, footer, "question", "codex").unwrap();
+        assert_eq!(first.key, second.key);
+        assert_eq!(second.choices[1], "Both. Include tests.");
+        assert_eq!((first.selected, second.selected), (1, 2));
+        for footer in [
+            "tab to add notes | ⌃enter to submit answer",
+            "tab to add notes | enter to submit answer | select multiple",
+        ] {
+            assert!(terminal_menu(&initial, footer, "question", "codex").is_none());
+        }
+        assert!(terminal_menu(&["› 1. One", "› 2. Two"], footer, "question", "codex").is_none());
+        assert!(terminal_menu(&["› 1. One", "  3. Three"], footer, "question", "codex").is_none());
+    }
+
+    #[test]
     fn chat_recognizes_a_screenshot_path_wrapped_before_the_cursor() {
         let mut parser = vt100::Parser::new(10, 30, 0);
         let draft = "Read the screenshot in \"file.png\"";
@@ -1446,6 +1924,7 @@ mod tests {
             chat_pending: false,
             terminal_slash: false,
             thread_uncertain: false,
+            answered_prompt: None,
         };
         input.write_from_terminal(b"/", true, None).unwrap();
         input
