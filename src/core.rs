@@ -163,6 +163,7 @@ pub struct Core {
     pub db: Mutex<Value>,
     pub terms: Mutex<HashMap<String, Arc<LiveTerminal>>>,
     pub login_terminal: Mutex<Option<crate::terminal::LoginTerminal>>,
+    pub(crate) chat_log: Mutex<crate::chat::LogCache>,
     pub browsers: Mutex<BrowserState>,
     #[cfg(windows)]
     pub previews: crate::preview::Previews,
@@ -203,6 +204,7 @@ impl Core {
             db: Mutex::new(db),
             terms: Mutex::new(HashMap::new()),
             login_terminal: Mutex::new(None),
+            chat_log: Mutex::new(crate::chat::LogCache::default()),
             browsers: Mutex::new(BrowserState::default()),
             #[cfg(windows)]
             previews: crate::preview::Previews::default(),

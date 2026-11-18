@@ -2,6 +2,7 @@
 mod accounts;
 mod addons;
 mod browser;
+mod chat;
 #[cfg(windows)]
 mod clipboard;
 mod core;
@@ -56,7 +57,7 @@ async fn dispatch(
             } else {
                 None
             };
-            clipboard::dispatch(owner, &action, &args)
+            clipboard::dispatch(&core, owner, &action, &args)
         })
         .await
         .map_err(|e| e.to_string())?
@@ -90,6 +91,7 @@ fn route(core: &Arc<Core>, domain: &str, action: &str, args: &Value) -> Result<V
         "files" => files::dispatch(core, action, args),
         "git" => git::dispatch(core, action, args),
         "history" => history::dispatch(core, action, args),
+        "chat" => chat::dispatch(core, action, args),
         "addons" => addons::dispatch(core, action, args),
         "models" => models::dispatch(core, action, args),
         "templates" => templates::dispatch(core, action, args),
@@ -578,7 +580,10 @@ fn rpc_fixture(provider: &str) -> Result<()> {
         } else if provider == "claude" {
             json!({"models":[{"value":"fixture-claude","displayName":"Fixture Claude"}]})
         } else if v["method"] == "model/list" {
-            json!({"data":[{"model":"fixture-codex","displayName":"Fixture Codex","isDefault":true,"defaultReasoningEffort":"medium","supportedReasoningEfforts":[{"reasoningEffort":"medium"}]}]})
+            json!({"data":[
+                {"model":"fixture-codex","displayName":"Fixture Codex","isDefault":true,"defaultReasoningEffort":"medium","supportedReasoningEfforts":[{"reasoningEffort":"medium"}]},
+                {"model":"fixture-chat","displayName":"Fixture Chat","defaultReasoningEffort":"medium","supportedReasoningEfforts":[{"reasoningEffort":"medium"},{"reasoningEffort":"high"}]},
+            ]})
         } else if v["method"] == "models.list" {
             json!({"models":[{"id":"fixture-copilot","name":"Fixture Copilot"}]})
         } else {

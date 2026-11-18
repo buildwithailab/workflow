@@ -422,6 +422,7 @@ function render() {
   bs.value = focusId || "";
   paintBrowserPermission();
   if (panel === "links") renderLinks();
+  renderChatView();
 }
 function projectInitials(name) {
   const words = name.match(/[\p{L}\p{N}][\p{L}\p{N}\p{M}]*/gu) || [];
@@ -535,7 +536,7 @@ function renderSessionTabs() {
       el("span", "name", s.name), stateBadge(s.id));
     return tab;
   });
-  root.hidden = !tabs.length;
+  $("#session-tabbar").hidden = !tabs.length;
   root.replaceChildren(...tabs);
   const selected = tabs.find((b) => b.dataset.sessionId === focusId);
   const viewport = $("#viewport");
@@ -1003,7 +1004,7 @@ function renderCards() {
   drawEdges();
   requestAnimationFrame(fitTerminals);
 }
-function terminalClipboard(term, host, writableRun, onInput) {
+function terminalClipboard(term, host, writableRun, onInput, sessionId) {
   let inputQueue = Promise.resolve(), pasting = false, pastedInput;
   let inputGeneration = 0, pendingInput = 0;
   const enqueue = (action, affectsDraft = true) => {
@@ -1033,7 +1034,11 @@ function terminalClipboard(term, host, writableRun, onInput) {
     if (!text) throw Error(tr("Kopyalamak için terminalde metin seç."));
     await api("clipboard", "write", { text });
   };
-  const paste = (readText = () => api("clipboard", "read")) => {
+  const readClipboard = async () => {
+    const attachment = sessionId && await api("clipboard", "read_attachment", { id: sessionId });
+    return attachment || api("clipboard", "read");
+  };
+  const paste = (readPayload = readClipboard) => {
     const run = writableRun();
     if (!run || term.options.disableStdin) {
       error(tr("Yapıştırmak için oturumun terminalini başlat."));
@@ -1043,9 +1048,14 @@ function terminalClipboard(term, host, writableRun, onInput) {
     return enqueue(async () => {
       const canPaste = () => host.isConnected && writableRun() === run && !term.options.disableStdin;
       if (generation !== inputGeneration || !canPaste()) return;
-      let text = await readText();
+      const payload = await readPayload();
+      const attachment = typeof payload === "object" ? payload : null;
       // A stopped, replaced or detached terminal must not receive a pending paste.
-      if (!canPaste()) return;
+      if (!canPaste()) {
+        await discardScreenshot(sessionId, attachment);
+        return;
+      }
+      let text = attachment ? " " + imagePrompt([attachment], session(sessionId)?.provider) + " " : payload;
       if (!text) throw Error(tr("Windows panosundan yapıştırılabilir metin alınamadı."));
       if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(text)) {
         inputGeneration++;
@@ -1071,8 +1081,12 @@ function terminalClipboard(term, host, writableRun, onInput) {
   host.addEventListener("paste", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    const text = e.clipboardData?.getData("text/plain");
-    paste(() => text);
+    const image = sessionId && [...(e.clipboardData?.files || [])].find(file => file.type.startsWith("image/"));
+    if (image) {
+      paste(() => saveClipboardImage(sessionId, image));
+      return;
+    }
+    paste(() => e.clipboardData?.getData("text/plain") ?? "");
   }, true);
   term.attachCustomKeyEventHandler((e) => {
     const key = e.key.toLowerCase();
@@ -1111,6 +1125,16 @@ function terminalClipboard(term, host, writableRun, onInput) {
   };
   const copyButton = item(tr("Kopyala"), "Ctrl+Shift+C", copy);
   const pasteButton = item(tr("Yapıştır"), "Ctrl+V", paste);
+  const imageButton = sessionId && item(tr("Dosya ekle…"), "", async () => {
+    const run = writableRun();
+    if (!run) return;
+    const images = await chooseSessionImages(sessionId);
+    if (!images.length || writableRun() !== run || !host.isConnected) return;
+    const selected = session(sessionId);
+    if (!selected || selected.login) return;
+    await paste(() => " " + imagePrompt(images, selected.provider) + " ");
+    term.focus();
+  });
   host.append(menu);
   host.addEventListener("contextmenu", (e) => {
     // Preserve mouse reporting in full-screen CLI applications (Shift overrides it).
@@ -1119,6 +1143,7 @@ function terminalClipboard(term, host, writableRun, onInput) {
     e.stopPropagation();
     copyButton.disabled = !term.hasSelection();
     pasteButton.disabled = !writableRun() || term.options.disableStdin;
+    if (imageButton) imageButton.disabled = pasteButton.disabled;
     menu.showPopover();
     const rect = host.getBoundingClientRect();
     const x = e.clientX || rect.left + 12, y = e.clientY || rect.top + 12;
@@ -1137,7 +1162,13 @@ function terminalClipboard(term, host, writableRun, onInput) {
       if (!next.disabled) next.focus();
     }
   });
-  return () => pendingInput > 0;
+  return {
+    hasPendingInput: () => pendingInput > 0,
+    attachFiles: (paths) => paste(async () => {
+      const files = await attachmentReferences(sessionId, paths);
+      return " " + imagePrompt(files, session(sessionId)?.provider) + " ";
+    }),
+  };
 }
 
 function confirmTerminalPaste() {
@@ -1285,10 +1316,12 @@ function createCard(s, index) {
     else if (!/^[\x00-\x1f\x7f]/.test(data)) v.inputDraft += data;
     return api("terminal", "write", { id: s.id, runId: v.runId, data });
   };
-  v.hasPendingInput = terminalClipboard(term, host, () =>
+  const clipboard = terminalClipboard(term, host, () =>
     views.get(s.id) === v && v.ready && !v.replaying && active(s.id) ? v.runId : null,
-    sendInput,
+    sendInput, s.login ? null : s.id,
   );
+  v.hasPendingInput = clipboard.hasPendingInput;
+  v.attachFiles = clipboard.attachFiles;
   const observer = new ResizeObserver(() => {
     clearTimeout(v.resizeTimer);
     v.resizeTimer = setTimeout(() => {
@@ -1305,6 +1338,7 @@ function createCard(s, index) {
       renderTeamsEditor();
       renderSessionList();
       renderSessionTabs();
+      renderChatView();
       $$(".session-card").forEach((c) =>
         c.classList.toggle("focused", c.dataset.id === s.id),
       );
@@ -1443,6 +1477,10 @@ function observeTerminal(id, v) {
     );
     if (m) {
       v.observedModel = m[0];
+      if (session(id)?.provider === "codex") {
+        v.observedEffort = footer.slice(m.index + m[0].length)
+          .match(/^\s+(none|minimal|low|medium|high|xhigh|max|ultra)\b/i)?.[1]?.toLowerCase();
+      }
       v.model.textContent = m[0];
     }
   }
@@ -1967,7 +2005,7 @@ function drawEdges() {
 }
 $("#viewport").addEventListener("pointerdown", (e) => {
   if (
-    mode !== "map" ||
+    shownChatId || mode !== "map" ||
     e.button !== 0 ||
     e.target.closest(".session-card") ||
     e.target.closest(".edge, .link-node")
@@ -2042,7 +2080,7 @@ window.addEventListener("pointerup", (e) => {
 $("#viewport").addEventListener(
   "wheel",
   (e) => {
-    if (mode !== "map" || !e.ctrlKey) return;
+    if (shownChatId || mode !== "map" || !e.ctrlKey) return;
     e.preventDefault();
     const r = $("#viewport").getBoundingClientRect();
     zoom(Math.exp(-e.deltaY * 0.002), e.clientX - r.left, e.clientY - r.top);
@@ -4922,6 +4960,7 @@ async function initialize() {
   };
   checkTeams();
 }
+initChatControls();
 initialize().catch(error);
 setInterval(() => {
   if (document.visibilityState === "visible")

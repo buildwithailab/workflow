@@ -299,12 +299,28 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             .get(&format!("models:{sid}"))
             .cloned()
             .context("Önce model listesini aç")?;
-        cached
+        let model_info = cached
             .as_array()
             .unwrap()
             .iter()
             .find(|m| m["id"] == model)
             .context("Model bu hesapta listelenmedi")?;
+        let effort = args["effort"].as_str();
+        if provider == "codex"
+            && effort.is_some_and(|value| {
+                ![
+                    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+                ]
+                .contains(&value)
+                    || !model_info["efforts"].as_array().is_some_and(|options| {
+                        options
+                            .iter()
+                            .any(|option| option["reasoningEffort"] == value)
+                    }) && model_info["defaultEffort"] != value
+            })
+        {
+            bail!("Düşünme seviyesi geçersiz");
+        }
         let live = core
             .terms
             .lock()
@@ -312,6 +328,17 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             .get(sid)
             .cloned()
             .filter(|t| !t.exited.load(std::sync::atomic::Ordering::SeqCst));
+        if args["surface"] == "chat" {
+            if provider != "codex" || s["login"] == true || s["archived"] == true {
+                bail!("Sohbet bu oturumda kullanılamıyor.");
+            }
+            if live.is_some() {
+                terminal::apply_chat_model(core, args, model, effort)?;
+            } else if !args["runId"].is_null() {
+                bail!("Terminal değişti; ajan hazır olunca yeniden seç");
+            }
+            return core.update_session(sid, json!({"model":model,"effort":effort}));
+        }
         if let Some(live) = live {
             if args["runId"] != live.run_id
                 || args["seq"].as_u64() != Some(*live.seq.lock().unwrap())
@@ -319,15 +346,11 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
                 bail!("Terminal değişti; ajan hazır olunca yeniden seç")
             };
             let command = if provider == "codex" {
-                let effort = args["effort"].as_str().unwrap_or("medium");
-                if ![
-                    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
-                ]
-                .contains(&effort)
-                {
-                    bail!("Düşünme seviyesi geçersiz")
-                };
-                format!("/model {model} --reasoning={effort}\r")
+                if let Some(effort) = effort {
+                    format!("/model {model} --reasoning={effort}\r")
+                } else {
+                    format!("/model {model}\r")
+                }
             } else if provider == "copilot" {
                 format!("/model --session {model}\r")
             } else {

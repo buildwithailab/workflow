@@ -342,6 +342,271 @@ async function testCopilotNpm() {
   console.log("PASS Copilot npm discovery, launcher and installation option without WinGet");
 }
 
+async function testCodexChat() {
+  const profile = path.join(temporary, "chat-test-profile");
+  const folder = path.join(temporary, "chat-project");
+  fs.mkdirSync(folder, { recursive: true });
+  fs.writeFileSync(path.join(folder, "chat-terminal-fixture"), "");
+  fs.writeFileSync(path.join(folder, "preferences.txt"), "enabled=true\n");
+  await start("claude,copilot", profile);
+  const project = await api("app", "add_project", { directory: folder });
+  const s = await api("app", "create_session", {
+    projectId: project.id, provider: "codex", workspaceMode: "direct",
+    name: "Notification preferences", tools: false,
+  });
+  const logs = path.join(profile, "test-codex-home", "sessions");
+  fs.mkdirSync(logs, { recursive: true });
+  const log = path.join(logs, "rollout-chat-test.jsonl");
+  const event = (type, fields = {}) => ({ type: "event_msg", payload: { type, ...fields } });
+  const response = (type, fields = {}) => ({ type: "response_item", payload: { type, ...fields } });
+  const append = (...entries) => fs.appendFileSync(log, entries.map(x => JSON.stringify(x) + "\n").join(""));
+  append(
+    { type: "session_meta", payload: { id: "chat-test-thread", cwd: s.directory, timestamp: new Date().toISOString() } },
+    event("task_started", { turn_id: "first" }),
+    event("user_message", { message: "Fix the notification preference." }),
+    response("message", { role: "assistant", phase: "commentary", content: [{ text: "Checking the saved value" }] }),
+    response("function_call", { name: "apply_patch", call_id: "patch" }),
+    response("message", { role: "assistant", phase: "final_answer", content: [{ text: "**Fixed.**\n\n- The saved value is preserved.\n\n\x60\x60\x60ts\nconst enabled = saved ?? true;\n\x60\x60\x60" }] }),
+    event("task_complete"),
+  );
+  await api("history", "bind", { id: s.id, conversationId: "chat-test-thread" });
+  fs.writeFileSync(path.join(folder, "preferences.txt"), "enabled=false\n");
+  const setup = page.locator("#dialog").getByRole("button", { name: "Skip", exact: true });
+  if (await setup.isVisible()) await setup.click();
+  await page.evaluate(async id => {
+    await window.workflow.refresh();
+    window.workflow.selectSession(id, true);
+  }, s.id);
+  await page.locator("#session-chat-view").click();
+  const chat = page.locator("#chat-view");
+  await chat.getByText("Fixed.", { exact: true }).waitFor();
+  assert.equal(await chat.locator("pre code").textContent(), "const enabled = saved ?? true;\n");
+  const steps = chat.locator("details");
+  assert.equal(await steps.evaluate(node => node.open), false);
+  await steps.locator("summary").click();
+  await steps.getByText("apply_patch", { exact: true }).waitFor();
+  await page.locator("#panel-changes").getByRole("button", { name: /preferences\.txt/ }).waitFor();
+  assert.deepEqual((await api("app", "state")).active, [], "opening Chat does not start a terminal");
+
+  const input = chat.locator("textarea");
+  const screenshot = fs.readFileSync(path.join(root, "icons", "icon.png"));
+  const pasteScreenshot = selector => page.locator(selector).evaluate((node, bytes) => {
+    const data = new DataTransfer();
+    data.items.add(new File([Uint8Array.from(bytes)], "screenshot.png", { type: "image/png" }));
+    node.dispatchEvent(new ClipboardEvent("paste", { clipboardData: data, bubbles: true, cancelable: true }));
+  }, [...screenshot]);
+  const dropFiles = (selector, paths) => page.locator(selector).evaluate((node, paths) => {
+    const box = node.getBoundingClientRect();
+    return window.__TAURI__.event.emit("tauri://drag-drop", {
+      paths,
+      position: { x: (box.left + box.width / 2) * devicePixelRatio, y: (box.top + box.height / 2) * devicePixelRatio },
+    });
+  }, paths);
+  const screenshots = path.join(profile, "attachments", s.id);
+  await pasteScreenshot("#chat-input");
+  const chips = page.locator("#chat-images button");
+  await chips.filter({ hasText: "Screenshot" }).waitFor();
+  const [capture] = fs.readdirSync(screenshots);
+  assert.deepEqual(fs.readFileSync(path.join(screenshots, capture)), screenshot);
+  await chips.filter({ hasText: "Screenshot" }).click();
+  await until(() => !fs.existsSync(path.join(screenshots, capture)), "removing an unsent screenshot deletes its local copy");
+  const dropped = [path.join(folder, "preferences.txt"), path.join(root, "icons", "icon.png")];
+  await dropFiles("#chat-view", dropped);
+  for (const file of dropped) {
+    const chip = chips.filter({ hasText: path.basename(file) });
+    await chip.waitFor();
+    await chip.click();
+  }
+  const prompt = "Retest the preference.\nInclude the reload case.";
+  await input.fill(prompt);
+  const modelMenu = page.locator("#chat-model-menu");
+  await page.locator("#chat-model").click();
+  await modelMenu.getByRole("button", { name: "Fixture Chat", exact: true }).click();
+  const selectedModel = async () => (await api("app", "state")).sessions.find(row => row.id === s.id);
+  await until(async () => (await selectedModel()).model === "fixture-chat", "model selection saved before startup");
+  await page.locator("#chat-effort").click();
+  await modelMenu.getByRole("button", { name: "High", exact: true }).click();
+  await until(async () => (await selectedModel()).effort === "high", "reasoning effort saved before startup");
+  assert.deepEqual((await api("app", "state")).active, [], "choosing settings does not start Codex");
+  assert.equal(await input.inputValue(), prompt);
+  await page.locator("#chat-start").click();
+  await until(async () => !!(await api("chat", "read", { id: s.id })).ticket, "native Codex composer ready", 12000);
+  await page.evaluate(id => {
+    collectChatAttachments(id, () => new Promise(resolve => { window.finishTestAttachment = () => resolve([]); }));
+    document.querySelector("#chat-composer").requestSubmit();
+  }, s.id);
+  assert.equal(await page.locator("#chat-send").isDisabled(), true);
+  assert(!fs.existsSync(path.join(data, "test-input", "codex-chat.bin")));
+  await page.evaluate(() => window.finishTestAttachment());
+  await until(async () => !await page.locator("#chat-send").isDisabled(), "attachment selection finished");
+  await page.evaluate(id => {
+    window.workflow.views.get(id).inputDraft = "obsolete terminal estimate";
+    document.querySelector("#chat-input").dispatchEvent(new Event("input"));
+  }, s.id);
+  assert.equal(await page.locator("#chat-send").isDisabled(), false);
+  await page.evaluate(id => { window.workflow.views.get(id).inputDraft = ""; }, s.id);
+  const runId = (await api("terminal", "attach", { id: s.id })).runId;
+  const ticketBeforeModel = (await api("chat", "read", { id: s.id })).ticket;
+  await assert.rejects(api("models", "apply", { id: s.id, surface: "chat", model: "fixture-chat", effort: "ultra", ...ticketBeforeModel }), /Düşünme seviyesi geçersiz/);
+  await page.locator("#chat-effort").click();
+  await modelMenu.getByRole("button", { name: "Medium", exact: false }).click();
+  await until(async () => (await selectedModel()).effort === "medium", "live reasoning effort confirmed by Codex");
+  await until(async () => !!(await api("chat", "read", { id: s.id })).ticket, "Codex ready after model change");
+  assert.equal((await api("terminal", "attach", { id: s.id })).runId, runId);
+  assert.equal(await input.inputValue(), prompt);
+  const submitted = path.join(data, "test-input", "codex-chat.bin");
+  await page.locator("#session-terminal-view").click();
+  assert(await chat.isHidden());
+  await page.locator("#session-chat-view").click();
+  assert.equal(await input.inputValue(), prompt);
+  assert.equal((await api("terminal", "attach", { id: s.id })).runId, runId);
+  assert(!fs.existsSync(submitted), "view switching sends no terminal input");
+  const ticket = (await api("chat", "read", { id: s.id })).ticket;
+  await assert.rejects(api("chat", "send", { id: s.id, ...ticket, runId: "stale", text: prompt }), /çalıştırması değişti/);
+  await assert.rejects(api("chat", "send", { id: s.id, ...ticket, text: "/new" }), /kabuk komutlarını/);
+  await chat.getByRole("button", { name: "Send", exact: true }).click();
+  await until(() => fs.existsSync(submitted), "same Codex process received the chat input", 12000);
+  const received = fs.readFileSync(submitted);
+  assert.equal(received[received.length - 1], 13);
+  assert.match(received.toString(), /^\x1b\[200~Retest the preference\.\x1b\[201~/);
+  assert.match(received.toString(), /\x1b\[200~Include the reload case\.\x1b\[201~\r$/);
+  await until(async () => {
+    const snapshot = await api("terminal", "attach", { id: s.id });
+    return Buffer.from(snapshot.data, "base64").toString().includes("Working (test)");
+  }, "Codex displays a running task next to its composer");
+  assert.equal((await api("chat", "read", { id: s.id })).ticket, null);
+  append(
+    event("task_started", { turn_id: "second" }),
+    response("message", {
+      role: "user",
+      content: [{ text: "Environment context" }, { text: prompt }],
+      internal_chat_message_metadata_passthrough: {
+        content_item_kinds: ["environments.environment_context", "user.text"],
+        content_item_metadata: [{ provenance: { type: "harness" } }, { provenance: { type: "user" } }],
+      },
+    }),
+    event("task_complete", { last_agent_message: "Reload test passed." }),
+  );
+  await chat.getByText("Reload test passed.", { exact: true }).waitFor();
+  assert.equal(await chat.locator(".chat-prompt").count(), 2);
+  assert.equal(await chat.locator(".chat-prompt").last().textContent(), prompt);
+  assert.equal((await api("terminal", "attach", { id: s.id })).runId, runId);
+  await page.locator("#session-terminal-view").click();
+  const terminal = `.session-card[data-id="${s.id}"] .terminal-host`;
+  await page.locator(terminal).waitFor();
+  await pasteScreenshot(terminal);
+  await dropFiles(terminal, dropped);
+  await page.waitForFunction(id => {
+    const draft = window.workflow.views.get(id)?.inputDraft;
+    return draft?.includes(".png") && draft.includes("preferences.txt") && draft.includes("icon.png");
+  }, s.id);
+  const [terminalCapture] = fs.readdirSync(screenshots);
+  assert.deepEqual(fs.readFileSync(path.join(screenshots, terminalCapture)), screenshot);
+  assert.deepEqual(fs.readFileSync(submitted), received, "pasting or dropping does not submit the prompt");
+  await api("terminal", "stop", { id: s.id, runId });
+  await until(async () => (await api("terminal", "attach", { id: s.id })).exited, "Codex fixture stopped");
+  await page.locator("#session-chat-view").click();
+  await input.fill("First conversation only");
+  await pasteScreenshot("#chat-input");
+  await chips.filter({ hasText: "Screenshot" }).waitFor();
+  fs.writeFileSync(path.join(logs, "rollout-second-chat.jsonl"), JSON.stringify({
+    type: "session_meta", payload: { id: "second-chat-test-thread", cwd: s.directory, timestamp: new Date().toISOString() },
+  }) + "\n");
+  await api("history", "bind", { id: s.id, conversationId: "second-chat-test-thread" });
+  await page.evaluate(() => window.workflow.refresh());
+  assert.equal(await input.inputValue(), "");
+  assert.equal(await chips.count(), 0, "rebinding drops unsent attachments from the prior conversation");
+  const leaked = await page.evaluate(async id => {
+    const current = window.workflow.state().sessions.find(row => row.id === id);
+    current.conversationId = null;
+    renderChatView();
+    let complete;
+    const pending = collectChatAttachments(id, () => new Promise(resolve => { complete = resolve; }));
+    current.conversationId = "first-bound-thread";
+    renderChatView();
+    current.conversationId = "replacement-thread";
+    renderChatView();
+    complete([{ name: "sample.png", reference: "sample.png", kind: "image" }]);
+    await pending;
+    return chatViews.get(id).images.length;
+  }, s.id);
+  assert.equal(leaked, 0, "an attachment started before the first bind cannot reach a later conversation");
+  await page.evaluate(() => window.workflow.refresh());
+  await stop();
+  console.log("PASS Codex Chat and Terminal share one run, render structured messages and steps, and review files in the inspector");
+}
+
+async function testAdditionalProviderChats() {
+  for (const provider of ["claude", "copilot"]) {
+    const claude = provider === "claude";
+    const profile = path.join(temporary, provider + "-chat-profile");
+    const folder = path.join(temporary, provider + "-chat-workspace");
+    fs.mkdirSync(folder, { recursive: true });
+    fs.writeFileSync(path.join(folder, "chat-terminal-fixture"), "");
+    const picture = path.join(temporary, provider + " sample.png");
+    fs.copyFileSync(path.join(root, "icons", "icon.png"), picture);
+    await start("", profile);
+    const p = await api("app", "add_project", { directory: folder });
+    const s = await api("app", "create_session", { projectId: p.id, provider, workspaceMode: "direct", tools: false });
+    const logs = claude ? path.join(profile, "test-claude-home/projects/example")
+      : path.join(profile, "test-copilot-home/session-state", s.id);
+    fs.mkdirSync(logs, { recursive: true });
+    const log = path.join(logs, claude ? `${s.id}.jsonl` : "events.jsonl");
+    const entry = (kind, content, extra = {}) => claude
+      ? { type: kind, sessionId: s.id, cwd: s.directory, message: { content }, ...extra }
+      : { type: kind, data: { content, ...extra } };
+    const append = (...rows) => fs.appendFileSync(log, rows.map(row => JSON.stringify(row) + "\n").join(""));
+    if (!claude) append(entry("session.start", "", { sessionId: s.id, context: { cwd: s.directory } }));
+    append(entry(claude ? "user" : "user.message", "Check the selected setting."));
+    append(claude
+      ? entry("assistant", [{ type: "thinking", thinking: "Private thought" }, { type: "tool_use", name: "Edit", id: "tool-1", input: { old: "Tool contents" } }])
+      : entry("tool.execution_start", "", { toolName: "edit", toolCallId: "tool-1", arguments: { old: "Tool contents" } }));
+    append(entry(claude ? "assistant" : "assistant.message", [{ type: "text", text: "The setting is ready." }]));
+    await api("history", "bind", { id: s.id, conversationId: s.id });
+    const setup = page.locator("#dialog").getByRole("button", { name: "Skip", exact: true });
+    if (await setup.isVisible()) await setup.click();
+    await page.evaluate(async id => { await window.workflow.refresh(); window.workflow.selectSession(id, true); }, s.id);
+    await page.locator("#session-chat-view").click();
+    await page.locator("#chat-view").getByText("The setting is ready.").waitFor();
+    await page.locator("#chat-view details summary").click();
+    assert.equal(await page.locator("#chat-view").getByText("Tool contents").count(), 0);
+    const attach = await api("chat", "image_reference", { id: s.id, path: picture });
+    assert.equal(attach.name, provider + " sample.png");
+    assert.match(attach.reference, /sample\.png"$/);
+    await assert.rejects(api("chat", "image_reference", { id: s.id, path: "relative.png" }), /PNG/);
+    const approval = page.locator("#chat-approval");
+    if (claude) await approval.selectOption("plan");
+    await page.locator("#chat-start").click();
+    await until(async () => !!(await api("chat", "read", { id: s.id })).ticket, provider + " idle composer");
+    if (!claude) {
+      assert.equal((await api("chat", "read", { id: s.id })).liveApprovalMode, "manual");
+      await until(async () => await approval.inputValue() === "manual", "observed Copilot manual mode displayed");
+    }
+    const runId = (await api("terminal", "attach", { id: s.id })).runId;
+    if (!claude) await approval.selectOption("auto");
+    await until(async () => {
+      const row = (await api("app", "state")).sessions.find(row => row.id === s.id);
+      return row.approvalMode === (claude ? "plan" : "auto");
+    }, provider + " approval preference");
+    if (!claude) {
+      assert.equal((await api("chat", "read", { id: s.id })).liveApprovalMode, "auto");
+      await until(async () => await approval.inputValue() === "auto", "observed Copilot assisted mode displayed");
+    }
+    await page.locator("#chat-input").fill("Check again.");
+    await page.locator("#session-terminal-view").click();
+    await page.locator("#session-chat-view").click();
+    assert.equal(await page.locator("#chat-input").inputValue(), "Check again.");
+    await page.locator("#chat-send").click();
+    const output = path.join(data, "test-input", `${provider}-chat.bin`);
+    await until(() => fs.existsSync(output), provider + " receives chat prompt");
+    assert.equal(fs.readFileSync(output, "utf8"), "\x1b[200~Check again.\x1b[201~\r");
+    fs.unlinkSync(output);
+    assert.equal((await api("terminal", "attach", { id: s.id })).runId, runId);
+    await stop();
+  }
+  console.log("PASS Claude and Copilot Chat retain native conversation, file references, draft and approval settings");
+}
+
 async function test() {
   const git = (args) =>
     cp.execFileSync("git", args, {
@@ -419,6 +684,10 @@ async function test() {
     );
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  if (process.platform === "win32") {
+    await testCodexChat();
+    await testAdditionalProviderChats();
+  }
   if (process.platform === "win32") await testCopilotNpm();
   const address = "http://127.0.0.1:" + server.address().port;
   const started = Date.now();

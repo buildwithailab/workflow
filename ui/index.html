@@ -147,7 +147,17 @@
           </div>
           <div id="provider-cards"></div>
         </section>
-        <div id="session-tabs" role="tablist" aria-label="Klasördeki oturumlar" hidden></div>
+        <div id="session-tabbar" hidden>
+          <div id="session-tabs" role="tablist" aria-label="Klasördeki oturumlar"></div>
+          <div id="session-view-switch" role="group" aria-label="Oturum görünümü" hidden>
+            <button id="session-terminal-view" type="button" aria-label="Terminal" title="Terminal" aria-controls="world" aria-pressed="true">
+              <span class="session-terminal-icon" aria-hidden="true">&gt;_</span>
+            </button>
+            <button id="session-chat-view" type="button" aria-label="Sohbet" title="Sohbet" aria-controls="chat-view" aria-pressed="false">
+              <span class="session-chat-icon" aria-hidden="true"></span>
+            </button>
+          </div>
+        </div>
         <div id="viewport">
           <div class="canvas-hint">
             Boş alandan sürükle · Ctrl + tekerlek ile yakınlaştır
@@ -187,6 +197,29 @@
             <h2>Bir sonraki işine yer aç.</h2>
             <p>Proje ekle, bir sağlayıcı seç ve ilk oturumunu başlat.</p>
           </div>
+          <section id="chat-view" aria-label="Sohbet" hidden>
+            <div id="chat-scroll">
+              <div id="chat-empty" class="help" hidden></div>
+              <div id="chat-turns"></div>
+            </div>
+            <form id="chat-composer">
+              <textarea id="chat-input" aria-label="Sohbet mesajı" placeholder="Bu oturuma mesaj yaz…" rows="2" maxlength="16000"></textarea>
+              <div id="chat-images" hidden></div>
+              <div class="chat-compose-actions">
+                <div class="chat-model-controls">
+                  <button id="chat-attach-image" type="button" class="quiet" title="Dosya ekle…" aria-label="Dosya ekle…">+</button>
+                  <select id="chat-approval" aria-label="Onay seviyesi" title="Onay seviyesi"></select>
+                  <button id="chat-model" type="button" class="chat-picker-button" title="Model seç" aria-label="Model seç" aria-haspopup="true" aria-controls="chat-model-menu" aria-expanded="false"><span>Model seç</span></button>
+                  <button id="chat-effort" type="button" class="chat-picker-button" title="Düşünme seviyesi" aria-label="Düşünme seviyesi" aria-haspopup="true" aria-controls="chat-model-menu" aria-expanded="false"><span>Düşünme seviyesi</span></button>
+                </div>
+                <button id="chat-bind" type="button" hidden>Konuşmayı seç</button>
+                <button id="chat-start" type="button" hidden>Terminali başlat</button>
+                <button id="chat-send" type="submit" class="primary">Gönder</button>
+              </div>
+              <span id="chat-status" role="status"></span>
+              <div id="chat-model-menu" popover role="group"></div>
+            </form>
+          </section>
         </div>
         <footer class="footer">
           <span class="row" id="running-status"
@@ -473,6 +506,7 @@
     <script src="vendor/addon-fit.js"></script>
     <script src="i18n.js"></script>
     <script src="diff.js"></script>
+    <script src="chat.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

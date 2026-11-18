@@ -56,10 +56,11 @@ fn metadata(file: &Path, provider: &str) -> Option<Value> {
                 .or_else(|| file.parent()?.file_name()?.to_str().map(str::to_string))?;
             return Some(json!({"id":thread,"cwd":cwd,"createdAt":v["timestamp"],"file":file}));
         }
-        if let Some(cwd) = v["cwd"].as_str() {
-            return Some(
-                json!({"id":v["sessionId"],"cwd":cwd,"createdAt":v["timestamp"],"file":file}),
-            );
+        if provider == "claude" && v["isSidechain"] != true {
+            let (Some(thread), Some(cwd)) = (v["sessionId"].as_str(), v["cwd"].as_str()) else {
+                continue;
+            };
+            return Some(json!({"id":thread,"cwd":cwd,"createdAt":v["timestamp"],"file":file}));
         }
     }
     None
@@ -99,6 +100,46 @@ fn matches_directory(cwd: &str, current: Option<&Path>, previous: Option<&str>) 
         return true;
     }
     current.is_some_and(|directory| cwd.canonicalize().is_ok_and(|path| path == directory))
+}
+
+pub(crate) fn bound_log(core: &Core, session: &Value, thread: &str) -> Result<Option<PathBuf>> {
+    let provider = string(session, "provider")?;
+    let profile = Profile::get(core, provider, &session["accountId"])?;
+    let paths = logs(provider, &profile);
+    let suffix = format!("-{thread}");
+    let named = |path: &Path| {
+        path.file_stem()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == thread || name.ends_with(&suffix))
+            || provider == "copilot"
+                && path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == thread)
+    };
+    Ok(paths
+        .iter()
+        .filter(|path| named(path))
+        .chain(paths.iter().filter(|path| !named(path)))
+        .find(|path| matches_bound_log(path, session, thread))
+        .cloned())
+}
+
+pub(crate) fn matches_bound_log(path: &Path, session: &Value, thread: &str) -> bool {
+    let provider = session["provider"].as_str().unwrap_or_default();
+    metadata(path, provider).is_some_and(|entry| {
+        entry["id"] == thread
+            && entry["cwd"].as_str().is_some_and(|cwd| {
+                let current = session["directory"]
+                    .as_str()
+                    .and_then(|dir| Path::new(dir).canonicalize().ok());
+                matches_directory(
+                    cwd,
+                    current.as_deref(),
+                    session["previousDirectory"].as_str(),
+                )
+            })
+    })
 }
 
 pub fn discover(core: &Core, id: &str) -> Result<Option<String>> {

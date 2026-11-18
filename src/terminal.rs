@@ -14,6 +14,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
+    time::{Duration, Instant},
 };
 
 pub struct LiveTerminal {
@@ -22,12 +23,75 @@ pub struct LiveTerminal {
     pub exited: AtomicBool,
     pub history: Mutex<Vec<u8>>,
     pub seq: Mutex<u64>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    input: Mutex<TerminalInput>,
+    chat_thread: Mutex<Option<String>>,
+    provider: String,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     screen: Mutex<vt100::Parser>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     #[cfg(windows)]
     job: Mutex<Option<Job>>,
+}
+
+struct TerminalInput {
+    writer: Box<dyn Write + Send>,
+    revision: u64,
+    chat_pasting: bool,
+    chat_pending: bool,
+    terminal_slash: bool,
+    thread_uncertain: bool,
+}
+
+impl TerminalInput {
+    fn write(&mut self, data: &[u8]) -> Result<()> {
+        self.revision += 1;
+        self.write_bytes(data)
+    }
+
+    fn write_bytes(&mut self, data: &[u8]) -> Result<()> {
+        self.writer.write_all(data)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    fn write_from_terminal(
+        &mut self,
+        mut data: &[u8],
+        composer_empty: bool,
+        visible_draft: Option<&str>,
+    ) -> Result<()> {
+        let original = data;
+        let bracketed = data.starts_with(b"\x1b[200~") && data.ends_with(b"\x1b[201~");
+        if bracketed {
+            data = &data[6..data.len() - 6];
+        }
+        if composer_empty
+            && (data.iter().copied().find(|c| !c.is_ascii_whitespace()) == Some(b'/')
+                || data == b"\x1b[A")
+        {
+            self.terminal_slash = true;
+        }
+        if data == b"\x1b" || data == b"\x03" {
+            self.terminal_slash = false;
+        }
+        if !bracketed && data.iter().any(|byte| matches!(byte, b'\r' | b'\n')) {
+            let typed_command = std::str::from_utf8(data)
+                .ok()
+                .map(str::trim_start)
+                .filter(|text| text.starts_with('/'));
+            let maybe_switch = match typed_command.or(visible_draft) {
+                Some(text) if text.starts_with('/') => !matches!(
+                    text.split_whitespace().next(),
+                    Some("/status" | "/help" | "/diff" | "/model" | "/permissions" | "/effort")
+                ),
+                Some(text) if !text.is_empty() && text != CODEX_EMPTY_PROMPT => false,
+                _ => self.terminal_slash,
+            };
+            self.thread_uncertain |= maybe_switch;
+            self.terminal_slash = false;
+        }
+        self.write(original)
+    }
 }
 #[cfg(windows)]
 pub(crate) struct Job(windows::Win32::Foundation::HANDLE);
@@ -103,10 +167,7 @@ impl LiveTerminal {
         if self.exited.load(Ordering::SeqCst) {
             bail!("Oturum kapalı")
         };
-        let mut w = self.writer.lock().unwrap();
-        w.write_all(data)?;
-        w.flush()?;
-        Ok(())
+        self.input.lock().unwrap().write(data)
     }
     pub fn snapshot(&self) -> Value {
         let seq = self.seq.lock().unwrap();
@@ -146,7 +207,8 @@ pub fn executable(provider: &str, custom: Option<&str>) -> Option<PathBuf> {
     }
     #[cfg(windows)]
     if provider == "copilot" {
-        return crate::provider_setup::npm_prefix().and_then(|prefix| executable_in(&prefix, provider));
+        return crate::provider_setup::npm_prefix()
+            .and_then(|prefix| executable_in(&prefix, provider));
     }
     None
 }
@@ -258,6 +320,30 @@ fn provider_arguments(session: &Value, conversation: Option<&str>) -> Result<Vec
         if provider == "codex" {
             args.extend(["-c".into(), format!("model_reasoning_effort='{effort}'")]);
         }
+    }
+    match (provider, session["approvalMode"].as_str()) {
+        ("codex", Some(mode @ ("manual" | "auto"))) => {
+            let reviewer = if mode == "auto" {
+                "auto_review"
+            } else {
+                "user"
+            };
+            args.extend([
+                "-a".into(),
+                "on-request".into(),
+                "-c".into(),
+                format!("approvals_reviewer='{reviewer}'"),
+            ]);
+        }
+        ("claude", Some(mode @ ("manual" | "auto" | "edits" | "plan"))) => {
+            let value = match mode {
+                "manual" => "default",
+                "edits" => "acceptEdits",
+                _ => mode,
+            };
+            args.extend(["--permission-mode".into(), value.into()]);
+        }
+        _ => {}
     }
     Ok(args)
 }
@@ -390,7 +476,10 @@ pub fn start(core: &Arc<Core>, session_id: &str) -> Result<Value> {
         .append(true)
         .create(true)
         .open(folder.join(format!("{session_id}.ansi")))?;
-    let (t, mut child, reader) = spawn_terminal(cmd, run_id.clone())?;
+    let (t, mut child, reader) = spawn_terminal(cmd, run_id.clone(), provider)?;
+    *t.chat_thread.lock().unwrap() = conversation.clone().or_else(|| {
+        (provider != "codex" && session["login"] != true).then(|| session_id.to_owned())
+    });
     core.terms
         .lock()
         .unwrap()
@@ -433,6 +522,7 @@ pub fn start(core: &Arc<Core>, session_id: &str) -> Result<Value> {
     {
         let c = core.clone();
         let sid = session_id.to_string();
+        let terminal = t.clone();
         std::thread::spawn(move || {
             for _ in 0..30 {
                 std::thread::sleep(std::time::Duration::from_secs(2));
@@ -446,7 +536,12 @@ pub fn start(core: &Arc<Core>, session_id: &str) -> Result<Value> {
                             .ok()
                             .is_some_and(|s| s["runId"] == run_id && s["conversationId"].is_null())
                         {
-                            let _ = c.update_session(&sid, json!({"conversationId":thread}));
+                            let mut bound = terminal.chat_thread.lock().unwrap();
+                            if c.update_session(&sid, json!({"conversationId":thread}))
+                                .is_ok()
+                            {
+                                *bound = Some(thread);
+                            }
                         }
                         break;
                     }
@@ -472,7 +567,11 @@ type SpawnedTerminal = (
     Box<dyn Read + Send>,
 );
 
-fn spawn_terminal(mut cmd: CommandBuilder, run_id: String) -> Result<SpawnedTerminal> {
+fn spawn_terminal(
+    mut cmd: CommandBuilder,
+    run_id: String,
+    provider: &str,
+) -> Result<SpawnedTerminal> {
     for key in std::env::vars_os().map(|(k, _)| k) {
         let k = key.to_string_lossy();
         if internal_variable(&k) {
@@ -506,7 +605,16 @@ fn spawn_terminal(mut cmd: CommandBuilder, run_id: String) -> Result<SpawnedTerm
         exited: AtomicBool::new(false),
         history: Mutex::new(vec![]),
         seq: Mutex::new(0),
-        writer: Mutex::new(writer),
+        input: Mutex::new(TerminalInput {
+            writer,
+            revision: 0,
+            chat_pasting: false,
+            chat_pending: false,
+            terminal_slash: false,
+            thread_uncertain: false,
+        }),
+        chat_thread: Mutex::new(None),
+        provider: provider.to_owned(),
         master: Mutex::new(Some(pair.master)),
         screen: Mutex::new(vt100::Parser::new(36, 120, 10000)),
         killer: Mutex::new(child.clone_killer()),
@@ -546,17 +654,20 @@ fn read_terminal(
                             }
                             if query.ends_with(b"\x1b[6n") {
                                 let (row, col) = parser.screen().cursor_position();
-                                let _ =
-                                    tt.write(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
+                                let _ = tt.input.lock().unwrap().write_bytes(
+                                    format!("\x1b[{};{}R", row + 1, col + 1).as_bytes(),
+                                );
                                 query.clear();
                             } else if query.ends_with(b"\x1b[c") || query.ends_with(b"\x1b[0c") {
-                                let _ = tt.write(b"\x1b[?1;2c");
+                                let _ = tt.input.lock().unwrap().write_bytes(b"\x1b[?1;2c");
                                 query.clear();
                             } else if query.ends_with(b"\x1b[>c") {
-                                let _ = tt.write(b"\x1b[>0;1;0c");
+                                let _ = tt.input.lock().unwrap().write_bytes(b"\x1b[>0;1;0c");
                                 query.clear();
                             }
                         }
+                        // A fast turn can redraw straight from the verified draft to the empty composer.
+                        tt.input.lock().unwrap().chat_pending = false;
                     }
                     let mut seq = tt.seq.lock().unwrap();
                     *seq += n as u64;
@@ -631,7 +742,7 @@ pub fn login(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
         profile.apply_pty(&mut cmd);
         cmd.cwd(&core.directory);
         cmd.env("TERM", "xterm-256color");
-        let (terminal, mut child, reader) = spawn_terminal(cmd, id())?;
+        let (terminal, mut child, reader) = spawn_terminal(cmd, id(), provider)?;
         let output = read_terminal(core.clone(), terminal.clone(), reader, None);
         let finished = terminal.clone();
         std::thread::spawn(move || {
@@ -722,6 +833,477 @@ fn resize_terminal(t: &LiveTerminal, args: &Value) -> Result<Value> {
     Ok(json!(true))
 }
 
+const CODEX_EMPTY_PROMPT: &str = "Ask Codex to do anything";
+
+fn codex_composer_text(screen: &vt100::Screen) -> Option<String> {
+    screen
+        .rows(0, screen.size().1)
+        .nth(screen.cursor_position().0 as usize)
+        .and_then(|line| {
+            line.trim_start()
+                .strip_prefix(['›', '❯', '>'])
+                .map(|input| input.trim().to_owned())
+        })
+}
+
+fn empty_codex_prompt(screen: &vt100::Screen) -> bool {
+    // Confirm the empty composer at the cursor, not a prompt quoted in scrollback.
+    screen.bracketed_paste()
+        && screen.cursor_position().1 <= 6
+        && codex_composer_text(screen).as_deref() == Some(CODEX_EMPTY_PROMPT)
+}
+
+fn codex_prompt_ready(screen: &vt100::Screen) -> bool {
+    empty_codex_prompt(screen) && codex_composer_unblocked(screen)
+}
+
+fn provider_prompt_ready(screen: &vt100::Screen, provider: &str) -> bool {
+    if provider == "codex" {
+        return codex_prompt_ready(screen);
+    }
+    let tags: &[&str] = match provider {
+        "claude" => &["for shortcuts", "/effort", "mode on", "accept edits on"],
+        "copilot" => &["manual approval", "assisted approval"],
+        _ => return false,
+    };
+    provider_composer(screen).is_some_and(|(draft, footer)| {
+        draft.trim().is_empty() && tags.iter().any(|tag| footer.contains(tag))
+    })
+}
+
+fn provider_composer(screen: &vt100::Screen) -> Option<(String, String)> {
+    if !screen.bracketed_paste() {
+        return None;
+    }
+    // These renderers draw a cursor independently from the terminal's hardware cursor.
+    // Identify their composer by its framing lines and provider-specific footer.
+    let lines = screen.rows(0, screen.size().1).collect::<Vec<_>>();
+    let divider = |line: &str| line.trim_start().starts_with("─────");
+    (1..lines.len()).rev().find_map(|start| {
+        lines[start].trim_start().strip_prefix('❯')?;
+        if !divider(&lines[start - 1]) {
+            return None;
+        }
+        let end = (start + 1..lines.len()).find(|&index| divider(&lines[index]))?;
+        let footer = lines[end + 1..].join(" ").to_ascii_lowercase();
+        if [
+            "esc to cancel",
+            "sign in to continue",
+            "cancel with esc",
+            "enter to confirm",
+            "esc to interrupt",
+            "ctrl+c to interrupt",
+            "ctrl-c to interrupt",
+        ]
+        .iter()
+        .any(|tag| footer.contains(tag))
+        {
+            return None;
+        }
+        // Cells beyond the drawn frame can still hold an earlier, wider render.
+        let frame_width = lines[start - 1].chars().take_while(|&ch| ch == '─').count();
+        let width = if frame_width >= 20 {
+            frame_width as u16
+        } else {
+            screen.size().1
+        };
+        let text = screen
+            .rows(0, width)
+            .skip(start)
+            .take(end - start)
+            .enumerate()
+            .map(|(index, line)| {
+                let line = line.trim();
+                if index == 0 {
+                    line.strip_prefix('❯').unwrap_or(line).trim().to_owned()
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some((text, footer))
+    })
+}
+
+fn codex_composer_unblocked(screen: &vt100::Screen) -> bool {
+    let cursor_row = screen.cursor_position().0 as usize;
+    let footer = screen
+        .rows(0, screen.size().1)
+        .skip(cursor_row + 1)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_lowercase();
+    // Codex can render its running indicator immediately above the composer.
+    // Match the status line itself so plain history text cannot block input.
+    let running_above = screen
+        .rows(0, screen.size().1)
+        .take(cursor_row)
+        .any(|line| {
+            let line = line.trim_start();
+            let Some(status) = line.strip_prefix("• ") else {
+                return false;
+            };
+            (status.starts_with("Working (") || status.starts_with("Working…"))
+                && status.contains("esc to interrupt")
+        });
+    if running_above {
+        return false;
+    }
+    ![
+        "esc to interrupt",
+        "ctrl+c to interrupt",
+        "ctrl-c to interrupt",
+        "working (",
+        "working…",
+        "do you want to proceed",
+        "do you trust",
+        "do you want to make this edit",
+        "this command requires approval",
+        "would you like to run the following",
+        "approve for this session",
+        "allow for this session",
+        "update available",
+    ]
+    .iter()
+    .any(|text| footer.contains(text))
+}
+
+fn chat_thread_matches(terminal: &LiveTerminal, session: &Value) -> bool {
+    terminal.chat_thread.lock().unwrap().as_deref() == session["conversationId"].as_str()
+}
+
+pub(crate) fn chat_state(core: &Core, session: &Value) -> (Value, bool, Option<&'static str>) {
+    let Ok(terminal) = get(core, &json!({"id":session["id"]})) else {
+        return (Value::Null, false, None);
+    };
+    if terminal.exited.load(Ordering::SeqCst) {
+        return (Value::Null, false, None);
+    }
+    if !chat_thread_matches(&terminal, session) {
+        return (Value::Null, true, None);
+    }
+    if session["workspaceKind"] == "direct" && session["conversationId"].is_null() {
+        return (Value::Null, false, None);
+    }
+    let screen = terminal.screen.lock().unwrap();
+    let input = terminal.input.lock().unwrap();
+    if input.thread_uncertain {
+        return (Value::Null, true, None);
+    }
+    let mode = if terminal.provider == "copilot" {
+        provider_composer(screen.screen()).and_then(|(_, footer)| {
+            if footer.contains("assisted approval") {
+                Some("auto")
+            } else if footer.contains("manual approval") {
+                Some("manual")
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+    if input.chat_pasting
+        || input.chat_pending
+        || input.terminal_slash
+        || !provider_prompt_ready(screen.screen(), &terminal.provider)
+    {
+        return (Value::Null, false, mode);
+    }
+    (
+        json!({"runId":terminal.run_id,"inputRevision":input.revision}),
+        false,
+        mode,
+    )
+}
+
+fn chat_input(text: &str) -> Result<String> {
+    chat_input_for(text, "codex")
+}
+
+fn chat_input_for(text: &str, provider: &str) -> Result<String> {
+    let text = text.replace("\r\n", "\n");
+    if text.trim().is_empty() || text.len() > 32 * 1024 || text.chars().count() > 16_000 {
+        bail!("Sohbet mesajı boş veya çok uzun.");
+    }
+    if text
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
+    {
+        bail!("Sohbet mesajında terminal denetim karakterleri var.");
+    }
+    if text.trim_start().starts_with(['/', '!']) || (provider == "copilot" && text.trim() == "$") {
+        bail!("Codex ve kabuk komutlarını Terminal görünümünde çalıştır.");
+    }
+    // ConPTY decodes these Windows input records as Shift+Enter key down and up.
+    // The Codex composer drops pasted CR/LF in this mode.
+    #[cfg(windows)]
+    const NEWLINE: &str = "\x1b[201~\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_\x1b[200~";
+    #[cfg(not(windows))]
+    const NEWLINE: &str = "\n";
+    let text = text
+        .trim_end()
+        .replace('\n', if provider == "codex" { NEWLINE } else { "\r" });
+    Ok(format!("\x1b[200~{text}\x1b[201~"))
+}
+
+fn codex_draft_visible(screen: &vt100::Screen, text: &str, indent: usize) -> bool {
+    if !screen.bracketed_paste() || empty_codex_prompt(screen) || !codex_composer_unblocked(screen)
+    {
+        return false;
+    }
+    let first_line = text.trim_start().lines().next().unwrap_or_default();
+    let excerpt: String = first_line
+        .chars()
+        .take_while(|&c| c != '\t')
+        .take(12)
+        .collect();
+    let placeholder = format!("[Pasted Content {} chars]", first_line.chars().count());
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    let mut last_line_start = cursor_row;
+    while last_line_start > 0 && screen.row_wrapped(last_line_start - 1) {
+        last_line_start -= 1;
+    }
+    let cursor_text = screen.contents_between(last_line_start, 0, cursor_row, cursor_col);
+    let cursor_text = cursor_text.trim_end();
+    let last_line = text.trim_end().lines().last().unwrap_or_default();
+    let last_placeholder = format!("[Pasted Content {} chars]", last_line.chars().count());
+    let suffix: String = last_line
+        .chars()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if !cursor_text.ends_with(&suffix) && !cursor_text.ends_with(&last_placeholder) {
+        return false;
+    }
+    screen
+        .rows(0, screen.size().1)
+        .take(cursor_row as usize + 1)
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            if line.len() - trimmed.len() != indent {
+                return None;
+            }
+            trimmed
+                .strip_prefix(['›', '❯', '>'])
+                .map(|text| text.trim().to_owned())
+        })
+        .last()
+        .is_some_and(|draft| draft.starts_with(&excerpt) || draft.starts_with(&placeholder))
+}
+
+pub(crate) fn send_chat(core: &Core, args: &Value) -> Result<Value> {
+    let text = string(args, "text")?;
+    let terminal = get(core, args)?;
+    let input = if terminal.provider == "codex" {
+        chat_input(text)?
+    } else {
+        chat_input_for(text, &terminal.provider)?
+    };
+    submit_chat_input(core, args, text, &input, |_, _| Ok(()))?;
+    Ok(json!(true))
+}
+
+pub(crate) fn apply_chat_model(
+    core: &Core,
+    args: &Value,
+    model: &str,
+    effort: Option<&str>,
+) -> Result<()> {
+    let mut command = format!("/model {model}");
+    if let Some(effort) = effort {
+        command.push_str(&format!(" --reasoning={effort}"));
+    }
+    let confirmation = format!("• Model changed to {model} ");
+    let terminal = get(core, args)?;
+    let confirmations_before = codex_model_confirmations(
+        terminal.screen.lock().unwrap().screen(),
+        &confirmation,
+        effort,
+    );
+    submit_chat_input(core, args, &command, &command, |terminal, revision| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            {
+                let screen = terminal.screen.lock().unwrap();
+                let input = terminal.input.lock().unwrap();
+                if terminal.exited.load(Ordering::SeqCst) || input.revision != revision {
+                    bail!("Terminal değişti; ajan hazır olunca yeniden seç");
+                }
+                let screen = screen.screen();
+                if empty_codex_prompt(screen)
+                    && codex_model_confirmations(screen, &confirmation, effort)
+                        > confirmations_before
+                {
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                bail!("Codex model değişikliğini doğrulamadı. Terminali kontrol et.");
+            }
+            std::thread::sleep(Duration::from_millis(35));
+        }
+    })
+}
+
+pub(crate) fn apply_copilot_approval(core: &Core, args: &Value, mode: &str) -> Result<()> {
+    let (option, label) = if mode == "auto" {
+        ("assisted", "assisted approval")
+    } else {
+        ("default", "manual approval")
+    };
+    let command = format!("/permissions {option}");
+    submit_chat_input(core, args, &command, &command, |terminal, revision| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            {
+                let parser = terminal.screen.lock().unwrap();
+                let input = terminal.input.lock().unwrap();
+                if terminal.exited.load(Ordering::SeqCst) || input.revision != revision {
+                    bail!("Terminal değişti; ajan hazır olunca yeniden seç");
+                }
+                let screen = parser.screen();
+                if provider_composer(screen).is_some_and(|(draft, footer)| {
+                    draft.trim().is_empty() && footer.contains(label)
+                }) {
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                bail!("Sağlayıcı onay değişikliğini doğrulamadı.");
+            }
+            std::thread::sleep(Duration::from_millis(35));
+        }
+    })
+}
+
+fn codex_model_confirmations(screen: &vt100::Screen, prefix: &str, effort: Option<&str>) -> usize {
+    let rows = screen.rows(0, screen.size().1).collect::<Vec<_>>();
+    let matches = |line: &str| {
+        line.trim()
+            .strip_prefix(prefix)
+            .and_then(|text| text.strip_suffix(" for this session only"))
+            .is_some_and(|value| effort.is_none_or(|expected| value == expected))
+    };
+    rows.iter()
+        .enumerate()
+        .filter(|(index, line)| {
+            matches(line)
+                || (line.trim_start().starts_with("• Model changed to ")
+                    && rows
+                        .get(index + 1)
+                        .is_some_and(|next| matches(&format!("{} {}", line.trim(), next.trim()))))
+        })
+        .count()
+}
+
+fn submit_chat_input(
+    core: &Core,
+    args: &Value,
+    text: &str,
+    data: &str,
+    confirm: impl FnOnce(&LiveTerminal, u64) -> Result<()>,
+) -> Result<()> {
+    let guard = core.operations.lock().unwrap();
+    let id = string(args, "id")?;
+    let s = core.session(id)?;
+    if s["login"] == true || s["archived"] == true {
+        bail!("Sohbet bu oturumda kullanılamıyor.");
+    }
+    let _ = string(args, "runId")?;
+    let terminal = get(core, args)?;
+    if !chat_thread_matches(&terminal, &s)
+        || s["workspaceKind"] == "direct" && s["conversationId"].is_null()
+    {
+        bail!("Bu konuşmayı Terminal görünümünde bağlayıp yeniden başlat.");
+    }
+    let screen = terminal.screen.lock().unwrap();
+    let mut input = terminal.input.lock().unwrap();
+    if terminal.exited.load(Ordering::SeqCst)
+        || input.chat_pasting
+        || input.chat_pending
+        || input.terminal_slash
+        || input.thread_uncertain
+        || args["inputRevision"].as_u64() != Some(input.revision)
+        || !provider_prompt_ready(screen.screen(), &terminal.provider)
+    {
+        bail!("Sağlayıcı hazır değil. Terminalde onay veya taslak olup olmadığına bak.");
+    }
+    let composer_row = screen.screen().cursor_position().0 as usize;
+    let indent = screen
+        .screen()
+        .rows(0, screen.screen().size().1)
+        .nth(composer_row)
+        .map_or(0, |line| line.len() - line.trim_start().len());
+    input.write(data.as_bytes())?;
+    input.chat_pasting = true;
+    let pasted_revision = input.revision;
+    drop(input);
+    drop(screen);
+    drop(guard);
+
+    let result = submit_chat_draft(core, args, id, text, indent, pasted_revision)
+        .and_then(|revision| confirm(&terminal, revision));
+    terminal.input.lock().unwrap().chat_pasting = false;
+    result
+}
+
+fn submit_chat_draft(
+    core: &Core,
+    args: &Value,
+    id: &str,
+    text: &str,
+    indent: usize,
+    pasted_revision: u64,
+) -> Result<u64> {
+    // Codex may treat Enter as part of the paste burst until the draft is rendered.
+    let timeout = if get(core, args)?.provider == "codex" {
+        2
+    } else {
+        8
+    };
+    let deadline = Instant::now() + Duration::from_secs(timeout);
+    std::thread::sleep(Duration::from_millis(150));
+    loop {
+        {
+            let _guard = core.operations.lock().unwrap();
+            let current = get(core, args)?;
+            let screen = current.screen.lock().unwrap();
+            let input = &mut *current.input.lock().unwrap();
+            if current.exited.load(Ordering::SeqCst)
+                || input.revision != pasted_revision
+                || input.thread_uncertain
+                || !chat_thread_matches(&current, &core.session(id)?)
+            {
+                bail!("Terminal değişti. Göndermeden önce terminaldeki taslağı kontrol et.");
+            }
+            let verified = if current.provider == "codex" {
+                codex_draft_visible(screen.screen(), text, indent)
+            } else {
+                provider_composer(screen.screen()).is_some_and(|(draft, _)| {
+                    draft
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .eq(text.chars().filter(|c| !c.is_whitespace()))
+                })
+            };
+            if verified {
+                input.write(b"\r")?;
+                input.chat_pending = true;
+                return Ok(input.revision);
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!("Sağlayıcı taslağı doğrulanamadı. Terminalden kontrol et.");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
     match action {
         "start" => start(core, string(args, "id")?),
@@ -740,7 +1322,37 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             }
         }
         "write" => {
-            get(core, args)?.write(string(args, "data")?.as_bytes())?;
+            let terminal = get(core, args)?;
+            let data = string(args, "data")?.as_bytes();
+            if matches!(terminal.provider.as_str(), "codex" | "claude" | "copilot") {
+                let screen = terminal.screen.lock().unwrap();
+                if terminal.exited.load(Ordering::SeqCst) {
+                    bail!("Oturum kapalı");
+                }
+                let composer_empty = provider_prompt_ready(screen.screen(), &terminal.provider);
+                let visible_draft = data
+                    .iter()
+                    .any(|byte| matches!(byte, b'\r' | b'\n'))
+                    .then(|| {
+                        if terminal.provider == "codex" {
+                            codex_composer_text(screen.screen())
+                        } else {
+                            provider_composer(screen.screen())
+                                .map(|(text, _)| text.trim().to_owned())
+                        }
+                    })
+                    .flatten();
+                let mut input = terminal.input.lock().unwrap();
+                if terminal.provider == "copilot"
+                    && ((composer_empty && matches!(data, b"\x1b[D" | b"\t"))
+                        || data.starts_with(b"\x1b[<0;"))
+                {
+                    input.thread_uncertain = true;
+                }
+                input.write_from_terminal(data, composer_empty, visible_draft.as_deref())?;
+            } else {
+                terminal.write(data)?;
+            }
             Ok(json!(true))
         }
         "resize" => resize_terminal(get(core, args)?.as_ref(), args),
@@ -756,9 +1368,121 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
 mod tests {
     use super::*;
     #[test]
+    fn chat_submission_frames_multiline_text_once_and_rejects_terminal_commands() {
+        #[cfg(windows)]
+        let expected = "\x1b[200~First\x1b[201~\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_\x1b[200~second\x1b[201~";
+        #[cfg(not(windows))]
+        let expected = "\x1b[200~First\nsecond\x1b[201~";
+        assert_eq!(chat_input("First\r\nsecond").unwrap(), expected);
+        for invalid in [
+            "",
+            " \n",
+            " /model",
+            "\t!dir",
+            "injected\x1b[201~",
+            "bypass\rnewline",
+        ] {
+            assert!(chat_input(invalid).is_err(), "{invalid:?}");
+        }
+    }
+    #[test]
+    fn chat_requires_an_idle_bracketed_codex_composer() {
+        let mut parser = vt100::Parser::new(10, 100, 0);
+        parser.process("› Ask Codex to do anything\x1b[1;3H".as_bytes());
+        assert!(!codex_prompt_ready(parser.screen()));
+        parser.process(b"\x1b[?2004h");
+        assert!(codex_prompt_ready(parser.screen()));
+        parser.process(b"\x1b[2;1HWorking (esc to interrupt)\x1b[1;3H");
+        assert!(!codex_prompt_ready(parser.screen()));
+        parser.process(
+            "\x1b[2J\x1b[H• Working (3s · esc to interrupt)\r\n› Ask Codex to do anything\x1b[2;3H"
+                .as_bytes(),
+        );
+        assert!(!codex_prompt_ready(parser.screen()));
+        parser.process("\x1b[2J\x1b[H› /resume".as_bytes());
+        assert_eq!(
+            codex_composer_text(parser.screen()).as_deref(),
+            Some("/resume")
+        );
+    }
+
+    #[test]
+    fn chat_ignores_activity_phrases_in_history_and_drafts() {
+        let mut parser = vt100::Parser::new(10, 100, 0);
+        parser.process(
+            "\x1b[?2004hThe message says update available\r\n› Ask Codex to do anything\x1b[2;3H"
+                .as_bytes(),
+        );
+        assert!(codex_prompt_ready(parser.screen()));
+        let draft = "Explain why it says do you trust";
+        parser.process(format!("\x1b[2;1H\x1b[2K› {draft}").as_bytes());
+        assert!(codex_draft_visible(parser.screen(), draft, 0));
+
+        parser.process(
+            format!("\x1b[2J\x1b[HAn update available\r\n─────────\r\n❯ {draft}\r\n─────────\r\nmanual approval")
+                .as_bytes(),
+        );
+        assert!(provider_composer(parser.screen()).is_some_and(|(actual, _)| actual == draft));
+        parser.process(b" \x1b[6;1HEsc to cancel");
+        assert!(provider_composer(parser.screen()).is_none());
+    }
+
+    #[test]
+    fn chat_recognizes_a_screenshot_path_wrapped_before_the_cursor() {
+        let mut parser = vt100::Parser::new(10, 30, 0);
+        let draft = "Read the screenshot in \"file.png\"";
+        parser.process(format!("\x1b[?2004h› {draft}").as_bytes());
+        let (row, col) = parser.screen().cursor_position();
+        assert_eq!(row, 1);
+        assert!(col > 0 && col < 8);
+        assert!(codex_draft_visible(parser.screen(), draft, 0));
+    }
+    #[test]
+    fn terminal_navigation_invalidates_chat_when_thread_may_have_changed() {
+        let mut input = TerminalInput {
+            writer: Box::new(Vec::new()),
+            revision: 0,
+            chat_pasting: false,
+            chat_pending: false,
+            terminal_slash: false,
+            thread_uncertain: false,
+        };
+        input.write_from_terminal(b"/", true, None).unwrap();
+        input
+            .write_from_terminal(b"\r", false, Some("/status"))
+            .unwrap();
+        assert!(!input.thread_uncertain);
+        input.write_from_terminal(b"\x1b[A", true, None).unwrap();
+        input
+            .write_from_terminal(b"\r", false, Some("Recalled prompt"))
+            .unwrap();
+        assert!(!input.thread_uncertain);
+        input.write_from_terminal(b"\x1b[A", true, None).unwrap();
+        input
+            .write_from_terminal(b"\r", false, Some("/resume"))
+            .unwrap();
+        assert!(input.thread_uncertain);
+    }
+    #[test]
+    fn recognizes_mcp_config_failure_before_any_conversation_started() {
+        let failure = b"\x1b[HError: \x1b[?25linvalid type: string \"[mcp,C:\\\\lease.json]\", expected a sequence\r\nin `mcp_servers.workflow.args`\x1b[5;1H";
+        assert!(is_codex_mcp_bootstrap_error(failure));
+        assert!(!is_codex_mcp_bootstrap_error(
+            b"Error: authentication failed"
+        ));
+        assert!(!is_codex_mcp_bootstrap_error(
+            &[
+                b"Earlier conversation\r\n",
+                failure.strip_prefix(b"\x1b[H").unwrap()
+            ]
+            .concat()
+        ));
+    }
+
+    #[test]
     fn login_never_receives_conversation_options() {
         for provider in ["codex", "claude", "copilot"] {
-            let session = json!({"id":"session-id","provider":provider,"login":true,"model":"chosen-model","effort":"high"});
+            let session = json!({"id":"session-id","provider":provider,"login":true,"model":"chosen-model","effort":"high","approvalMode":"auto"});
             let expected = if provider == "claude" {
                 vec!["auth", "login"]
             } else {
@@ -790,5 +1514,45 @@ mod tests {
             provider_arguments(&session, None).unwrap(),
             vec!["--session-id", "session-id", "--model", "chosen-model"]
         );
+    }
+
+    #[test]
+    fn launches_and_resumes_with_the_selected_approval_mode() {
+        for resume in [None, Some("conversation")] {
+            let codex = json!({"id":"session","provider":"codex","approvalMode":"auto"});
+            let args = provider_arguments(&codex, resume).unwrap();
+            assert!(args.ends_with(&[
+                "-a".into(),
+                "on-request".into(),
+                "-c".into(),
+                "approvals_reviewer='auto_review'".into(),
+            ]));
+            let codex = json!({"id":"session","provider":"codex","approvalMode":"manual"});
+            let args = provider_arguments(&codex, resume).unwrap();
+            assert!(args.ends_with(&[
+                "-a".into(),
+                "on-request".into(),
+                "-c".into(),
+                "approvals_reviewer='user'".into(),
+            ]));
+            for (mode, flag) in [
+                ("edits", "acceptEdits"),
+                ("manual", "default"),
+                ("plan", "plan"),
+                ("auto", "auto"),
+            ] {
+                let claude = json!({"id":"session","provider":"claude","approvalMode":mode});
+                assert!(provider_arguments(&claude, resume)
+                    .unwrap()
+                    .ends_with(&["--permission-mode".into(), flag.into()]));
+            }
+            for provider in ["codex", "claude"] {
+                let default = json!({"id":"session","provider":provider,"approvalMode":"default"});
+                let args = provider_arguments(&default, resume).unwrap();
+                assert!(!args
+                    .iter()
+                    .any(|arg| arg == "-a" || arg == "--permission-mode"));
+            }
+        }
     }
 }
