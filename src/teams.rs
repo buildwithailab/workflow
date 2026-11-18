@@ -417,3 +417,53 @@ pub async fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Va
         _ => bail!("Teams işlemi bulunamadı."),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn routes_existing_chat_links_without_reusing_arbitrary_query_parameters() {
+        let target = Target::parse(
+            "https://teams.microsoft.com/l/chat/48%3Anotes/conversations?message=other",
+        )
+        .unwrap();
+        assert_eq!(target.id, "48:notes");
+        assert!(!target.url.query_pairs().any(|(key, _)| key == "message"));
+        let target =
+            Target::parse("https://teams.cloud.microsoft/l/message/19%3Aabc%40thread.v2/123")
+                .unwrap();
+        assert_eq!(target.id, "19:abc@thread.v2");
+        assert_eq!(target.url.path(), "/l/chat/19:abc@thread.v2/conversations");
+    }
+
+    #[test]
+    fn rejects_lookalike_hosts_new_chats_and_channels() {
+        for link in [
+            "https://teams.microsoft.com.example.net/l/chat/48:notes/conversations",
+            "https://teams.microsoft.com/l/chat/0/0?users=someone",
+            "https://teams.microsoft.com/l/message/19:abc@thread.tacv2/123",
+            "https://teams.microsoft.com/l/chat/48%3Anotes%26id%3Dother/conversations",
+        ] {
+            assert!(Target::parse(link).is_err(), "{link}");
+        }
+    }
+
+    #[test]
+    fn authorizes_only_the_saved_chat_and_tenant() {
+        let saved = "https://teams.microsoft.com/l/chat/19%3Aabc%40thread.v2/conversations";
+        let same = "https://teams.cloud.microsoft/l/message/19:abc@thread.v2/123";
+        let other = "https://teams.microsoft.com/l/chat/19:def@thread.v2/conversations";
+        let tenant = format!("{same}?tenantId=00000000-0000-0000-0000-000000000001");
+        assert_eq!(
+            authorized_target(Some(saved), None).unwrap().id,
+            "19:abc@thread.v2"
+        );
+        assert!(authorized_target(Some(saved), Some(same)).is_ok());
+        assert!(authorized_target(Some(saved), Some(other)).is_err());
+        assert!(authorized_target(Some(saved), Some(&tenant)).is_err());
+        assert!(authorized_target(Some(&tenant), Some(same)).is_err());
+        assert!(authorized_target(None, Some(same)).is_err());
+        assert!(authorized_target(None, None).is_err());
+    }
+}

@@ -85,6 +85,68 @@ function button(text, fn, cls = "", title = "") {
   };
   return b;
 }
+const workspaceMenu = el("div", "workspace-action-menu");
+workspaceMenu.id = "workspace-action-menu";
+workspaceMenu.setAttribute("popover", "auto");
+workspaceMenu.setAttribute("role", "menu");
+document.body.append(workspaceMenu);
+let workspaceMenuAnchor;
+function positionWorkspaceMenu() {
+  if (!workspaceMenuAnchor?.isConnected) {
+    workspaceMenu.hidePopover();
+    return;
+  }
+  const anchor = workspaceMenuAnchor.getBoundingClientRect();
+  const { width, height } = workspaceMenu.getBoundingClientRect();
+  workspaceMenu.style.left = Math.max(8, Math.min(anchor.right - width, innerWidth - width - 8)) + "px";
+  const below = anchor.bottom + 4;
+  const above = anchor.top - height - 4;
+  const top = below + height > innerHeight - 8 && above >= 8 ? above : below;
+  workspaceMenu.style.top = Math.max(8, Math.min(top, innerHeight - height - 8)) + "px";
+}
+workspaceMenu.addEventListener("beforetoggle", (event) => {
+  if (event.newState !== "closed") return;
+  workspaceMenuAnchor?.setAttribute("aria-expanded", "false");
+  workspaceMenuAnchor = null;
+});
+workspaceMenu.onkeydown = (event) => {
+  if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+  const choices = [...workspaceMenu.querySelectorAll("button:not(:disabled)")];
+  const index = choices.indexOf(document.activeElement);
+  const next = event.key === "Home" ? 0 : event.key === "End" ? choices.length - 1
+    : (index + (event.key === "ArrowDown" ? 1 : -1) + choices.length) % choices.length;
+  event.preventDefault();
+  choices[next]?.focus();
+};
+function workspaceMenuButton(label, actions, cls) {
+  const trigger = button("⋯", () => {
+    const wasOpen = workspaceMenu.matches(":popover-open") && workspaceMenuAnchor === trigger;
+    workspaceMenu.hidePopover();
+    if (wasOpen) return;
+    const items = actions();
+    if (!items.length) return;
+    workspaceMenu.setAttribute("aria-label", label);
+    for (const item of items) {
+      item.setAttribute("role", "menuitem");
+      const select = item.onclick;
+      item.onclick = (event) => {
+        workspaceMenu.hidePopover();
+        return select(event);
+      };
+    }
+    workspaceMenu.replaceChildren(...items);
+    workspaceMenuAnchor = trigger;
+    trigger.setAttribute("aria-expanded", "true");
+    workspaceMenu.showPopover({ source: trigger });
+    positionWorkspaceMenu();
+    workspaceMenu.querySelector("button:not(:disabled)")?.focus();
+  }, cls, label);
+  trigger.setAttribute("aria-label", label);
+  trigger.setAttribute("aria-haspopup", "menu");
+  trigger.setAttribute("aria-expanded", "false");
+  trigger.setAttribute("aria-controls", workspaceMenu.id);
+  return trigger;
+}
 function error(e) {
   toast(tMessage(typeof e === "string" ? e : e?.message || String(e)), true);
 }
@@ -309,6 +371,14 @@ function folderOptions(pid) {
   return [{ id: "", label: tr("Genel") },
     ...foldersFor(pid).map((folder) => ({ id: folder.id, label: folder.name }))];
 }
+function sidebarFolders(pid) {
+  const visible = new Set();
+  const archived = new Set();
+  for (const s of db.sessions) {
+    if (s.projectId === pid) (s.archived ? archived : visible).add(s.folderId || "");
+  }
+  return folderOptions(pid).filter((folder) => visible.has(folder.id) || !archived.has(folder.id));
+}
 function folderLayoutKey(project = projectId, folder = folderId) {
   return JSON.stringify([project, folder]);
 }
@@ -383,6 +453,10 @@ function render() {
   if (!project() || project()?.removed)
     selectScope(db.projects.find((p) => !p.removed)?.id || null, null);
   if (folderId !== knownFolder(projectId, folderId)) selectScope(projectId, null);
+  const folders = sidebarFolders(projectId);
+  if (folders.length && !folders.some((folder) => folder.id === (folderId || ""))) {
+    selectScope(projectId, folders[0].id);
+  }
   const sessions = visibleSessions();
   if (
     !sessions.some((s) => s.id === focusId)
@@ -456,6 +530,7 @@ function renderProjectRail() {
 }
 function renderSessionList() {
   const root = $("#project-sessions");
+  if (workspaceMenuAnchor && root.contains(workspaceMenuAnchor)) workspaceMenu.hidePopover();
   const focused = root.contains(document.activeElement) ? document.activeElement : null;
   const hasProject = !!project();
   $("#project-rules").hidden = $("#remove-project").hidden = $("#add-session-folder").hidden = !hasProject;
@@ -474,10 +549,15 @@ function renderSessionList() {
       stateBadge(s.id),
     );
     b.ondblclick = () => rename(s.id);
-    return b;
+    const row = el("div", "session-entry-row");
+    const options = workspaceMenuButton(tr("Oturum seçenekleri"), () => sessionMenu(s.id), "icon quiet session-entry-options");
+    options.dataset.sessionOptions = s.id;
+    row.append(b, options);
+    return row;
   });
-  root.replaceChildren(...folderOptions(projectId).map((folder) => {
+  root.replaceChildren(...sidebarFolders(projectId).map((folder) => {
     const key = folder.id || null;
+    const count = sessions.filter((session) => (session.folderId || null) === key).length;
     const selected = key === folderId;
     const expanded = selected && !collapsedSessionFolders.has(folderLayoutKey(projectId, key));
     const group = el("section", "session-folder");
@@ -495,14 +575,21 @@ function renderSessionList() {
       chevron,
       el("span", "session-folder-icon"),
       el("span", "name", folder.label),
-      el("span", "folder-count", sessions.filter((session) => (session.folderId || null) === key).length),
+      el("span", "folder-count", count),
     );
     row.append(choose);
-    if (key && selected) {
-      const menu = button("⋯", () => folderMenu(key, folder.label), "icon quiet", tr("Klasör ayarları"));
-      menu.dataset.folderMenu = key;
-      menu.setAttribute("aria-label", tr("Klasör ayarları"));
-      row.append(menu);
+    if (selected && (count || key)) {
+      if (key) {
+        const menu = workspaceMenuButton(tr("Klasör ayarları"), () => folderMenu(key, folder.label), "icon quiet");
+        menu.dataset.folderMenu = folder.id;
+        row.append(menu);
+      } else {
+        const label = tr("Klasörü arşive taşı");
+        const archive = button("", () => {}, "icon quiet folder-archive-button", label);
+        archive.setAttribute("aria-label", label);
+        archive.onclick = busy(archive, () => archiveFolder(folder.label, folderMembers(null)));
+        row.append(archive);
+      }
     }
     children.hidden = !expanded;
     if (expanded)
@@ -511,9 +598,10 @@ function renderSessionList() {
     return group;
   }));
   if (focused) {
-    const { sessionId, folderId, folderMenu } = focused.dataset;
+    const { sessionId, sessionOptions, folderId, folderMenu } = focused.dataset;
     [...root.querySelectorAll("button")].find((b) =>
       (sessionId !== undefined && b.dataset.sessionId === sessionId) ||
+      (sessionOptions !== undefined && b.dataset.sessionOptions === sessionOptions) ||
       (folderId !== undefined && b.dataset.folderId === folderId) ||
       (folderMenu !== undefined && b.dataset.folderMenu === folderMenu),
     )?.focus({ preventScroll: true });
@@ -580,10 +668,16 @@ function folderNameDialog(key = null, name = "") {
   fieldName.focus();
 }
 
+function folderMembers(key) {
+  return projectSessions().filter((s) => (s.folderId || null) === key);
+}
+
 function folderMenu(key, name) {
   const pid = projectId;
-  modal(name, [
+  const members = folderMembers(key);
+  return [
     button(tr("Klasörü yeniden adlandır"), () => folderNameDialog(key, name)),
+    ...(members.length ? [button(tr("Klasörü arşive taşı"), () => archiveFolder(name, members))] : []),
     button(tr("Klasörü kaldır"), () => modal(tr("Klasörü kaldır"),
       el("p", "help", tr("Oturumlar Genel klasörüne taşınacak.")), async () => {
         await api("app", "folder_remove", { projectId: pid, folderId: key });
@@ -591,7 +685,59 @@ function folderMenu(key, name) {
         await sync();
         if (pid === projectId) selectFolder(null);
       }, tr("Kaldır"))),
-  ]);
+  ];
+}
+
+async function archiveFolder(name, members) {
+  if (!members.length) return;
+  const state = await api("app", "state");
+  const runs = await Promise.all(members.map((member) => archiveProcesses(member, state)));
+  if (runs.some(({ terminal, preview }) => terminal || preview)) {
+    folderArchiveDialog(name, members, true);
+  } else {
+    await applyFolderArchive(members, true);
+  }
+}
+
+function folderArchiveDialog(name, members, archive) {
+  const title = tr(archive ? "Klasörü arşive taşı" : "Klasörü geri getir");
+  const description = archive
+    ? tr("Bu klasördeki {count} oturum arşivlenecek. Çalışan terminaller ve önizlemeler durdurulacak. Workflow’un oluşturduğu çalışma klasörleri de taşınacak.", { count: members.length })
+    : tr("Bu klasördeki {count} oturum kendi projesine geri getirilecek.", { count: members.length });
+  modal(title + " · " + name, el("p", "help", description),
+    () => applyFolderArchive(members, archive, archive), title);
+}
+
+async function applyFolderArchive(members, archive, stop = false) {
+  const failures = [];
+  let changed = 0;
+  const owner = db.projects.find((p) => p.id === members[0].projectId);
+  if (!archive && owner?.removed) await api("app", "add_project", { directory: owner.directory });
+  for (const member of members) {
+    try {
+      const state = await api("app", "state");
+      const current = state.sessions.find((s) => s.id === member.id && s.projectId === member.projectId
+        && (s.folderId || null) === (member.folderId || null));
+      if (!current) throw Error(tr("Oturum artık bu klasörde değil."));
+      if (!!current.archived === archive) continue;
+      if (stop) {
+        const { terminal, preview } = await archiveProcesses(current, state);
+        await stopArchiveProcesses(current.id, terminal, preview);
+      }
+      await api("app", "session_patch", { id: current.id, archived: archive });
+      changed++;
+    } catch (err) {
+      failures.push(member.name + " · " + uiError(err));
+    }
+  }
+  await sync();
+  refreshPanel().catch(error);
+  if (failures.length) {
+    const summary = tr("{count} oturum taşındı. Şu oturumlar taşınamadı.", { count: changed });
+    throw Error([summary, ...failures].join("\n"));
+  }
+  if (!archive) selectSession(members[0].id);
+  toast(tr(archive ? "Klasördeki oturumlar arşive taşındı." : "Klasördeki oturumlar geri getirildi."));
 }
 $("#add-session-folder").onclick = () => folderNameDialog();
 
@@ -1222,7 +1368,7 @@ function createCard(s, index) {
     agentBadge,
     model,
     preview,
-    button("⋯", () => sessionMenu(s.id), "icon", tr("Oturum seçenekleri")),
+    workspaceMenuButton(tr("Oturum seçenekleri"), () => sessionMenu(s.id), "icon"),
     link,
     state,
     control,
@@ -1577,37 +1723,70 @@ async function toggleTerminal(id) {
     await sync();
   }
 }
-async function archiveSession(id) {
-  if (active(id)) {
-    modal(
-      tr("Oturumu arşivle"),
-      el(
-        "p",
-        "help",
-        tr("Önce bu oturumun terminalini durdur. Konuşma ve çalışma alanı arşivde korunur."),
-      ),
-      async () => {
-        await api("terminal", "stop", { id, runId: views.get(id)?.runId });
-        await new Promise((r) => setTimeout(r, 800));
-        await api("app", "session_patch", { id, archived: true });
-        await sync();
-      },
-      tr("Durdur ve arşivle"),
-    );
+function hasUnmovedArchive(s) {
+  return s.archived && !s.archivedFromDirectory && ["worktree", "copy"].includes(s.workspaceKind);
+}
+
+async function archiveProcesses(selected, state) {
+  const id = selected.id;
+  if (starting.has(id)) throw Error(tr("Oturum açılıyor. Biraz sonra tekrar dene."));
+  const preview = selected.preview || previews[id] ? await api("preview", "status", { sessionId: id }) : null;
+  return {
+    terminal: state.active.find((run) => run.id === id),
+    preview: ["starting", "ready"].includes(preview?.state) ? preview : null,
+  };
+}
+
+async function stopArchiveProcesses(id, terminal, preview) {
+  if (preview) await api("preview", "stop", { sessionId: id, runId: preview.runId });
+  if (!terminal) return;
+  await api("terminal", "stop", { id, runId: terminal.runId });
+  const deadline = Date.now() + 5000;
+  while ((await api("app", "state")).active.some((run) => run.runId === terminal.runId)) {
+    if (Date.now() >= deadline) throw Error(tr("Terminal henüz durmadı. Durduktan sonra tekrar dene."));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+async function archiveSession(id, fromHistory = false) {
+  const selected = session(id);
+  if (!selected || (selected.archived && !hasUnmovedArchive(selected))) return;
+  const dialog = $("#dialog");
+  const origin = dialog.open && $("#dialog-body").firstElementChild;
+  const { terminal, preview } = await archiveProcesses(selected, await api("app", "state"));
+  const save = async () => {
+    await api("app", "session_patch", { id, archived: true });
+    await sync();
+    refreshPanel().catch(error);
+    toast(tr("Oturum arşive taşındı."));
+  };
+  if (!terminal && !preview) {
+    await save();
+    if (origin && dialog.open && $("#dialog-body").firstElementChild === origin) {
+      if (fromHistory) archiveList();
+      else closeModal();
+    }
     return;
   }
-  await api("app", "session_patch", { id, archived: true });
-  await sync();
+  modal(
+    tr("Oturumu arşivle") + " · " + selected.name,
+    el("p", "help", tr("Bu oturumun çalışan terminali ve varsa açık önizlemesi durdurulacak. Konuşma ve çalışma alanı arşivde korunur.")),
+    async () => {
+      await stopArchiveProcesses(id, terminal, preview);
+      await save();
+    },
+    tr("Durdur ve arşivle"),
+  );
 }
-async function sessionMenu(id) {
-  const s = session(id),
-    box = el("div"),
-    bind = button(tr("Konuşma seç / doğrula"), () => bindHistory(id));
+function sessionMenu(id) {
+  const s = session(id);
+  if (!s || s.archived) return [];
+  const bind = button(tr("Konuşma seç / doğrula"), () => bindHistory(id));
   if (active(id) && s.conversationId) {
     bind.disabled = true;
     bind.title = tr("Konuşmayı değiştirmek için önce oturumu durdur");
   }
-  box.append(
+  return [
     button(tr("Konuşma geçmişini oku"), () => showTranscript(id)),
     bind,
     ...(foldersFor(s.projectId).length ? [button(tr("Klasöre taşı"), () => moveSessionDialog(s))] : []),
@@ -1626,7 +1805,11 @@ async function sessionMenu(id) {
     button(tr("Çalışma klasörünü aç"), () =>
       api("app", "reveal", { sessionId: id }),
     ),
-  );
+    button(tr("Oturum bilgileri"), () => showSessionInfo(s)),
+    button(tr("Arşive taşı"), () => archiveSession(id)),
+  ];
+}
+function showSessionInfo(s) {
   const details = el(
     "p",
     "help",
@@ -1637,12 +1820,15 @@ async function sessionMenu(id) {
           ? tr("Konuşma seç / doğrula ile bağla")
           : tr("İlk mesajdan sonra kaydedilir"))),
   );
-  box.append(details);
-  modal(s.name, box);
+  modal(tr("Oturum bilgileri") + " · " + s.name, details);
 }
-async function showTranscript(id) {
+async function showTranscript(id, fromHistory = false) {
   const result = await api("history", "messages", { id });
   const box = el("div");
+  if (fromHistory) box.append(button(tr("Oturum geçmişine dön"), archiveList, "history-back"));
+  if (session(id)?.archivedFromDirectory) {
+    box.append(button(tr("Arşiv klasörünü aç"), () => api("app", "reveal", { sessionId: id }), "history-back"));
+  }
   for (const m of result.messages) {
     const row = el("article", "transcript-message " + m.role);
     row.append(
@@ -2794,25 +2980,83 @@ async function sessionAddons(id) {
     await sync();
   });
 }
-async function archiveList() {
+function archiveList() {
   const box = el("div");
-  for (const s of db.sessions.filter((s) => s.archived)) {
+  box.id = "session-history";
+  const projects = new Map(db.projects.map((p) => [p.id, p]));
+  const running = new Set(db.active.map((run) => run.id));
+  const order = (s) => s.lastUsedAt || s.createdAt || "";
+  const sessions = [...db.sessions].sort((a, b) => order(b).localeCompare(order(a)));
+  const group = (label, rows, empty, expanded = true) => {
+    const section = el("details", "session-history-group");
+    section.open = expanded;
+    const heading = el("summary", "", tr(label));
+    heading.append(el("span", "folder-count", rows.length));
+    section.append(heading);
+    if (!rows.length) section.append(el("p", "help", tr(empty)));
+    return section;
+  };
+  const sessionRow = (s, grouped = false) => {
+    const owner = projects.get(s.projectId);
     const row = el("div", "archive-row");
-    row.append(
-      el("span", "", s.name + " · " + names[s.provider]),
-      button(tr("Geçmiş"), () => showTranscript(s.id)),
-      button(tr("Geri getir"), async () => {
-        await api("app", "session_patch", { id: s.id, archived: false });
-        closeModal();
-        await sync();
-        selectSession(s.id);
-      }),
-    );
-    box.append(row);
+    row.dataset.sessionId = s.id;
+    const title = el("span", "archive-session-label");
+    const context = grouped ? names[s.provider] : [owner?.name, names[s.provider]].filter(Boolean).join(" · ");
+    title.append(el("strong", "", s.name), el("small", "", context));
+    const action = button(tr(s.archived ? "Geri getir" : "Arşive taşı"), () => {});
+    action.onclick = busy(action, async () => {
+      if (!s.archived) {
+        await archiveSession(s.id, true);
+        return;
+      }
+      if (owner?.removed) await api("app", "add_project", { directory: owner.directory });
+      await api("app", "session_patch", { id: s.id, archived: false });
+      closeModal();
+      await sync();
+      selectSession(s.id);
+    });
+    row.append(title, button(tr("Geçmiş"), () => showTranscript(s.id, true)), action);
+    if (hasUnmovedArchive(s)) {
+      const move = button(tr("Klasörü arşive taşı"), () => {}, "legacy-archive-move");
+      move.onclick = busy(move, () => archiveSession(s.id, true));
+      row.append(move);
+    }
+    return row;
+  };
+  const archived = sessions.filter((s) => s.archived);
+  const archive = group("Arşiv", archived, "Arşivlenmiş oturum yok.");
+  archive.dataset.historyGroup = "archive";
+  const byFolder = new Map();
+  for (const s of archived) {
+    const key = folderLayoutKey(s.projectId, s.folderId || null);
+    if (!byFolder.has(key)) byFolder.set(key, []);
+    byFolder.get(key).push(s);
   }
-  if (!box.childNodes.length)
-    box.append(el("p", "help", tr("Arşivlenmiş oturum yok.")));
-  modal(tr("Geçmiş oturumlar"), box);
+  for (const members of byFolder.values()) {
+    const first = members[0];
+    const folder = folderOptions(first.projectId).find((item) => item.id === (first.folderId || ""));
+    const name = folder?.label || tr("Genel");
+    const owner = projects.get(first.projectId);
+    const detail = el("details", "archive-folder-group");
+    detail.open = true;
+    const heading = el("summary", "", [owner?.name, name].filter(Boolean).join(" · "));
+    heading.append(el("span", "folder-count", members.length));
+    detail.append(heading,
+      button(tr("Klasörü geri getir"), () => folderArchiveDialog(name, members, false), "archive-folder-restore"),
+      ...members.map((s) => sessionRow(s, true)));
+    archive.append(detail);
+  }
+  const closed = sessions.filter((s) => !s.archived && !running.has(s.id));
+  const closedGroup = group("Kapalı oturumlar", closed, "Kapalı oturum yok.");
+  closedGroup.append(...closed.map((s) => sessionRow(s)));
+  const open = sessions.filter((s) => !s.archived && running.has(s.id));
+  box.append(archive, closedGroup);
+  if (open.length) {
+    const openGroup = group("Açık oturumlar", open, "", false);
+    openGroup.append(...open.map((s) => sessionRow(s)));
+    box.append(openGroup);
+  }
+  modal(tr("Oturum geçmişi"), box);
 }
 function editTemplate(entry, projectId, destinationId) {
   const template = entry.template;
@@ -3030,7 +3274,7 @@ $("#manage-session-templates").onclick = () => {
 };
 $("#add-project").onclick = () => newProject().catch(error);
 $("#addons").onclick = () => addonLibrary().catch(error);
-$("#archive").onclick = () => archiveList().catch(error);
+$("#archive").onclick = archiveList;
 $("#refresh").onclick = busy($("#refresh"), async () => {
   await scanProviders();
   await sync();
@@ -4940,8 +5184,12 @@ async function initialize() {
   }
   window.addEventListener("resize", () => {
     if (templateMenu.matches(":popover-open")) positionTemplateMenu();
+    if (workspaceMenu.matches(":popover-open")) positionWorkspaceMenu();
     fitTerminals();
     scheduleViewport();
+  });
+  $("#project-sessions").addEventListener("scroll", () => {
+    if (workspaceMenu.matches(":popover-open")) positionWorkspaceMenu();
   });
   new ResizeObserver(scheduleViewport).observe($("#browser-surface"));
   new ResizeObserver(() => {

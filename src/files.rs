@@ -22,7 +22,9 @@ pub(crate) fn preview_content(path: &Path, bytes: &[u8]) -> Result<Value> {
     if let Some(mime) = mime {
         Ok(json!({"image":format!("data:{mime};base64,{}",B64.encode(bytes))}))
     } else {
-        Ok(json!({"text":std::str::from_utf8(bytes).context("İkili dosya önizlenemiyor")?,"hash":hash(bytes)}))
+        Ok(
+            json!({"text":std::str::from_utf8(bytes).context("İkili dosya önizlenemiyor")?,"hash":hash(bytes)}),
+        )
     }
 }
 
@@ -49,10 +51,7 @@ pub fn blob(core: &Core, key: &Value) -> Result<Option<Vec<u8>>> {
 }
 pub fn baseline(core: &Core, id: &str) -> Result<Value> {
     Ok(serde_json::from_slice(&fs::read(
-        core.directory
-            .join("workspaces")
-            .join(id)
-            .join("baseline.json"),
+        crate::workspace_archive::slot(&core.directory, &core.session(id)?)?.join("baseline.json"),
     )?)?)
 }
 fn checkout(root: &Path) -> Option<String> {

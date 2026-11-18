@@ -69,7 +69,6 @@ fn list(core: &Core, session: &Value) -> Result<Vec<Value>> {
     let provider = string(session, "provider")?;
     let directory = string(session, "directory")?;
     let canonical = Path::new(directory).canonicalize().ok();
-    let legacy = session["previousDirectory"].as_str();
     let profile = Profile::get(core, provider, &session["accountId"])?;
     let mut out = logs(provider, &profile)
         .iter()
@@ -77,7 +76,7 @@ fn list(core: &Core, session: &Value) -> Result<Vec<Value>> {
         .filter(|m| {
             m["cwd"]
                 .as_str()
-                .is_some_and(|cwd| matches_directory(cwd, canonical.as_deref(), legacy))
+                .is_some_and(|cwd| matches_session_directory(cwd, canonical.as_deref(), session))
         })
         .collect::<Vec<_>>();
     out.sort_by(|a, b| b["createdAt"].as_str().cmp(&a["createdAt"].as_str()));
@@ -100,6 +99,13 @@ fn matches_directory(cwd: &str, current: Option<&Path>, previous: Option<&str>) 
         return true;
     }
     current.is_some_and(|directory| cwd.canonicalize().is_ok_and(|path| path == directory))
+}
+
+fn matches_session_directory(cwd: &str, current: Option<&Path>, session: &Value) -> bool {
+    matches_directory(cwd, current, session["previousDirectory"].as_str())
+        || session["archivedFromDirectory"]
+            .as_str()
+            .is_some_and(|directory| matches_directory(cwd, None, Some(directory)))
 }
 
 pub(crate) fn bound_log(core: &Core, session: &Value, thread: &str) -> Result<Option<PathBuf>> {
@@ -133,11 +139,7 @@ pub(crate) fn matches_bound_log(path: &Path, session: &Value, thread: &str) -> b
                 let current = session["directory"]
                     .as_str()
                     .and_then(|dir| Path::new(dir).canonicalize().ok());
-                matches_directory(
-                    cwd,
-                    current.as_deref(),
-                    session["previousDirectory"].as_str(),
-                )
+                matches_session_directory(cwd, current.as_deref(), session)
             })
     })
 }

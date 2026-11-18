@@ -348,7 +348,9 @@ async fn call(core: &Arc<Core>, source: &str, method: &str, mut args: Value) -> 
             link(core, source, target, "files")?;
             let scope = json!({"sessionId":target});
             let root = core.root(&scope)?;
-            let project = core.root(&json!({"projectId":core.session(target)?["projectId"]}))?.canonicalize()?;
+            let project = core
+                .root(&json!({"projectId":core.session(target)?["projectId"]}))?
+                .canonicalize()?;
             if let Some(paths) = args.get("paths") {
                 let paths = paths.as_array().context("Dosya yolları liste olmalı")?;
                 if paths.len() > 20 {
@@ -374,7 +376,11 @@ async fn call(core: &Arc<Core>, source: &str, method: &str, mut args: Value) -> 
                 let mut visible = Vec::new();
                 for change in changes {
                     let relative = string(&change, "path")?;
-                    if crate::sharing::project_path_blocked(&root, &project, std::path::Path::new(relative))? {
+                    if crate::sharing::project_path_blocked(
+                        &root,
+                        &project,
+                        std::path::Path::new(relative),
+                    )? {
                         continue;
                     }
                     // A renamed or deleted file may still have a sensitive baseline.
@@ -383,7 +389,9 @@ async fn call(core: &Arc<Core>, source: &str, method: &str, mut args: Value) -> 
                             continue;
                         }
                     }
-                    if change["after"].is_string() && crate::sharing::read_shared(&root, &project, relative).is_err() {
+                    if change["after"].is_string()
+                        && crate::sharing::read_shared(&root, &project, relative).is_err()
+                    {
                         continue;
                     }
                     visible.push(change);
@@ -450,6 +458,30 @@ async fn call(core: &Arc<Core>, source: &str, method: &str, mut args: Value) -> 
 mod tests {
     use super::*;
     #[test]
+    fn codex_mcp_array_preserves_paths_through_windows_shims() {
+        let command = r"C:\My Project\Workflow.exe";
+        let lease = r"C:\O'Brien & %USER%\İ.json";
+        let native = codex_configuration(command, lease, false);
+        let native_args = native[3]
+            .strip_prefix("mcp_servers.workflow.args=")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(native_args).unwrap(),
+            json!(["mcp", lease])
+        );
+
+        let shim = codex_configuration(command, lease, true);
+        assert_eq!(
+            shim[1],
+            r#"mcp_servers.workflow.command=\"C:\u005cMy\u0020Project\u005cWorkflow.exe\""#
+        );
+        assert_eq!(
+            shim[3],
+            r#"mcp_servers.workflow.args=[\"mcp\",\"C:\u005cO\u0027Brien\u0020\u0026\u0020\u0025USER\u0025\u005c\u0130.json\"]"#
+        );
+    }
+
+    #[test]
     fn token_comparison() {
         assert!(constant_eq("abc", "abc"));
         assert!(!constant_eq("abc", "abcd"));
@@ -462,5 +494,35 @@ mod tests {
             .unwrap()
             .iter()
             .all(|v| v["inputSchema"]["type"] == "object"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn teams_requires_a_message_and_accepts_an_optional_link() {
+        let catalog = tools();
+        let tool = catalog
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "teams_send_message")
+            .unwrap();
+        assert_eq!(tool["inputSchema"]["required"], json!(["text"]));
+        assert_eq!(tool["inputSchema"]["properties"]["link"]["type"], "string");
+        assert_eq!(tool["annotations"]["idempotentHint"], false);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn teams_open_exposes_no_chat_or_message_parameters() {
+        let catalog = tools();
+        let tool = catalog
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "teams_open")
+            .unwrap();
+        assert_eq!(tool["inputSchema"]["properties"], json!({}));
+        assert_eq!(tool["inputSchema"]["required"], json!([]));
+        assert_eq!(tool["annotations"]["destructiveHint"], false);
     }
 }

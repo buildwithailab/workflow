@@ -784,6 +784,185 @@ async function testPendingChatInteraction() {
   console.log("PASS clickable Chat choices for text and native menus, stale choice rejection, approval display and fallback for all three providers");
 }
 
+async function testArchiveStorage() {
+  const profile = path.join(temporary, "archive-storage-profile");
+  const source = path.join(temporary, "archive-source");
+  const repository = path.join(temporary, "archive-repository");
+  const nested = path.join(repository, "component");
+  fs.mkdirSync(source);
+  fs.mkdirSync(nested, { recursive: true });
+  fs.writeFileSync(path.join(source, "source.txt"), "original workspace\n");
+  fs.writeFileSync(path.join(nested, "tracked.txt"), "initial state\n");
+  const git = (directory, ...args) => cp.execFileSync("git", args, {
+    cwd: directory, encoding: "utf8", windowsHide: true,
+  }).trim();
+  git(repository, "init");
+  git(repository, "add", ".");
+  git(repository, "-c", "user.name=Workflow Test", "-c", "user.email=test@localhost",
+    "commit", "-m", "Initial archive test");
+
+  await start("", profile);
+  const skip = page.locator("#dialog").getByRole("button", { name: "Skip", exact: true });
+  if (await skip.isVisible()) await skip.click();
+  const plain = await api("app", "add_project", { directory: source });
+  const project = await api("app", "add_project", { directory: nested });
+  const makeSession = (projectId, workspaceMode) =>
+    api("app", "create_session", { projectId, provider: "codex", workspaceMode, tools: false });
+  const copy = await makeSession(plain.id, "isolated");
+  const worktree = await makeSession(project.id, "isolated");
+  const direct = await makeSession(plain.id, "direct");
+  assert.equal(copy.workspaceKind, "copy");
+  assert.equal(worktree.workspaceKind, "worktree");
+  const slot = (s, archived) => path.join(profile, archived ? "archive" : "workspaces", s.id);
+  const change = (s, archived) => api("app", "session_patch", { id: s.id, archived });
+  const assertLocations = (s, archived) => {
+    assert(fs.existsSync(path.join(slot(s, archived), "baseline.json")));
+    assert(!fs.existsSync(slot(s, !archived)), "only one managed folder may exist");
+  };
+  const copyArchive = slot(copy, true);
+  fs.mkdirSync(copyArchive, { recursive: true });
+  await assert.rejects(change(copy, true), /oturum klasörü zaten var/);
+  assert(fs.existsSync(copy.directory));
+  assert(fs.existsSync(copyArchive));
+  fs.rmdirSync(copyArchive);
+  fs.writeFileSync(path.join(copy.directory, "copy-only.txt"), "preserved file\n");
+  fs.writeFileSync(path.join(worktree.directory, "tracked.txt"), "staged edit\n");
+  git(worktree.directory, "add", "tracked.txt");
+  fs.writeFileSync(path.join(worktree.directory, "tracked.txt"), "unstaged edit\n");
+  fs.writeFileSync(path.join(worktree.directory, "untracked.txt"), "preserved too\n");
+  const originalStatus = git(worktree.directory, "status", "--porcelain");
+  const originalAdmin = git(worktree.directory, "rev-parse", "--absolute-git-dir");
+  const originalBranch = git(worktree.directory, "branch", "--show-current");
+  const root = git(worktree.directory, "rev-parse", "--show-toplevel");
+  git(repository, "worktree", "lock", root);
+  await assert.rejects(change(worktree, true), /worktree kilitli/);
+  assertLocations(worktree, false);
+  git(repository, "worktree", "unlock", root);
+  const logs = path.join(profile, "test-codex-home", "sessions");
+  fs.mkdirSync(logs, { recursive: true });
+  fs.writeFileSync(path.join(logs, "rollout-archive-fixture.jsonl"), [
+    { type: "session_meta", payload: { id: "archive-fixture", cwd: worktree.directory, timestamp: new Date().toISOString() } },
+    { type: "response_item", payload: { role: "assistant", content: [{ text: "Archive history fixture" }] } },
+  ].map(JSON.stringify).join("\n") + "\n");
+  await api("history", "bind", { id: worktree.id, conversationId: "archive-fixture" });
+
+  const archivedDirect = await change(direct, true);
+  assert.equal(archivedDirect.directory, direct.directory);
+  assert.equal(fs.readFileSync(path.join(source, "source.txt"), "utf8"), "original workspace\n");
+  const archivedCopy = await change(copy, true);
+  assertLocations(copy, true);
+  assert.equal(fs.readFileSync(path.join(archivedCopy.directory, "copy-only.txt"), "utf8"), "preserved file\n");
+  const archivedTree = await change(worktree, true);
+  assertLocations(worktree, true);
+  assert.equal(archivedTree.archivedFromDirectory, worktree.directory);
+  assert.equal(fs.realpathSync(archivedTree.directory), fs.realpathSync(path.join(slot(worktree, true), "files", "component")));
+  assert.equal(git(archivedTree.directory, "status", "--porcelain"), originalStatus);
+  assert.equal(git(archivedTree.directory, "rev-parse", "--absolute-git-dir"), originalAdmin);
+  assert.equal(git(archivedTree.directory, "branch", "--show-current"), originalBranch);
+  assert.match((await api("history", "messages", { id: worktree.id })).messages[0].text, /Archive history fixture/);
+
+  assert.equal((await change(copy, false)).directory, copy.directory);
+  assertLocations(copy, false);
+  assert.equal((await change(worktree, false)).directory, worktree.directory);
+  assertLocations(worktree, false);
+  assert.equal(git(worktree.directory, "status", "--porcelain"), originalStatus);
+  const additional = await makeSession(plain.id, "isolated");
+  const activeRun = await api("terminal", "start", { id: additional.id });
+  pids.push(activeRun.pid);
+  const dialog = page.locator("#dialog");
+  const sidebar = page.locator("#project-sessions");
+  const menu = page.locator("#workspace-action-menu");
+  const archiveFolder = async (folderId) => {
+    await sidebar.locator('[data-folder-menu="' + folderId + '"]').click();
+    await menu.getByRole("menuitem", { name: "Move folder to archive", exact: true }).click();
+  };
+  const restoreFolder = async () => {
+    await page.locator("#archive").click();
+    const group = page.locator(".archive-folder-group").filter({
+      has: page.locator('.archive-row[data-session-id="' + copy.id + '"]'),
+    });
+    await group.getByRole("button", { name: "Restore folder", exact: true }).click();
+    await dialog.getByRole("button", { name: "Restore folder", exact: true }).click();
+    await dialog.waitFor({ state: "hidden" });
+  };
+  const selectCopy = () => page.evaluate(async id => {
+    await window.workflow.refresh();
+    window.workflow.selectSession(id);
+  }, copy.id);
+  await selectCopy();
+  const generalArchive = sidebar.getByRole("button", { name: "Move folder to archive", exact: true });
+  await generalArchive.click();
+  await dialog.getByRole("button", { name: "Move folder to archive", exact: true }).click();
+  await dialog.waitFor({ state: "hidden" });
+  assert((await api("terminal", "attach", { id: additional.id })).exited);
+  await sidebar.locator('[data-folder-id=""]').waitFor({ state: "hidden" });
+  assertLocations(copy, true);
+  assertLocations(additional, true);
+  await restoreFolder();
+  await sidebar.locator('[data-folder-id=""]').waitFor();
+  assertLocations(copy, false);
+  assertLocations(additional, false);
+  await generalArchive.click();
+  await sidebar.locator('[data-folder-id=""]').waitFor({ state: "hidden" });
+  assert(await dialog.isHidden(), "a closed General folder archives directly");
+  assertLocations(copy, true);
+  assertLocations(additional, true);
+  await restoreFolder();
+
+  const topic = await api("app", "folder_create", { projectId: plain.id, name: "Archive test topic" });
+  for (const s of [copy, additional]) {
+    await api("app", "folder_move_session", { projectId: plain.id, folderId: topic.id, id: s.id });
+  }
+  fs.mkdirSync(slot(additional, true), { recursive: true });
+  await selectCopy();
+  const folderTrigger = sidebar.locator('[data-folder-menu="' + topic.id + '"]');
+  await folderTrigger.click();
+  assert.equal(await folderTrigger.getAttribute("aria-expanded"), "true");
+  await page.keyboard.press("End");
+  assert.equal(await page.locator(":focus").textContent(), "Remove folder");
+  await page.keyboard.press("Escape");
+  await menu.waitFor({ state: "hidden" });
+  assert(await dialog.isHidden());
+  await archiveFolder(topic.id);
+  await page.locator("#toast span").filter({ hasText: /following sessions could not be moved/i }).waitFor();
+  assertLocations(copy, true);
+  assert(fs.existsSync(additional.directory));
+  fs.rmdirSync(slot(additional, true));
+  await archiveFolder(topic.id);
+  await sidebar.locator('[data-folder-id="' + topic.id + '"]').waitFor({ state: "hidden" });
+  await restoreFolder();
+  await sidebar.locator('[data-folder-id="' + topic.id + '"]').waitFor();
+  assertLocations(copy, false);
+  assertLocations(additional, false);
+  assert((await api("app", "state")).sessions.filter(s => [copy.id, additional.id].includes(s.id))
+    .every(s => s.folderId === topic.id && !s.archived));
+  await stop();
+
+  // Simulate an interrupted move before the workspace database was updated.
+  const journal = path.join(profile, "archive-transactions", worktree.id);
+  fs.writeFileSync(journal, JSON.stringify(fs.realpathSync(originalAdmin)));
+  const canonicalProfile = fs.realpathSync(profile);
+  assert.equal(path.dirname(fs.realpathSync(path.dirname(slot(worktree, false)))), canonicalProfile);
+  assert.equal(path.dirname(fs.realpathSync(path.dirname(slot(worktree, true)))), canonicalProfile);
+  fs.renameSync(slot(worktree, false), slot(worktree, true));
+  const db = path.join(profile, "workspace.json");
+  const previous = JSON.parse(fs.readFileSync(db, "utf8"));
+  previous.sessions.find(s => s.id === copy.id).archived = true;
+  fs.writeFileSync(db, JSON.stringify(previous));
+  await start("", profile);
+  assertLocations(worktree, false);
+  assert.equal(fs.existsSync(journal), false);
+  assert.equal(git(worktree.directory, "status", "--porcelain"), originalStatus);
+  await page.locator("#archive").click();
+  const legacy = page.locator('#session-history .archive-row[data-session-id="' + copy.id + '"]');
+  await legacy.getByRole("button", { name: "Move folder to archive" }).click();
+  await until(() => fs.existsSync(slot(copy, true)), "legacy archive folder moved");
+  await legacy.getByRole("button", { name: "Move folder to archive" }).waitFor({ state: "hidden" });
+  assertLocations(copy, true);
+  await stop();
+  console.log("PASS physical workspace archive and recovery, General and named folder archive and restore, and retry after a partial move");
+}
+
 async function test() {
   const git = (args) =>
     cp.execFileSync("git", args, {
@@ -865,6 +1044,7 @@ async function test() {
     await testCodexChat();
     await testAdditionalProviderChats();
     await testPendingChatInteraction();
+    await testArchiveStorage();
   }
   if (process.platform === "win32") await testCopilotNpm();
   const address = "http://127.0.0.1:" + server.address().port;
@@ -990,7 +1170,7 @@ async function test() {
   await page.getByRole("heading", { name: "Eklenti kütüphanesi", exact: true }).waitFor();
   await page.locator("#dialog-close").click();
   await page.locator(".rail-tools #archive").click();
-  await page.getByRole("heading", { name: "Geçmiş oturumlar", exact: true }).waitFor();
+  await page.getByRole("heading", { name: "Oturum geçmişi", exact: true }).waitFor();
   await page.locator("#dialog-close").click();
   assertPanelsFit(await widths());
   await page.locator("#toggle-left").click();
@@ -1415,7 +1595,7 @@ async function test() {
   await sessionList.locator('[data-session-id="' + sessions[0].id + '"]').click();
   await page.locator('[data-id="' + sessions[0].id + '"] .card-header')
     .getByTitle("Oturum seçenekleri").click();
-  await page.locator("#dialog").getByRole("button", { name: "Klasöre taşı" }).click();
+  await page.locator("#workspace-action-menu").getByRole("menuitem", { name: "Klasöre taşı" }).click();
   await page.locator("#dialog").getByLabel("Oturum klasörü").selectOption(folderId);
   await page.locator("#dialog").getByRole("button", { name: "Taşı", exact: true }).click();
   await until(async () => (await folderRow.getAttribute("aria-expanded")) === "true", "moved session opened in its folder");
@@ -1464,12 +1644,12 @@ async function test() {
   assert.equal(await activeTab.getAttribute("data-session-id"), sessions[1].id);
   assert.deepEqual(await activeRunIds(), beforeSwitch);
   await sessionList.getByRole("button", { name: "Klasör ayarları", exact: true }).click();
-  await page.locator("#dialog").getByRole("button", { name: "Klasörü yeniden adlandır" }).click();
+  await page.locator("#workspace-action-menu").getByRole("menuitem", { name: "Klasörü yeniden adlandır" }).click();
   await page.locator("#dialog").getByLabel("Klasör adı").fill("API review");
   await page.locator("#dialog").getByRole("button", { name: "Kaydet" }).click();
   await sessionList.getByText("API review", { exact: true }).waitFor();
   await sessionList.getByRole("button", { name: "Klasör ayarları", exact: true }).click();
-  await page.locator("#dialog").getByRole("button", { name: "Klasörü kaldır" }).click();
+  await page.locator("#workspace-action-menu").getByRole("menuitem", { name: "Klasörü kaldır" }).click();
   await page.locator("#dialog").getByRole("button", { name: "Kaldır", exact: true }).click();
   await until(async () => (await topicTabs.count()) === 3, "removed folder restores sessions to General");
   const restored = (await api("app", "state")).sessions.filter((entry) => sessions.some((s) => s.id === entry.id));
@@ -1599,6 +1779,70 @@ async function test() {
   await page.keyboard.press("Enter");
   await until(() => inputLog().slice(beforePaste.length).replace(/\r\n/g, "\n") === "synthetic clipboard second line end\n", "exactly one submitted line");
   console.log("PASS native Workflow WebView and provider PTY accept unbracketed multiline paste only as a confirmed single-line draft");
+  const teamsRow = page.locator(".teams-control");
+  const teamsEdit = teamsRow.getByRole("button", { name: "Teams hedefini düzenle", exact: true });
+  assert.equal(await teamsRow.locator("#teams-state").textContent(), "Giriş gerekli");
+  assert(await teamsRow.getByRole("button", { name: "Teams’e bağlan" }).isVisible());
+  assert(await teamsEdit.isHidden());
+  await page.evaluate(() => window.paintTeams({ state: "signing-in" }));
+  assert.equal(await teamsRow.locator("#teams-state").textContent(), "Giriş bekleniyor");
+  assert(await teamsRow.getByRole("button", { name: "Teams girişine devam et" }).isVisible());
+  await page.evaluate(() => window.paintTeams({ state: "connected" }));
+  assert.equal(await teamsRow.locator("#teams-state").textContent(), "Bağlı");
+  const teamsOpen = teamsRow.getByRole("button", { name: "Teams’i aç", exact: true });
+  await teamsOpen.click();
+  await page.locator("#toast").getByText("Önce Teams hesabına giriş yap.", { exact: true }).waitFor();
+  await teamsRow.locator(".teams-info strong").click();
+  assert(await page.locator("#dialog").isHidden());
+  await page.evaluate(() => window.paintTeams({ state: "disconnected" }));
+  await page.evaluate((id) => window.workflow.selectSession(id), sessions[0].id);
+  const teamsDialog = page.locator("#dialog");
+  const teamsLink = teamsDialog.locator('input[type="url"]');
+  const saveTeamsTarget = teamsDialog.getByRole("button", { name: "Kaydet", exact: true });
+  const openTeamsTarget = async () => {
+    await page.locator('.session-card[data-id="' + sessions[0].id + '"]')
+      .getByTitle("Oturum seçenekleri", { exact: true }).click();
+    await page.locator("#workspace-action-menu").getByRole("menuitem", { name: "Teams hedefi", exact: true }).click();
+    await teamsDialog.getByRole("heading", { name: "Teams hedefi · " + sessions[0].name, exact: true }).waitFor();
+  };
+  const savedTeamsTarget = async (id) =>
+    (await api("app", "state")).sessions.find((s) => s.id === id).teamsChatLink;
+  await openTeamsTarget();
+  await teamsLink.fill("https://example.invalid/l/chat/48%3Anotes/conversations");
+  await saveTeamsTarget.click();
+  await teamsDialog.locator(".dialog-error").waitFor();
+  assert(!await savedTeamsTarget(sessions[0].id));
+  await teamsDialog.getByRole("button", { name: "Kendi sohbetim", exact: true }).click();
+  await saveTeamsTarget.click();
+  await teamsDialog.waitFor({ state: "hidden" });
+  const savedLink = await savedTeamsTarget(sessions[0].id);
+  assert.equal(decodeURIComponent(new URL(savedLink).pathname), "/l/chat/48:notes/conversations");
+  assert(!await savedTeamsTarget(sessions[1].id));
+  const teamsAttempt = { text: "Local Teams test" };
+  assert.match((await mcp(sessions[0].id, "teams_send_message", teamsAttempt)).error, /Önce Teams hesabına giriş yap/);
+  assert.match((await mcp(sessions[1].id, "teams_send_message", teamsAttempt)).error, /Teams hedefini kaydet/);
+  assert.match((await mcp(sessions[0].id, "teams_open")).error, /Önce Teams hesabına giriş yap/);
+  await page.evaluate(() => window.paintTeams({ state: "connected" }));
+  await teamsEdit.click();
+  assert.equal(await teamsDialog.locator("#dialog-title").textContent(), "Teams hedefi · " + sessions[0].name);
+  assert.equal(await teamsLink.inputValue(), savedLink);
+  assert.equal(await teamsDialog.locator("textarea").count(), 0);
+  const newTeamsLink = "https://teams.microsoft.com/l/chat/19:example@thread.v2/conversations";
+  await teamsLink.fill(newTeamsLink);
+  await saveTeamsTarget.click();
+  await teamsDialog.waitFor({ state: "hidden" });
+  assert.equal(new URL(await savedTeamsTarget(sessions[0].id)).pathname, new URL(newTeamsLink).pathname);
+  await page.evaluate((id) => window.workflow.selectSession(id), sessions[1].id);
+  await teamsEdit.click();
+  assert.equal(await teamsDialog.locator("#dialog-title").textContent(), "Teams hedefi · " + sessions[1].name);
+  assert.equal(await teamsLink.inputValue(), "");
+  await teamsDialog.getByRole("button", { name: "Vazgeç", exact: true }).click();
+  await page.evaluate((id) => {
+    window.paintTeams({ state: "disconnected" });
+    window.workflow.selectSession(id);
+  }, sessions[0].id);
+  await api("teams", "set_target", { sessionId: sessions[0].id, link: "" });
+  console.log("PASS Teams connection states, window open action and session-scoped MCP destination");
   for (const s of sessions) {
     const models = await api("models", "list", { id: s.id });
     assert(models.some((m) => m.id === "fixture-" + s.provider));
@@ -1730,9 +1974,14 @@ async function test() {
   await api("app", "session_patch", {
     id: login.id,
     name: archivedName,
-    archived: true,
   });
   await page.evaluate(() => window.workflow.refresh());
+  await page.evaluate(id => window.workflow.selectSession(id), login.id);
+  const loginOptions = page.locator('#project-sessions [data-session-options="' + login.id + '"]');
+  await loginOptions.click();
+  await page.locator("#workspace-action-menu").getByRole("menuitem", { name: "Arşive taşı", exact: true }).click();
+  await loginCard.waitFor({ state: "hidden" });
+  assert.equal((await api("app", "state")).sessions.find(s => s.id === login.id).archived, true);
   await page.locator("#archive").click();
   const archived = page
     .locator("#dialog .archive-row")
@@ -1756,6 +2005,7 @@ async function test() {
   assert(historyBounds.x + historyBounds.width <= restore.x);
   assert(restore.x + restore.width <= row.x + row.width + 1);
   assert(historyBounds.width > 55 && restore.width > 65);
+  assert.match(await archived.locator("xpath=ancestor::details[@data-history-group='archive']").locator(":scope > summary").textContent(), /^Arşiv/);
   await historyButton.click();
   await until(
     async () =>
@@ -1763,16 +2013,32 @@ async function test() {
       archivedName + " · Geçmiş",
     "archived conversation history",
   );
-  await page.locator("#dialog-close").click();
-  await page.locator("#archive").click();
+  await page.locator("#dialog").getByRole("button", { name: "Oturum geçmişine dön", exact: true }).click();
   await restoreButton.click();
   await loginCard.waitFor({ state: "visible" });
   assert.equal(
     (await api("app", "state")).active.some((a) => a.id === login.id),
     false,
   );
+  await page.locator("#archive").click();
+  const historyRow = page.locator('#session-history .archive-row[data-session-id="' + login.id + '"]');
+  assert.match(await historyRow.locator("..").locator("summary").textContent(), /^Kapalı oturumlar/);
+  await historyRow.getByRole("button", { name: "Arşive taşı", exact: true }).click();
+  await historyRow.getByRole("button", { name: "Geri getir", exact: true }).waitFor();
+  assert.match(await historyRow.locator("xpath=ancestor::details[@data-history-group='archive']").locator(":scope > summary").textContent(), /^Arşiv/);
+  await historyRow.getByRole("button", { name: "Geri getir", exact: true }).click();
+  const secondRun = await api("terminal", "start", { id: login.id });
+  pids.push(secondRun.pid);
+  await loginOptions.click();
+  await page.locator("#workspace-action-menu").getByRole("menuitem", { name: "Arşive taşı", exact: true }).click();
+  await page.locator("#dialog").getByRole("button", { name: "Durdur ve arşivle", exact: true }).click();
+  await page.locator("#dialog").waitFor({ state: "hidden" });
+  assert((await api("terminal", "attach", { id: login.id })).exited);
+  await page.locator("#archive").click();
+  await historyRow.getByRole("button", { name: "Geri getir", exact: true }).click();
+  await loginCard.waitFor({ state: "visible" });
   console.log(
-    "PASS archive actions fit, open history, and restore without launching the terminal",
+    "PASS session history groups closed and archived sessions, archives through both entry points and restores without launching the terminal",
   );
 
   await api("app", "session_patch", {

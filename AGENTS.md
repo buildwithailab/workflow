@@ -8,6 +8,13 @@
 - Implement our own application code. Test terminal lifecycle, browser selection and browser actions before distributing.
 - No local commits or remote pushes unless explicitly requested.
 
+## Release scope
+
+- Before preparing a release, reconcile all user-approved changes against the release source, including approved work still in the local development copy. A previous push limited to specific changes does not define the next release's scope.
+- Account for each approved feature in the release candidate and verify it in the packaged executable. If an approved change is absent from the intended source or blocked, resolve that gap before publishing. Keep unapproved changes outside the release.
+- Verify the final Windows ZIP and the executable's version and features. Use the tested artifact for publication and check that the public downloads match its checksum.
+- For terminal clipboard acceptance, test copying into and pasting from the real Windows clipboard using the packaged executable. A synthetic WebView paste event is supplementary coverage.
+
 ## Mandatory security gate before every commit
 
 - Before EVERY commit, review the exact staged file list and full staged diff, then run `node scripts/check-commit.cjs --staged` in the actual repository. Repeat after any staging change. A worktree scan or an earlier passing result is not a substitute for checking the final index.

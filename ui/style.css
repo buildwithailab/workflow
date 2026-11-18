@@ -524,6 +524,32 @@ body.no-left .sidebar {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.workspace-action-menu {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  width: max-content;
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow: auto;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--raised);
+  color: var(--text);
+  box-shadow: 0 8px 24px #0007;
+}
+.workspace-action-menu button {
+  display: block;
+  width: 100%;
+  padding: 6px 9px;
+  border-color: transparent;
+  background: transparent;
+  text-align: left;
+}
+.workspace-action-menu button:not(:disabled):is(:hover, :focus-visible) {
+  background: var(--bg);
+}
 #session-template-items:not(:empty) + #manage-session-templates {
   margin-top: 4px;
   border-top-color: var(--line);
@@ -640,6 +666,13 @@ body.no-left .sidebar {
   width: 24px;
   height: 26px;
 }
+.folder-archive-button::before {
+  content: "";
+  width: 15px;
+  height: 15px;
+  background: currentColor;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 4h16v4H4zM6 8v12h12V8m-8 4h4'/%3E%3C/svg%3E") center / contain no-repeat;
+}
 .session-folder-select {
   flex: 1;
   min-width: 0;
@@ -715,7 +748,8 @@ body.no-left .sidebar {
     linear-gradient(currentColor, currentColor) center 7px / 5px 1px no-repeat;
 }
 .session-entry {
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   display: flex;
   gap: 7px;
   background: transparent;
@@ -724,10 +758,22 @@ body.no-left .sidebar {
   margin: 2px 0;
   text-align: left;
 }
+.session-entry-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.session-entry-options.icon {
+  flex: none;
+  width: 22px;
+  height: 26px;
+}
 .session-entry .name {
   flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .session-entry .state {
   font-size: 10px;
@@ -2673,6 +2719,35 @@ dialog::backdrop {
   width: 100%;
   min-width: 0;
 }
+.session-history-group + .session-history-group {
+  margin-top: 12px;
+}
+.session-history-group > summary {
+  padding-block: 8px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+.session-history-group > summary .folder-count {
+  margin-inline-start: 8px;
+}
+.history-back {
+  margin: 0 6px 8px 0;
+}
+.archive-folder-group {
+  margin-block: 10px 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.archive-folder-group > summary {
+  cursor: pointer;
+}
+.archive-folder-group > summary .folder-count {
+  margin-inline-start: 8px;
+}
+.archive-folder-restore {
+  margin-block: 8px 4px;
+}
 .archive-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
@@ -2682,6 +2757,14 @@ dialog::backdrop {
 }
 .archive-row > span {
   overflow-wrap: anywhere;
+}
+.archive-session-label > small {
+  display: block;
+  color: var(--muted);
+}
+.legacy-archive-move {
+  grid-column: 1 / -1;
+  justify-self: start;
 }
 .dialog-footer {
   padding: 13px 25px 20px;
@@ -2694,6 +2777,7 @@ dialog::backdrop {
   color: var(--red);
   font-size: 12px;
   line-height: 1.7;
+  white-space: pre-line;
 }
 .about-updates {
   display: grid;

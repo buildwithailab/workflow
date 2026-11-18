@@ -197,6 +197,7 @@ impl Core {
         } else {
             json!({"version":1,"projects":[],"sessions":[],"links":[],"jobs":[],"preferences":{},"providers":{}})
         };
+        crate::workspace_archive::recover(&directory, &db);
         Ok(Arc::new(Self {
             #[cfg(windows)]
             updates: crate::updates::Updates::load(&directory),

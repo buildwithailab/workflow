@@ -24,6 +24,7 @@ mod terminal;
 #[cfg(windows)]
 mod updates;
 mod usage;
+mod workspace_archive;
 use crate::core::*;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -332,22 +333,23 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
                     patch[k] = args[k].clone()
                 }
             }
-            if patch["archived"] == true {
+            if let Some(archive) = patch["archived"].as_bool() {
                 let _operation = core.operations.lock().unwrap();
                 #[cfg(windows)]
-                if core.previews.running(sid) {
+                if archive && core.previews.running(sid) {
                     bail!("Önce bu oturumun önizlemesini durdur")
                 }
-                if core
-                    .terms
-                    .lock()
-                    .unwrap()
-                    .get(sid)
-                    .is_some_and(|t| !t.exited.load(std::sync::atomic::Ordering::SeqCst))
+                if archive
+                    && core
+                        .terms
+                        .lock()
+                        .unwrap()
+                        .get(sid)
+                        .is_some_and(|t| !t.exited.load(std::sync::atomic::Ordering::SeqCst))
                 {
                     bail!("Önce oturumu durdur")
                 }
-                return core.update_session(sid, patch);
+                return workspace_archive::set(core, sid, patch);
             }
             core.update_session(sid, patch)
         }
