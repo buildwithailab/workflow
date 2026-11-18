@@ -370,7 +370,7 @@ function selectSession(id, center = false, tab = null) {
   if (tab) openPanel(tab).catch(error);
   else refreshPanel();
   remember();
-  if (center && mode === "map") focusCard();
+  if (center && mode === "map") centerCard();
   if (center && mode === "grid")
     views.get(id)?.card.scrollIntoView({ block: "nearest", inline: "nearest" });
 }
@@ -1826,6 +1826,7 @@ function setMode(value) {
   remember();
 }
 function zoom(amount, x, y) {
+  if (mode === "focus") setMode("map");
   const rect = $("#viewport").getBoundingClientRect();
   x ??= rect.width / 2;
   y ??= rect.height / 2;
@@ -1865,6 +1866,9 @@ function fitMap() {
   remember();
 }
 function focusCard() {
+  if (views.has(focusId)) setMode("focus");
+}
+function centerCard() {
   const c = views.get(focusId)?.card;
   if (!c) return;
   const r = $("#viewport").getBoundingClientRect();
@@ -2089,7 +2093,10 @@ $("#viewport").addEventListener(
 );
 $("#zoom-out").onclick = () => zoom(1 / 1.15);
 $("#zoom-in").onclick = () => zoom(1.15);
-$("#fit").onclick = fitMap;
+$("#fit").onclick = () => {
+  if (mode === "focus") setMode("map");
+  fitMap();
+};
 $("#focus-card").onclick = focusCard;
 for (const m of ["map", "grid", "focus"])
   $("#view-" + m).onclick = () => setMode(m);

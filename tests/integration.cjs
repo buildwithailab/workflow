@@ -1505,6 +1505,57 @@ async function test() {
     "utf8",
   );
   const before = await api("terminal", "attach", { id: sessions[0].id });
+  const mapLayout = await page.locator("#cards").evaluate(cards =>
+    [...cards.children].map(card => [card.dataset.id, card.style.cssText]));
+  const fillsWorkspace = async (id) => page.evaluate(id => {
+    const viewport = document.querySelector("#viewport");
+    const area = viewport.getBoundingClientRect();
+    const card = window.workflow.views.get(id).card.getBoundingClientRect();
+    return Math.abs(card.top - area.top - viewport.clientTop) < 2
+      && Math.abs(card.left - area.left - viewport.clientLeft) < 2
+      && Math.abs(card.width - viewport.clientWidth) < 2
+      && Math.abs(card.height - viewport.clientHeight) < 2
+      && viewport.scrollHeight === viewport.clientHeight;
+  }, id);
+  await page.locator("#focus-card").click();
+  await until(() => fillsWorkspace(sessions[0].id), "Focus fills the workspace from its top edge");
+  assert.equal(await page.locator("#cards .session-card:visible").count(), 1);
+  for (const control of ["#zoom-out", "#zoom", "#zoom-in", "#fit", "#focus-card"]) {
+    assert(await page.locator(control).isVisible(), "focused Terminal keeps the workspace toolbar visible");
+  }
+  await page.locator("#zoom-out").click();
+  assert(await page.locator("#view-map").evaluate(button => button.classList.contains("selected")));
+  const zoomedOut = await page.locator("#zoom").textContent();
+  await page.locator("#focus-card").click();
+  await page.locator("#zoom-in").click();
+  assert(await page.locator("#view-map").evaluate(button => button.classList.contains("selected")));
+  assert(parseInt(await page.locator("#zoom").textContent(), 10) > parseInt(zoomedOut, 10));
+  await page.locator("#focus-card").click();
+  await page.locator("#fit").click();
+  assert(await page.locator("#view-map").evaluate(button => button.classList.contains("selected")));
+  assert.equal(await page.locator("#cards .session-card:visible").count(), 3);
+  await page.locator("#focus-card").click();
+  assert(await fillsWorkspace(sessions[0].id));
+
+  await page.locator("#session-chat-view").click();
+  await page.locator("#chat-input").fill("Keep my focused session draft.");
+  await page.locator("#session-terminal-view").click();
+  assert(await fillsWorkspace(sessions[0].id));
+  await page.locator(`#session-tabs [data-session-id="${sessions[1].id}"]`).click();
+  await until(() => fillsWorkspace(sessions[1].id), "next focused session uses the same full area");
+  await page.locator("#toggle-right").click();
+  await until(() => fillsWorkspace(sessions[1].id), "focused Terminal fills the area after panel resize");
+  await page.locator("#toggle-right").click();
+  await page.locator(`#session-tabs [data-session-id="${sessions[0].id}"]`).click();
+  await page.locator("#session-chat-view").click();
+  assert.equal(await page.locator("#chat-input").inputValue(), "Keep my focused session draft.");
+  await page.locator("#session-terminal-view").click();
+  await page.locator("#view-map").click();
+  assert.deepEqual(await page.locator("#cards").evaluate(cards =>
+    [...cards.children].map(card => [card.dataset.id, card.style.cssText])), mapLayout);
+  assert.deepEqual(await activeRunIds(), beforeSwitch);
+  assert.equal(fs.readFileSync(path.join(data, "test-input/codex.txt"), "utf8"), inputBefore);
+  console.log("PASS focused Terminal fills the workspace, follows tabs and panel resize, preserves Chat draft and map layout without input");
   await page.reload();
   await until(() => page.evaluate(() => !!window.workflow), "reload");
   const after = await api("terminal", "attach", { id: sessions[0].id });
