@@ -195,9 +195,10 @@ function modal(title, content, submit, label = tr("Kaydet")) {
       err?.remove();
       try {
         await submit();
-        closeModal();
+        if (save.isConnected && $("#dialog").open) closeModal();
       } catch (e) {
-        $("#dialog-body").append(el("p", "dialog-error", uiError(e)));
+        if (save.isConnected && $("#dialog").open)
+          $("#dialog-body").append(el("p", "dialog-error", uiError(e)));
         throw e;
       }
     });
@@ -1124,14 +1125,15 @@ function renderCards() {
         );
     }
     v.term.options.disableStdin = !active(s.id);
-    v.path.textContent =
+    v.pathMode.textContent =
       (s.workspaceKind === "direct"
         ? tr("Mevcut klasör")
         : s.workspaceKind === "worktree"
           ? "Git worktree"
           : tr("Ayrı klasör")) +
-      " · " +
-      s.directory;
+      " · ";
+    v.pathValue.textContent = s.directory;
+    v.path.title = v.pathMode.textContent + s.directory;
     const account = providerAccount(s.provider, s.accountId || defaultAccount);
     v.account.hidden =
       (!s.accountId || s.accountId === defaultAccount) &&
@@ -1385,12 +1387,18 @@ function createCard(s, index) {
   host.append(overlay);
   const foot = el("div", "card-footer"),
     path = el("span", "card-path"),
+    pathMode = el("span", "card-path-mode"),
+    pathTail = el("span", "card-path-value"),
+    pathValue = el("bdi"),
     account = el("span", "card-account"),
     summary = button(
       tr("Özet"),
       () => selectSession(s.id, false, "summary"),
       "card-summary",
     );
+  pathValue.dir = "ltr";
+  pathTail.append(pathValue);
+  path.append(pathMode, pathTail);
   account.hidden = true;
   foot.append(path, account, summary);
   card.append(host, foot);
@@ -1424,6 +1432,8 @@ function createCard(s, index) {
     link,
     state,
     path,
+    pathMode,
+    pathValue,
     account,
     summary,
     notice,
@@ -4078,18 +4088,103 @@ $("#suggest-after-stage").checked =
   localStorage.getItem("agentloom-suggest") === "true";
 $("#suggest-after-stage").onchange = (e) =>
   localStorage.setItem("agentloom-suggest", String(e.target.checked));
+async function mergeTargetDialog() {
+  const context = ctx();
+  const catalog = await api("git", "merge_targets", context);
+  if (context.projectId !== projectId || context.sessionId !== (focusId || undefined)) return;
+  const target = select(catalog.targets.map(name => ({ id: name, label: name })));
+  if (catalog.selected) target.value = catalog.selected;
+  const direction = el("strong", "merge-direction");
+  const status = el("p", "help");
+  status.setAttribute("role", "status");
+  const files = el("details", "merge-source-files");
+  const recovery = el("div", "merge-recovery");
+  const box = el("div", "merge-target-form");
+  box.append(direction, field(tr("Hedef dal"), target), status, files, recovery,
+    el("p", "help", tr("Kaynak oturum aynı dalda kalır. Birleştirme yalnızca seçilen yerel hedef dalı günceller.")));
+  let preview = null, revision = 0, applying = false;
+  let submit;
+  modal(tr("Hedef dala birleştir"), box, async () => {
+    if (!preview || applying) throw Error(tr("Önce geçerli bir hedef dal seç."));
+    applying = true; target.disabled = true;
+    try {
+      const result = await api("git", "merge_target_apply", { ...context, target: preview.target, stamp: preview.stamp });
+      if (!result.merged) {
+        preview = null;
+        files.open = true;
+        files.replaceChildren(el("summary", "", tr("Çakışan dosyalar")), ...result.conflicts.map(name => el("code", "merge-file", name)));
+        const recover = button(tr("Çakışmaları bu oturumda çöz"), () => {});
+        recover.onclick = busy(recover, async () => {
+          applying = true; target.disabled = true;
+          try {
+            const resolution = await api("git", "merge_target_resolve", {
+              ...context, target: result.target, stamp: result.stamp,
+            });
+            if (box.isConnected && $("#dialog").open) closeModal();
+            if (context.projectId === projectId && context.sessionId === focusId)
+              await setChangesMode("git");
+            toast(tr(resolution.conflicts.length
+              ? "Dosyaları bu oturumda çözerek birleştirmeyi tamamla. Sonra hedef dala birleştirmeyi yeniden dene."
+              : "Bu oturumdaki birleştirme sonucunu kontrol et. Ardından hedef dala birleştirmeyi yeniden dene."));
+          } finally { applying = false; target.disabled = false; }
+        });
+        recovery.replaceChildren(recover);
+        throw Error(tr("Çakışma bulundu; hedef dal değiştirilmedi. Çakışmaları bu oturumda çözebilirsin."));
+      }
+      toast(tr("{source} → {target} birleştirildi. Kaynak oturum korundu.", { source: catalog.source, target: result.target }));
+      await refreshChanges();
+    } catch (e) {
+      // A failed/stale application must be reviewed again before another attempt.
+      preview = null;
+      throw e;
+    } finally {
+      applying = false; target.disabled = false;
+      // modal()'s busy wrapper re-enables submit; keep it blocked until a fresh preview.
+      setTimeout(() => { if (submit?.isConnected && !preview) submit.disabled = true; }, 0);
+    }
+  }, tr("Birleştir"));
+  submit = $("#dialog-footer .primary");
+  const load = async () => {
+    if (applying) return;
+    const current = ++revision;
+    preview = null; submit.disabled = true;
+    status.removeAttribute("title");
+    recovery.replaceChildren(); files.replaceChildren();
+    box.querySelectorAll(".dialog-error").forEach(node => node.remove());
+    $("#dialog-body > .dialog-error")?.remove();
+    direction.textContent = catalog.source + " → " + target.value;
+    if (!target.value) { status.textContent = tr("Birleştirilecek başka bir yerel dal yok."); return; }
+    status.textContent = tr("Birleştirme kontrol ediliyor…");
+    try {
+      const result = await api("git", "merge_target_preview", { ...context, target: target.value });
+      if (current !== revision || !box.isConnected) return;
+      if (result.source !== catalog.source) throw Error(tr("Kaynak dal değişti. Birleştirme penceresini yeniden aç."));
+      status.textContent = result.unchanged ? tr("Kaynak değişiklikler hedef dalda zaten var.")
+        : tr("Kaynak commit: {commits} · Değişen dosya: {files}", { commits: result.commits, files: result.files.length });
+      if (result.directory) { status.title = result.directory; }
+      if (result.files.length) files.append(el("summary", "", tr("Kaynak dalın değişiklikleri")), ...result.files.map(name => el("code", "merge-file", name)));
+      preview = result; submit.disabled = result.unchanged;
+    } catch (e) { if (current === revision && box.isConnected) status.textContent = uiError(e); }
+  };
+  target.onchange = load;
+  const refresh = button(tr("Yeniden kontrol et"), load, "quiet");
+  box.insertBefore(refresh, files);
+  await load();
+}
+
 $("#git-more").onclick = () => {
   if (!gitState?.available) return;
   const box = el("div");
   for (const [id, label] of [
     ["branch", tr("Yeni dal")],
     ["switch", tr("Dal değiştir")],
-    ["merge", tr("Dal birleştir")],
+    ["merge_target", tr("Hedef dala birleştir")],
+    ["merge", tr("Bu dala başka dalı al")],
     ["pr", tr("Taslak PR oluştur")],
     ["merge_continue", tr("Birleştirmeyi tamamla")],
     ["merge_abort", tr("Birleştirmeyi iptal et")],
   ])
-    box.append(button(label, () => gitForm(id)));
+    box.append(button(label, () => id === "merge_target" ? mergeTargetDialog() : gitForm(id)));
   modal(tr("Git işlemleri"), box);
 };
 function gitForm(action) {

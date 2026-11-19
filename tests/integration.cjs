@@ -967,6 +967,136 @@ async function testArchiveStorage() {
   console.log("PASS physical workspace archive and recovery, General and named folder archive and restore, and retry after a partial move");
 }
 
+async function testTargetBranchMerge() {
+  const base = path.join(temporary, "target-merge");
+  const folder = path.join(base, "project");
+  const profile = path.join(base, "profile");
+  fs.mkdirSync(folder, { recursive: true });
+  const gitAt = (cwd, ...args) => cp.execFileSync("git", args, { cwd, encoding: "utf8", windowsHide: true });
+  const commit = (cwd, file, text) => {
+    fs.writeFileSync(path.join(cwd, file), text);
+    gitAt(cwd, "add", "--", file);
+    gitAt(cwd, "commit", "-m", "Synthetic target merge check");
+  };
+  gitAt(folder, "init", "-b", "main");
+  gitAt(folder, "config", "user.name", "Workflow Test");
+  gitAt(folder, "config", "user.email", "test@localhost");
+  gitAt(folder, "config", "commit.gpgsign", "false");
+  gitAt(folder, "config", "core.autocrlf", "false");
+  const hooks = path.join(base, "hooks");fs.mkdirSync(hooks);
+  gitAt(folder, "config", "core.hooksPath", hooks);
+  commit(folder, "feature.txt", "base\n");
+  const baseline = gitAt(folder, "rev-parse", "HEAD").trim();
+  await start("", profile);
+  // Late results from a dismissed dialog must never close or alter its replacement.
+  for (const rejected of [false, true]) {
+    await page.evaluate(() => {
+      const message = document.createElement("p");message.textContent = "Synthetic pending action";
+      window.modal("Pending dialog", message, () => new Promise((resolve, reject) => {
+        window.finishDialogFixture = { resolve, reject };
+      }), "Apply fixture");
+    });
+    await page.locator("#dialog").getByRole("button", { name: "Apply fixture", exact: true }).click();
+    await page.waitForFunction(() => !!window.finishDialogFixture);
+    await page.locator("#dialog-footer").getByRole("button", { name: "Cancel", exact: true }).click();
+    await page.locator("#app-settings").click();
+    await page.locator("#dialog").getByRole("heading", { name: "Settings", exact: true }).waitFor();
+    await page.evaluate(rejected => {
+      if (rejected) window.finishDialogFixture.reject(new Error("Synthetic delayed failure"));
+      else window.finishDialogFixture.resolve();
+      delete window.finishDialogFixture;
+    }, rejected);
+    await page.waitForTimeout(150);
+    assert(await page.locator("#dialog").getByRole("heading", { name: "Settings", exact: true }).isVisible());
+    assert.equal(await page.locator("#dialog .dialog-error").count(), 0);
+    await page.locator("#dialog-footer").getByRole("button", { name: "Close", exact: true }).click();
+  }
+  console.log("PASS dismissed modal success/failure leaves a replacement modal intact");
+  const project = await api("app", "add_project", { directory: folder });
+  const source = await api("app", "create_session", { projectId: project.id, provider: "codex", name: "Merge source" });
+  const context = { projectId: project.id, sessionId: source.id };
+  const dialog = page.locator("#dialog");
+  await page.evaluate(async ({ project, source }) => {
+    await window.sync();window.workflow.selectProject(project);window.workflow.selectSession(source, false, "changes");
+  }, { project: project.id, source: source.id });
+  await page.locator("#changes-mode-git").click();
+  const open = async (target) => {
+    await page.locator("#git-more").click();
+    await dialog.getByRole("button", { name: "Merge into target branch", exact: true }).click();
+    if (target) await dialog.getByLabel("Target branch", { exact: true }).selectOption(target);
+  };
+  const ready = async () => {
+    const button = dialog.locator("#dialog-footer").getByRole("button", { name: "Merge", exact: true });
+    await until(async () => await button.isEnabled(), "merge preview ready");return button;
+  };
+  const sourceBranch = gitAt(source.directory, "branch", "--show-current").trim();
+  commit(source.directory, "feature.txt", "source change\n");
+  await page.evaluate(() => window.refreshPanel());
+  await open();
+  assert.equal(await dialog.getByLabel("Target branch", { exact: true }).inputValue(), "main");
+  await dialog.getByText(sourceBranch + " → main", { exact: true }).waitFor();
+  await (await ready()).click();await dialog.waitFor({ state: "hidden" });
+  assert.equal(fs.readFileSync(path.join(folder, "feature.txt"), "utf8"), "source change\n");
+  assert.equal(gitAt(source.directory, "branch", "--show-current").trim(), sourceBranch);
+  assert.equal((await api("app", "state")).sessions.length, 1);
+  gitAt(folder, "branch", "release/test", baseline);
+  await page.evaluate(() => window.refreshPanel());await open("release/test");
+  await (await ready()).click();await dialog.waitFor({ state: "hidden" });
+  assert.equal(gitAt(folder, "rev-parse", "release/test").trim(), gitAt(source.directory, "rev-parse", "HEAD").trim());
+  fs.writeFileSync(path.join(folder, "uncommitted.txt"), "preserved draft");
+  await open("main");await dialog.getByText(/The target branch has uncommitted changes/).waitFor();
+  assert(await dialog.locator("#dialog-footer .primary").isDisabled());
+  await dialog.locator("#dialog-footer button").first().click();fs.unlinkSync(path.join(folder, "uncommitted.txt"));
+  const direct = await api("app", "create_session", { projectId: project.id, provider: "codex", workspaceMode: "direct", name: "Existing target session" });
+  const run = await api("terminal", "start", { id: direct.id });
+  await open("main");await dialog.getByText("Stop sessions using the target branch first.", { exact: true }).waitFor();
+  assert(await dialog.locator("#dialog-footer .primary").isDisabled());
+  await dialog.locator("#dialog-footer button").first().click();
+  await api("terminal", "stop", { id: direct.id, runId: run.runId });
+  await until(async () => !(await api("app", "state")).active.some(item => item.id === direct.id), "target session stopped");
+  commit(folder, "feature.txt", "target change\n");commit(source.directory, "feature.txt", "conflicting source change\n");
+  const targetBefore = gitAt(folder, "rev-parse", "HEAD").trim();
+  await open("main");await (await ready()).click();
+  await dialog.getByText("Conflicts found; the target branch was not changed. You can resolve them in this session.", { exact: true }).waitFor();
+  assert.equal(gitAt(folder, "rev-parse", "HEAD").trim(), targetBefore);
+  assert.equal(gitAt(folder, "status", "--porcelain").trim(), "");
+  await dialog.getByRole("button", { name: "Resolve conflicts in this session", exact: true }).click();
+  await until(async () => (await api("git", "state", context)).files.some(file => file.conflict), "source conflict review");
+  let state = await api("git", "state", context);
+  const details = await api("git", "conflict_details", { ...context, path: "feature.txt" });
+  await api("git", "conflict_resolve", { ...context, stamp: state.stamp, fileStamp: details.hash, path: "feature.txt", choice: "ours" });
+  state = await api("git", "state", context);
+  await api("git", "merge_continue", { ...context, stamp: state.stamp });
+  await page.evaluate(() => window.refreshPanel());await open("main");
+  await (await ready()).click();await dialog.waitFor({ state: "hidden" });
+  assert.equal(gitAt(folder, "rev-parse", "HEAD").trim(), gitAt(source.directory, "rev-parse", "HEAD").trim());
+  assert.equal(gitAt(source.directory, "branch", "--show-current").trim(), sourceBranch);
+  await open("main");
+  gitAt(source.directory, "switch", "-c", "test/source-changed");
+  await dialog.getByRole("button", { name: "Check again", exact: true }).click();
+  await dialog.getByText("The source branch changed. Reopen the merge dialog.", { exact: true }).waitFor();
+  assert(await dialog.locator("#dialog-footer .primary").isDisabled());
+  await dialog.locator("#dialog-footer button").first().click();
+  gitAt(source.directory, "switch", sourceBranch);
+  const privateMerges = path.join(profile, "merge-workspaces");
+  assert.equal(fs.readdirSync(privateMerges).length, 0);
+  assert.equal(gitAt(folder, "worktree", "list", "--porcelain").match(/worktree /g).length, 2);
+  await stop();
+  // Simulate an older nested-project session whose checkout was placed at the repository root.
+  const component = path.join(folder, "component");fs.mkdirSync(component, { recursive: true });
+  const metadataPath = path.join(profile, "workspace.json");
+  const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
+  metadata.projects.find(item => item.id === project.id).directory = component;
+  fs.writeFileSync(metadataPath, JSON.stringify(metadata));
+  await start("", profile);
+  const legacyHead = gitAt(folder, "rev-parse", "HEAD").trim();
+  for (const action of ["merge_targets", "merge_target_preview", "merge_target_apply", "merge_target_resolve"])
+    await assert.rejects(api("git", action, { ...context, target: "main", stamp: "0".repeat(64) }), /eski oturumun/);
+  assert.equal(gitAt(folder, "rev-parse", "HEAD").trim(), legacyHead);
+  await stop();
+  console.log("PASS target-branch merge from one source session, unchecked branch, dirty/live target guards, in-session conflict resolution and legacy workspace rejection");
+}
+
 async function testRepositoryConcurrency() {
   const base = path.join(temporary, "repository-concurrency");
   const main = path.join(base, "main"), peer = path.join(base, "peer"), other = path.join(base, "other");
@@ -1172,6 +1302,7 @@ async function test() {
     await testAdditionalProviderChats();
     await testPendingChatInteraction();
     await testArchiveStorage();
+    await testTargetBranchMerge();
   }
   if (process.platform === "win32") await testCopilotNpm();
   const address = "http://127.0.0.1:" + server.address().port;

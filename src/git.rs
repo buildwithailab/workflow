@@ -8,6 +8,8 @@ use std::{
     sync::Arc,
 };
 
+mod merge_target;
+
 const CHANGED: &str = "Git durumu değişti; yenileyip yeniden dene";
 
 pub(crate) fn worktree_root(directory: &Path) -> Result<PathBuf> {
@@ -148,6 +150,20 @@ fn state(root: &Path, include_review_stats: bool) -> Result<Value> {
         json!({"available":true,"branch":branch,"head":current.head,"files":files,"remotes":remotes,"upstream":upstream,"branches":branches,"stamp":stamp}),
     )
 }
+fn validate_session_workspace(core: &Core, directory: &Path, root: &Path, args: &Value) -> Result<()> {
+    if let Some(sid) = args["sessionId"].as_str() {
+        let session = core.session(sid)?;
+        if session["workspaceKind"] == "worktree" && dunce::canonicalize(directory)? == root {
+            let project = core.project(string(&session, "projectId")?)?;
+            let project_dir = dunce::canonicalize(string(&project, "directory")?)?;
+            if worktree_root(&project_dir).is_ok_and(|repository| project_dir != repository) {
+                bail!("Bu eski oturumun Git çalışma alanı hatalı konumda. Proje klasöründen yeni bir oturum aç.")
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
     let directory = core.root(args)?;
     let root = match worktree_root(&directory) {
@@ -157,6 +173,17 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
     };
     if action == "state" {
         return state(&root, args["reviewStats"] == true);
+    }
+    if matches!(action, "merge_targets" | "merge_target_preview" | "merge_target_apply" | "merge_target_resolve") {
+        let repository = core.repository_operations.lock(&[directory.clone()])?;
+        repository.validate(&[directory.clone()])?;
+        if worktree_root(&directory)? != root { bail!(CHANGED); }
+        {
+            let _guard = core.operations.lock().unwrap();
+            if core.root(args)? != directory { bail!(crate::repository_operations::CHANGED); }
+            validate_session_workspace(core, &directory, &root, args)?;
+        }
+        return merge_target::dispatch(core, &root, action, args);
     }
     if action == "history" {
         let selector = args["branch"].as_str().unwrap_or("--all");
@@ -262,20 +289,11 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
     {
         let _guard = core.operations.lock().unwrap();
         if core.root(args)? != directory { bail!(crate::repository_operations::CHANGED); }
+        validate_session_workspace(core, &directory, &root, args)?;
     }
     let (current, status, stamp) = snapshot(&root)?;
     if string(args, "stamp")? != stamp {
         bail!(CHANGED)
-    }
-    if let Some(sid) = args["sessionId"].as_str() {
-        let session = core.session(sid)?;
-        if session["workspaceKind"] == "worktree" && dunce::canonicalize(directory)? == root {
-            let project = core.project(string(&session, "projectId")?)?;
-            let project_dir = dunce::canonicalize(string(&project, "directory")?)?;
-            if worktree_root(&project_dir).is_ok_and(|repository| project_dir != repository) {
-                bail!("Bu eski oturumun Git çalışma alanı hatalı konumda. Proje klasöründen yeni bir oturum aç.")
-            }
-        }
     }
     let result = match action {
         "stage" => {

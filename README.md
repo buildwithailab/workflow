@@ -105,6 +105,8 @@ Workflow MCP checks the target project's and session workspace's `.workflowignor
 
 Choose **Current folder and branch** to work directly in the project. Choose **Separate workspace** to work in a Git worktree when the project has an initial commit, or a folder copy otherwise. Workflow also supports projects without Git.
 
+From a Git session, open **Changes → Pending Git changes → ⋯ → Merge into target branch** to merge its committed work into a local target branch. You do not need another provider session in the original project. Workflow checks the source and target, tries the merge in a temporary workspace, then updates the target while preserving the source session. Uncommitted changes, active target sessions, and stale previews block the operation. If conflicts occur, the target stays unchanged; resolve them in the source session and retry. This action does not push to a remote.
+
 ## Use add-ons in selected sessions
 
 Open the **Add-on library** beside **Projects** and install a package. In **New session**, choose **Separate workspace**, check the add-ons you want, and select **Start session**. Installed add-ons are unchecked by default in each new session.

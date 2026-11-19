@@ -1761,11 +1761,23 @@ body.no-left .sidebar {
   border-top: 1px solid #242b34;
 }
 .card-path {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+}
+.card-path-mode {
+  flex-shrink: 0;
+}
+.card-path-value {
   flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
 }
 .card-summary {
   font-size: 11px;
@@ -2945,4 +2957,24 @@ dialog::backdrop {
   .card-header {
     gap: 4px;
   }
+}
+
+.merge-target-form .merge-direction {
+  display: block;
+  overflow-wrap: anywhere;
+  color: var(--accent);
+  margin-bottom: 14px;
+}
+.merge-source-files {
+  margin: 12px 0;
+}
+.merge-source-files summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+.merge-file {
+  display: block;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  padding: 4px 0;
 }
