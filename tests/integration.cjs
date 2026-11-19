@@ -1075,6 +1075,23 @@ async function test() {
   await about.getByText("Installed version " + updateState.version, { exact: true }).waitFor();
   assert.equal(await about.getByRole("checkbox", { name: "Update automatically" }).isChecked(), updateState.supported);
   assert(await about.getByRole("button", { name: "Check for updates" }).isVisible());
+  await page.evaluate(state => window.paintUpdate(state), { ...updateState, checkedAt: Math.floor(Date.now() / 1000), error: null });
+  await about.getByText("No newer version found.", { exact: true }).waitFor();
+  const limitedUpdate = { ...updateState, checkedAt: Math.floor(Date.now() / 1000),
+    error: "GitHub istek sınırına ulaşıldı. Belirtilen zamandan sonra tekrar dene.",
+    errorKind: "rate_limited", retryAt: Math.floor(Date.now() / 1000) + 3600, httpStatus: 429 };
+  await page.evaluate(state => window.paintUpdate(state), limitedUpdate);
+  await about.getByText("GitHub has limited requests. Try again after the time shown.", { exact: true }).waitFor();
+  await about.getByText("Server response: HTTP 429", { exact: true }).waitFor();
+  assert.match(await about.innerText(), /Retry after: /);
+  assert(!await about.getByText("No newer version found.", { exact: true }).count());
+  await page.evaluate(state => window.paintUpdate(state), { ...limitedUpdate,
+    error: "İmzalı güncelleme bilgisi henüz yayımlanmamış. GitHub sürümlerini kontrol et.",
+    errorKind: "not_published", retryAt: null, httpStatus: null });
+  await about.getByText("Signed update information has not been published yet. Check GitHub releases.", { exact: true }).waitFor();
+  assert(!await about.getByText("Server response: HTTP 429", { exact: true }).count());
+  await page.evaluate(state => window.paintUpdate(state), updateState);
+  console.log("PASS update errors show cause and retry time without a false up-to-date result");
   const pendingUpdate = { ...updateState, pendingVersion: "99.0.0" };
   await page.evaluate(state => window.paintUpdate(state), pendingUpdate);
   assert(await about.getByRole("button", { name: "Update and restart" }).isVisible());

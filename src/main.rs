@@ -23,6 +23,8 @@ mod templates;
 mod terminal;
 #[cfg(windows)]
 mod updates;
+#[cfg(windows)]
+mod update_manifest;
 mod usage;
 mod workspace_archive;
 use crate::core::*;

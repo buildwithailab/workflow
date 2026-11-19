@@ -145,14 +145,18 @@ Install the Rust toolchain pinned in `rust-toolchain.toml`, the MSVC build tools
 ```powershell
 .\Build.cmd
 cargo test --locked
-.\scripts\package.ps1
+.\scripts\package.ps1 -ReleaseNotes <release-notes-file>
 ```
 
 The packaging script produces `dist/Workflow-Windows-x64.zip` and a SHA-256 checksum. The integration suite in `tests/integration.cjs` uses Playwright Core and a temporary data profile to exercise Windows terminals, Git, browser actions, previews, and shutdown. Set `WORKFLOW_TEST_EXE` to the executable to test and `WORKFLOW_PLAYWRIGHT` to the Playwright Core module path if installed outside the repository.
 
 ### Publish an update
 
-Match the version in `Cargo.toml`, `Cargo.lock`, and `tauri.conf.json` to the intended stable GitHub tag, such as `v0.1.2`. Enable immutable releases on the repository. Create a draft release, write the release notes, and attach the ZIP, its checksum, and `dist/Workflow-Update-Windows-x64.exe` before publishing. Workflow offers automatic installation for the Windows x64 executable on immutable releases and verifies it against GitHub's SHA-256 asset digest.
+Match the version in `Cargo.toml`, `Cargo.lock`, and `tauri.conf.json` to the intended stable GitHub tag. Before the first signed build, run `powershell -NoProfile -File scripts/init-update-signing.ps1 -Create` on the designated Windows release account. This creates a non-exportable P-256 signing key in that account's Windows key store and writes only its public verification key to `src/update-public-key.txt`. Build after pinning the public key. Other build machines can use that public key, but only the designated release account can sign updates. Losing that account/key requires distributing a manually installed build with a new trusted public key; it cannot be silently rotated or recovered from the repository.
+
+Package with `powershell -NoProfile -File scripts/package.ps1 -Executable <built-exe> -ReleaseNotes <release-notes-file>`. The packaging step signs and locally verifies `dist/Workflow-Update-Windows-x64.json`, binding the stable version, executable name, size, SHA-256, repository, and release notes. It rejects a signing key that differs from the app's pinned public key and an executable built without that pin. No GitHub token or private signing key belongs in source or distribution.
+
+Keep immutable releases enabled. Attach the Windows ZIP, its SHA-256 file, `Workflow-Update-Windows-x64.exe`, and the signed `Workflow-Update-Windows-x64.json` while the release is still a draft, then publish. Test the exact packaged executable and verify all four public downloads against the tested artifacts. Workflow checks the public latest-release JSON asset directly, without GitHub REST API requests or user login, and verifies its signature before trusting release data. Missing or invalid metadata is reported as an error, never as an up-to-date result. Existing immutable releases without this JSON file remain downloadable manually; they must not be edited. Older clients retain their original REST update path until upgraded.
 
 ## License
 

@@ -1,7 +1,8 @@
 use crate::core::{atomic, hash, Core};
+use crate::update_manifest::{version, Package, Release, SignedManifest, ASSET, FEED, MAX_FEED};
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use reqwest::{blocking::Client, redirect::Policy, StatusCode};
+use reqwest::{blocking::Client, header::HeaderMap, redirect::Policy, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -16,47 +17,148 @@ use std::{
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
 const REPO: &str = "https://github.com/buildwithailab/workflow";
-const RELEASES: &str = "https://api.github.com/repos/buildwithailab/workflow/releases";
-const ASSET: &str = "Workflow-Update-Windows-x64.exe";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DAY: i64 = 24 * 60 * 60;
-const MAX_ASSET: u64 = 128 * 1024 * 1024;
 const SUPPORTED: bool = cfg!(all(target_arch = "x86_64", not(debug_assertions)));
-const CHECK_FAILED: &str = "Güncellemeler kontrol edilemedi.";
-const DOWNLOAD_FAILED: &str = "Güncelleme indirilemedi veya doğrulanamadı.";
 const BUSY: &str = "Güncelleme işlemi zaten devam ediyor.";
 
-#[derive(Clone, Deserialize, Serialize)]
-struct Release {
-    version: String,
-    notes: String,
-    package: Option<Package>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FailureKind {
+    RateLimited,
+    AccessDenied,
+    NotPublished,
+    Untrusted,
+    Network,
+    Timeout,
+    Tls,
+    Server,
+    Storage,
+    NoUpdate,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
-struct Package {
-    size: u64,
-    sha256: String,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct Failure {
+    kind: FailureKind,
+    retry_at: Option<i64>,
+    http_status: Option<u16>,
+}
+impl Failure {
+    fn new(kind: FailureKind) -> Self {
+        Self {
+            kind,
+            retry_at: None,
+            http_status: None,
+        }
+    }
+    fn error(kind: FailureKind) -> anyhow::Error {
+        Self::new(kind).into()
+    }
+}
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.kind {
+            FailureKind::RateLimited => "GitHub istek sınırına ulaşıldı. Belirtilen zamandan sonra tekrar dene.",
+            FailureKind::AccessDenied => "Güncelleme sunucusuna erişim engellendi. Ağ veya proxy ayarlarını kontrol et.",
+            FailureKind::NotPublished => "İmzalı güncelleme bilgisi henüz yayımlanmamış. GitHub sürümlerini kontrol et.",
+            FailureKind::Untrusted => "Güncelleme bilgisi veya dosyası doğrulanamadı. Kurulum yapılmadı.",
+            FailureKind::Network => "Güncelleme sunucusuna bağlanılamadı. İnternet veya proxy ayarlarını kontrol et.",
+            FailureKind::Timeout => "Güncelleme sunucusu zamanında yanıt vermedi. Daha sonra tekrar dene.",
+            FailureKind::Tls => "Güncelleme bağlantısının güvenlik sertifikası doğrulanamadı. Sistem tarihi ve ağ ayarlarını kontrol et.",
+            FailureKind::Server => "Güncelleme sunucusu hata döndürdü. Daha sonra tekrar dene.",
+            FailureKind::NoUpdate => "Bu sürüm için kurulabilir güncelleme bulunamadı.",
+            FailureKind::Storage => "Güncelleme dosyası veya ayarları kaydedilemedi. Klasör izinlerini ve boş alanı kontrol et.",
+        })
+    }
+}
+impl std::error::Error for Failure {}
+
+fn response_failure(status: StatusCode, headers: &HeaderMap, now: i64) -> Failure {
+    let seconds = headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.parse::<i64>()
+                .ok()
+                .filter(|v| *v >= 0)
+                .map(|v| now.saturating_add(v))
+                .or_else(|| {
+                    chrono::DateTime::parse_from_rfc2822(v)
+                        .ok()
+                        .map(|v| v.timestamp())
+                })
+        });
+    let remaining_zero = headers
+        .get("x-ratelimit-remaining")
+        .is_some_and(|v| v == "0");
+    let limited = status == StatusCode::TOO_MANY_REQUESTS
+        || (status == StatusCode::FORBIDDEN
+            && (remaining_zero || headers.contains_key("retry-after")));
+    let mut failure = Failure::new(if limited {
+        FailureKind::RateLimited
+    } else if matches!(
+        status,
+        StatusCode::FORBIDDEN
+            | StatusCode::UNAUTHORIZED
+            | StatusCode::PROXY_AUTHENTICATION_REQUIRED
+    ) {
+        FailureKind::AccessDenied
+    } else if status.is_server_error() {
+        FailureKind::Server
+    } else {
+        FailureKind::Untrusted
+    });
+    failure.http_status = Some(status.as_u16());
+    if limited {
+        let reset = remaining_zero
+            .then(|| {
+                headers
+                    .get("x-ratelimit-reset")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<i64>().ok())
+            })
+            .flatten();
+        let retry = seconds.into_iter().chain(reset).max().unwrap_or(now + 60);
+        failure.retry_at = Some(retry.max(now + 1).min(now.saturating_add(7 * DAY)));
+    }
+    failure
 }
 
-#[derive(Deserialize)]
-struct GitHubRelease {
-    tag_name: String,
-    body: Option<String>,
-    draft: bool,
-    prerelease: bool,
-    #[serde(default)]
-    immutable: bool,
-    assets: Vec<GitHubAsset>,
-}
-
-#[derive(Deserialize)]
-struct GitHubAsset {
-    name: String,
-    size: u64,
-    state: String,
-    browser_download_url: String,
-    digest: Option<String>,
+fn transport_failure(error: &(dyn std::error::Error + 'static)) -> anyhow::Error {
+    let mut kind = FailureKind::Network;
+    let mut source = Some(error);
+    while let Some(current) = source {
+        if let Some(http) = current.downcast_ref::<reqwest::Error>() {
+            if http.is_timeout() {
+                kind = FailureKind::Timeout;
+                break;
+            }
+            if http.is_redirect() {
+                kind = FailureKind::Untrusted;
+                break;
+            }
+        }
+        if let Some(io) = current.downcast_ref::<std::io::Error>() {
+            if io.kind() == std::io::ErrorKind::TimedOut {
+                kind = FailureKind::Timeout;
+                break;
+            }
+            if let Some(inner) = io.get_ref() {
+                source = Some(inner);
+                continue;
+            }
+        }
+        let description = current.to_string().to_ascii_lowercase();
+        if ["certificate", "tls", "ssl", "schannel"]
+            .iter()
+            .any(|word| description.contains(word))
+        {
+            kind = FailureKind::Tls;
+        }
+        source = current.source();
+    }
+    // Keep raw transport/proxy strings out of status, logs and persisted errors.
+    Failure::error(kind)
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -67,6 +169,7 @@ struct Cache {
     installed: Option<Release>,
     latest: Option<Release>,
     error: Option<String>,
+    failure: Option<Failure>,
 }
 
 impl Cache {
@@ -102,19 +205,6 @@ enum Mode {
     Download,
 }
 
-fn version(value: &str) -> Option<[u64; 3]> {
-    let mut components = value.split('.');
-    let mut result = [0; 3];
-    for number in &mut result {
-        let part = components.next()?;
-        *number = part.parse().ok()?;
-        if number.to_string() != part {
-            return None;
-        }
-    }
-    components.next().is_none().then_some(result)
-}
-
 fn is_newer(candidate: &str, installed: &str) -> bool {
     matches!((version(candidate), version(installed)), (Some(a), Some(b)) if a > b)
 }
@@ -125,38 +215,6 @@ fn due(last: Option<i64>, now: i64) -> bool {
 
 fn download_url(version: &str) -> String {
     format!("{REPO}/releases/download/v{version}/{ASSET}")
-}
-
-fn release(info: GitHubRelease) -> Option<Release> {
-    let tag = info.tag_name.strip_prefix('v')?;
-    version(tag)?;
-    if info.draft || info.prerelease {
-        return None;
-    }
-    let package = info
-        .immutable
-        .then(|| {
-            let asset = info.assets.iter().find(|asset| asset.name == ASSET)?;
-            let digest = asset.digest.as_deref()?.strip_prefix("sha256:")?;
-            if asset.state != "uploaded"
-                || asset.browser_download_url != download_url(tag)
-                || !(64..=MAX_ASSET).contains(&asset.size)
-                || digest.len() != 64
-                || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-            {
-                return None;
-            }
-            Some(Package {
-                size: asset.size,
-                sha256: digest.to_ascii_lowercase(),
-            })
-        })
-        .flatten();
-    Some(Release {
-        version: tag.to_owned(),
-        notes: info.body.unwrap_or_default().chars().take(40_000).collect(),
-        package,
-    })
 }
 
 fn client() -> Result<Client> {
@@ -185,24 +243,61 @@ fn client() -> Result<Client> {
                 attempt.error("Unsupported update redirect")
             }
         }))
-        .build()?)
+        .build()
+        .map_err(|error| transport_failure(&error))?)
+}
+
+fn metadata_url(reference: &str) -> Option<String> {
+    if reference == "latest" {
+        return Some(format!("{REPO}/releases/latest/download/{FEED}"));
+    }
+    let tag = reference.strip_prefix("tags/v")?;
+    version(tag)?;
+    Some(format!("{REPO}/releases/download/v{tag}/{FEED}"))
 }
 
 fn read_release(client: &Client, reference: &str) -> Result<Option<Release>> {
+    let address = metadata_url(reference).ok_or_else(|| Failure::error(FailureKind::Untrusted))?;
     let response = client
-        .get(format!("{RELEASES}/{reference}"))
-        .header("Accept", "application/vnd.github+json")
+        .get(address)
         .timeout(Duration::from_secs(15))
-        .send()?;
+        .send()
+        .map_err(|error| transport_failure(&error))?;
+    parse_release_response(response, reference)
+}
+
+fn parse_release_response(
+    mut response: reqwest::blocking::Response,
+    reference: &str,
+) -> Result<Option<Release>> {
     if response.status() == StatusCode::NOT_FOUND {
         return Ok(None);
     }
+    if !response.status().is_success() {
+        return Err(response_failure(
+            response.status(),
+            response.headers(),
+            chrono::Utc::now().timestamp(),
+        )
+        .into());
+    }
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_FEED as u64)
+    {
+        return Err(Failure::error(FailureKind::Untrusted));
+    }
     let mut body = Vec::new();
-    response
-        .error_for_status()?
-        .take(512 * 1024)
-        .read_to_end(&mut body)?;
-    Ok(release(serde_json::from_slice(&body)?))
+    (&mut response)
+        .take(MAX_FEED as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|error| transport_failure(&error))?;
+    let release =
+        SignedManifest::parse(&body).ok_or_else(|| Failure::error(FailureKind::Untrusted))?;
+    if reference != "latest" && reference.strip_prefix("tags/v") != Some(release.version.as_str()) {
+        return Err(Failure::error(FailureKind::Untrusted));
+    }
+    Ok(Some(release))
 }
 
 fn verified_package(bytes: &[u8], package: &Package) -> bool {
@@ -212,8 +307,13 @@ fn verified_package(bytes: &[u8], package: &Package) -> bool {
 impl Updates {
     pub fn load(profile: &Path) -> Self {
         let directory = profile.join("updates");
-        let mut cache: Cache = fs::read(directory.join("state.json"))
+        let mut cache: Cache = fs::File::open(directory.join("state.json"))
             .ok()
+            .and_then(|file| {
+                let mut bytes = Vec::new();
+                file.take(1024 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+                (bytes.len() <= 1024 * 1024).then_some(bytes)
+            })
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
         let receipt = directory.join("install-result");
@@ -245,6 +345,10 @@ impl Updates {
     fn status(&self) -> Value {
         let cache = self.cache.lock().unwrap();
         let installation = self.installation.lock().unwrap();
+        let visible_failure = cache
+            .failure
+            .as_ref()
+            .filter(|failure| cache.error.as_deref() == Some(failure.to_string().as_str()));
         let latest = cache
             .latest
             .as_ref()
@@ -268,10 +372,13 @@ impl Updates {
             "available": latest.map(|release| json!({
                 "version": release.version,
                 "notes": release.notes,
-                "downloadable": SUPPORTED && release.package.is_some()
+                "downloadable": SUPPORTED && release.trusted_package().is_some()
             })),
             "pendingVersion": installation.pending.as_ref().map(|update| update.version.as_str()),
-            "error": cache.error
+            "error": cache.error,
+            "errorKind": visible_failure.map(|failure| failure.kind),
+            "retryAt": visible_failure.and_then(|failure| failure.retry_at),
+            "httpStatus": visible_failure.and_then(|failure| failure.http_status)
         })
     }
 
@@ -310,23 +417,66 @@ impl Updates {
         let now = chrono::Utc::now().timestamp();
         {
             let cache = self.cache.lock().unwrap();
+            if let Some(failure) = cache.failure.as_ref().filter(|failure| {
+                failure.kind == FailureKind::RateLimited
+                    && failure.retry_at.is_some_and(|retry| retry > now)
+            }) {
+                return if mode == Mode::Automatic {
+                    Ok(())
+                } else {
+                    Err(failure.clone().into())
+                };
+            }
+            let retry_due = cache
+                .failure
+                .as_ref()
+                .and_then(|failure| failure.retry_at)
+                .is_some_and(|retry| retry <= now);
             if mode == Mode::Automatic
-                && (!SUPPORTED || !cache.automatic() || !due(cache.checked_at, now))
+                && (!SUPPORTED || !cache.automatic() || (!due(cache.checked_at, now) && !retry_due))
             {
                 return Ok(());
             }
         }
-        let result = self.fetch(mode);
+        self.finish_check(now, self.fetch(mode))
+    }
+
+    fn finish_check(&self, now: i64, result: Result<()>) -> Result<()> {
         let mut cache = self.cache.lock().unwrap();
         cache.checked_at = Some(now);
-        cache.error = result.as_ref().err().map(ToString::to_string);
-        self.save(&cache)?;
+        cache.failure = result.as_ref().err().map(|error| {
+            error
+                .downcast_ref::<Failure>()
+                .cloned()
+                .unwrap_or_else(|| Failure::new(FailureKind::Storage))
+        });
+        if let Some(failure) = &mut cache.failure {
+            if matches!(
+                failure.kind,
+                FailureKind::Network
+                    | FailureKind::Tls
+                    | FailureKind::Timeout
+                    | FailureKind::Server
+            ) {
+                failure.retry_at = Some(now + 5 * 60);
+            }
+        }
+        cache.error = cache.failure.as_ref().map(ToString::to_string);
+        if self.save(&cache).is_err() {
+            let failure = Failure::new(FailureKind::Storage);
+            cache.error = Some(failure.to_string());
+            cache.failure = Some(failure.clone());
+            return Err(failure.into());
+        }
         result
     }
 
     fn fetch(&self, mode: Mode) -> Result<()> {
-        let client = client().context(CHECK_FAILED)?;
-        let latest = read_release(&client, "latest").context(CHECK_FAILED)?;
+        let client = client()?;
+        let latest = Some(
+            read_release(&client, "latest")?
+                .ok_or_else(|| Failure::error(FailureKind::NotPublished))?,
+        );
         let known_installed = {
             let cache = self.cache.lock().unwrap();
             cache
@@ -356,18 +506,17 @@ impl Updates {
             }
             cache.latest = latest.clone();
         }
-        let candidate = latest
-            .filter(|release| is_newer(&release.version, VERSION) && release.package.is_some());
+        let candidate = latest.filter(|release| {
+            is_newer(&release.version, VERSION) && release.trusted_package().is_some()
+        });
         let automatic = mode != Mode::Download;
         if SUPPORTED && (!automatic || self.cache.lock().unwrap().automatic()) {
             if let Some(release) = candidate {
-                return self
-                    .download(&client, release, automatic)
-                    .context(DOWNLOAD_FAILED);
+                return self.download(&client, release, automatic);
             }
         }
         if mode == Mode::Download {
-            bail!("Bu sürüm için kurulabilir güncelleme bulunamadı.");
+            return Err(Failure::error(FailureKind::NoUpdate));
         }
         Ok(())
     }
@@ -383,15 +532,34 @@ impl Updates {
         {
             return Ok(());
         }
-        let package = release.package.context(DOWNLOAD_FAILED)?;
-        let response = client
+        let package = release
+            .trusted_package()
+            .ok_or_else(|| Failure::error(FailureKind::Untrusted))?;
+        let mut response = client
             .get(download_url(&release.version))
-            .send()?
-            .error_for_status()?;
+            .send()
+            .map_err(|error| transport_failure(&error))?;
+        if !response.status().is_success() {
+            return Err(response_failure(
+                response.status(),
+                response.headers(),
+                chrono::Utc::now().timestamp(),
+            )
+            .into());
+        }
+        if response
+            .content_length()
+            .is_some_and(|size| size != package.size)
+        {
+            return Err(Failure::error(FailureKind::Untrusted));
+        }
         let mut bytes = Vec::new();
-        response.take(package.size + 1).read_to_end(&mut bytes)?;
+        (&mut response)
+            .take(package.size + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| transport_failure(&error))?;
         if !verified_package(&bytes, &package) {
-            bail!(DOWNLOAD_FAILED);
+            return Err(Failure::error(FailureKind::Untrusted));
         }
         let cache = self.cache.lock().unwrap();
         let mut installation = self.installation.lock().unwrap();
@@ -401,7 +569,7 @@ impl Updates {
         let path = self
             .directory
             .join(format!("{}.download", crate::core::id()));
-        atomic(&path, &bytes)?;
+        atomic(&path, &bytes).map_err(|_| Failure::error(FailureKind::Storage))?;
         if let Some(previous) = installation.pending.replace(Pending {
             version: release.version,
             sha256: package.sha256,
@@ -537,6 +705,250 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::blocking::Response;
+    use std::{
+        io::{BufRead, BufReader, Write},
+        net::TcpListener,
+        sync::mpsc,
+        thread,
+    };
+
+    fn with_loopback_response(wire_response: Vec<u8>, check: impl FnOnce(Response)) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (finish, finished) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            {
+                let mut request = BufReader::new(&mut stream);
+                loop {
+                    let mut line = String::new();
+                    let count = request.read_line(&mut line).unwrap();
+                    if count == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+            }
+            stream.write_all(&wire_response).unwrap();
+            // Keep the connection open so an incomplete response exercises the read timeout.
+            let _ = finished.recv_timeout(Duration::from_secs(5));
+        });
+        let response = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .unwrap();
+        check(response);
+        finish.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    fn assert_failure(result: Result<Option<Release>>, kind: FailureKind) {
+        let Err(error) = result else {
+            panic!("Expected an update error");
+        };
+        assert_eq!(error.downcast_ref::<Failure>().unwrap().kind, kind);
+    }
+
+    #[test]
+    fn metadata_urls_use_public_release_assets() {
+        assert_eq!(
+            metadata_url("latest").as_deref(),
+            Some("https://github.com/buildwithailab/workflow/releases/latest/download/Workflow-Update-Windows-x64.json")
+        );
+        assert_eq!(
+            metadata_url("tags/v1.2.3").as_deref(),
+            Some("https://github.com/buildwithailab/workflow/releases/download/v1.2.3/Workflow-Update-Windows-x64.json")
+        );
+        assert_eq!(
+            download_url("1.2.3"),
+            "https://github.com/buildwithailab/workflow/releases/download/v1.2.3/Workflow-Update-Windows-x64.exe"
+        );
+        assert!(metadata_url("tags/v1.2.3-rc").is_none());
+        assert!(metadata_url("tags/v1.2.3/../latest").is_none());
+    }
+
+    #[test]
+    fn http_failures_distinguish_rate_limits_access_denial_and_server_errors() {
+        let now = 1_700_000_000;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        headers.insert("x-ratelimit-reset", "1700000120".parse().unwrap());
+        headers.insert("retry-after", "90".parse().unwrap());
+        let quota = response_failure(StatusCode::FORBIDDEN, &headers, now);
+        assert_eq!(quota.kind, FailureKind::RateLimited);
+        assert_eq!(quota.http_status, Some(403));
+        assert_eq!(quota.retry_at, Some(now + 120));
+
+        headers.clear();
+        let rate_limit = response_failure(StatusCode::TOO_MANY_REQUESTS, &headers, now);
+        assert_eq!(rate_limit.kind, FailureKind::RateLimited);
+        assert_eq!(rate_limit.http_status, Some(429));
+        assert_eq!(rate_limit.retry_at, Some(now + 60));
+
+        for status in [
+            StatusCode::FORBIDDEN,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+        ] {
+            let denied = response_failure(status, &headers, now);
+            assert_eq!(denied.kind, FailureKind::AccessDenied);
+            assert_eq!(denied.http_status, Some(status.as_u16()));
+            assert_eq!(denied.retry_at, None);
+        }
+        let unavailable = response_failure(StatusCode::SERVICE_UNAVAILABLE, &headers, now);
+        assert_eq!(unavailable.kind, FailureKind::Server);
+        assert_eq!(unavailable.http_status, Some(503));
+        assert_eq!(unavailable.retry_at, None);
+    }
+
+    #[test]
+    fn release_response_distinguishes_missing_and_untrusted_metadata() {
+        with_loopback_response(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            |response| {
+                assert!(matches!(
+                    parse_release_response(response, "latest"),
+                    Ok(None)
+                ))
+            },
+        );
+        with_loopback_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+            |response| {
+                assert_failure(
+                    parse_release_response(response, "latest"),
+                    FailureKind::Untrusted,
+                );
+            },
+        );
+        with_loopback_response(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                MAX_FEED + 1
+            )
+            .into_bytes(),
+            |response| {
+                assert_failure(
+                    parse_release_response(response, "latest"),
+                    FailureKind::Untrusted,
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn release_response_reports_a_body_read_timeout() {
+        with_loopback_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{".to_vec(),
+            |response| {
+                assert_failure(
+                    parse_release_response(response, "latest"),
+                    FailureKind::Timeout,
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn live_rate_backoff_defers_automatic_and_manual_update_requests() {
+        let profile = std::env::temp_dir().join(crate::core::id());
+        let updates = Updates::load(&profile);
+        let now = chrono::Utc::now().timestamp();
+        let last_check = now - 2 * DAY;
+        let retry_at = now + 300;
+        let rate_limit = Failure {
+            kind: FailureKind::RateLimited,
+            retry_at: Some(retry_at),
+            http_status: Some(429),
+        };
+        {
+            let mut cache = updates.cache.lock().unwrap();
+            cache.checked_at = Some(last_check);
+            cache.failure = Some(rate_limit.clone());
+            cache.error = Some(rate_limit.to_string());
+        }
+
+        updates.check(Mode::Automatic).unwrap();
+        for mode in [Mode::Check, Mode::Download] {
+            let error = updates.check(mode).unwrap_err();
+            let failure = error.downcast_ref::<Failure>().unwrap();
+            assert_eq!(failure.kind, FailureKind::RateLimited);
+            assert_eq!(failure.retry_at, Some(retry_at));
+        }
+
+        let status = updates.status();
+        assert_eq!(status["errorKind"], "rate_limited");
+        assert_eq!(status["checkedAt"], last_check);
+        assert_eq!(status["retryAt"], retry_at);
+        assert_eq!(status["httpStatus"], 429);
+        assert!(!profile.exists());
+    }
+
+    #[test]
+    fn storage_save_failure_appears_in_update_status() {
+        let profile = std::env::temp_dir().join(crate::core::id());
+        fs::write(&profile, b"synthetic file blocking the profile directory").unwrap();
+        let updates = Updates::load(&profile);
+        let now = 1_700_000_000;
+
+        let result = updates.finish_check(now, Ok(()));
+        let status = updates.status();
+        fs::remove_file(&profile).unwrap();
+
+        let failure = result.unwrap_err().downcast::<Failure>().unwrap();
+        assert_eq!(failure.kind, FailureKind::Storage);
+        assert_eq!(status["error"], failure.to_string());
+        assert_eq!(status["errorKind"], "storage");
+        assert_eq!(status["checkedAt"], now);
+        assert!(status["httpStatus"].is_null());
+        assert!(status["retryAt"].is_null());
+    }
+
+    #[test]
+    fn installer_receipt_hides_obsolete_http_details_and_preserves_backoff() {
+        let profile = std::env::temp_dir().join(crate::core::id());
+        let updates = Updates::load(&profile);
+        let now = chrono::Utc::now().timestamp();
+        let retry_at = now + 300;
+        let failure = Failure {
+            kind: FailureKind::RateLimited,
+            retry_at: Some(retry_at),
+            http_status: Some(429),
+        };
+        updates
+            .save(&Cache {
+                checked_at: Some(now),
+                error: Some(failure.to_string()),
+                failure: Some(failure),
+                ..Cache::default()
+            })
+            .unwrap();
+        let receipt = updates.directory.join("install-result");
+        fs::write(&receipt, b"failed").unwrap();
+
+        let restored = Updates::load(&profile);
+        assert!(!receipt.exists());
+        fs::remove_file(updates.directory.join("state.json")).unwrap();
+        fs::remove_dir(&updates.directory).unwrap();
+        fs::remove_dir(&profile).unwrap();
+
+        let status = restored.status();
+        assert_eq!(status["error"], "Güncelleme kurulamadı.");
+        assert!(status["errorKind"].is_null());
+        assert!(status["httpStatus"].is_null());
+        assert!(status["retryAt"].is_null());
+        let cache = restored.cache.lock().unwrap();
+        let suppressed = cache.failure.as_ref().unwrap();
+        assert_eq!(suppressed.kind, FailureKind::RateLimited);
+        assert_eq!(suppressed.retry_at, Some(retry_at));
+    }
 
     #[test]
     fn automatic_updates_default_to_on_and_preserve_explicit_settings() {
@@ -565,30 +977,6 @@ mod tests {
         assert!(!is_newer("0.1.8", "0.1.9"));
         assert!(!is_newer("9.1.0-beta", VERSION));
         assert!(!is_newer("09.1.0", VERSION));
-    }
-
-    #[test]
-    fn only_immutable_official_releases_provide_an_installable_asset() {
-        let mut info = json!({
-            "tag_name": "v0.1.3", "draft": false, "prerelease": false, "immutable": true,
-            "body": "Synthetic release notes",
-            "assets": [{
-                "name": ASSET, "size": 1000, "state": "uploaded",
-                "browser_download_url": download_url("0.1.3"),
-                "digest": format!("sha256:{}", hash(b"synthetic executable"))
-            }]
-        });
-        let parse = |data: &Value| release(serde_json::from_value(data.clone()).unwrap());
-        assert!(parse(&info).unwrap().package.is_some());
-        info["immutable"] = json!(false);
-        let legacy = parse(&info).unwrap();
-        assert!(legacy.package.is_none());
-        assert_eq!(legacy.notes, "Synthetic release notes");
-        info["immutable"] = json!(true);
-        info["assets"][0]["browser_download_url"] = json!("https://example.invalid/update.exe");
-        assert!(parse(&info).unwrap().package.is_none());
-        info["prerelease"] = json!(true);
-        assert!(parse(&info).is_none());
     }
 
     #[test]

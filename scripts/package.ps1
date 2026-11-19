@@ -1,4 +1,4 @@
-param([string]$Executable)
+param([string]$Executable, [Parameter(Mandatory)] [string]$ReleaseNotes)
 
 $ErrorActionPreference = 'Stop'
 $workflowRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -19,9 +19,12 @@ for ($workflowOffset = 0; $workflowOffset -lt 2 -and $workflowOffset -lt $workfl
 }
 if ($workflowHasPrivatePath) { throw 'The executable contains a local user path. Rebuild it with Build.cmd.' }
 
+$workflowFeed = Join-Path $workflowRoot 'dist\Workflow-Update-Windows-x64.json'
+# A failed packaging attempt must not leave an older authorization beside new assets.
+if (Test-Path -LiteralPath $workflowFeed) { Remove-Item -LiteralPath $workflowFeed }
 $workflowDistribution = Join-Path $workflowRoot 'dist\Workflow-Windows-x64'
 New-Item -ItemType Directory -Force -Path $workflowDistribution | Out-Null
-Copy-Item -LiteralPath $workflowExecutable -Destination (Join-Path $workflowDistribution 'Workflow.exe') -Force
+[IO.File]::WriteAllBytes((Join-Path $workflowDistribution 'Workflow.exe'), $workflowBytes)
 $workflowDocs = @('Start-Workflow.cmd','README.md','LICENSE','THIRD-PARTY-NOTICES.txt')
 foreach ($workflowFile in $workflowDocs) { Copy-Item -LiteralPath (Join-Path $workflowRoot $workflowFile) -Destination $workflowDistribution -Force }
 $workflowNames = @('Workflow.exe') + $workflowDocs + @('LICENSE-xterm.txt','LICENSE-addon-fit.txt')
@@ -65,4 +68,6 @@ $workflowHash = Get-FileHash -LiteralPath $workflowZip -Algorithm SHA256
 "$($workflowHash.Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($workflowZip))" |
     Set-Content -LiteralPath "$workflowZip.sha256" -Encoding ascii
 $workflowHash | Select-Object Algorithm,Hash,Path
-Copy-Item -LiteralPath $workflowExecutable -Destination (Join-Path $workflowRoot 'dist\Workflow-Update-Windows-x64.exe') -Force
+$workflowRawUpdate = Join-Path $workflowRoot 'dist\Workflow-Update-Windows-x64.exe'
+[IO.File]::WriteAllBytes($workflowRawUpdate, $workflowBytes)
+& (Join-Path $PSScriptRoot 'sign-update.ps1') -Executable $workflowRawUpdate -ReleaseNotes $ReleaseNotes -Output $workflowFeed

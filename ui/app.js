@@ -2423,6 +2423,15 @@ function renderAbout(state, panel = $("#about-updates")) {
     panel.append(el("p", "help", tr("Yeniden başlatma açık oturumları durdurur.")));
   }
   if (state.error) panel.append(el("p", "dialog-error", tr(state.error)));
+  if (state.error && Number.isFinite(state.httpStatus)) {
+    panel.append(el("p", "help", tr("Sunucu yanıtı: HTTP {status}", { status: state.httpStatus })));
+  }
+  if (state.error && Number.isFinite(state.retryAt) && !Number.isNaN(new Date(state.retryAt * 1000).getTime())) {
+    panel.append(el("p", "help", tr("Yeniden deneme zamanı: {time}", {
+      time: new Date(state.retryAt * 1000).toLocaleString(uiLanguage),
+    })));
+  }
+
   if (state.checkedAt) {
     const time = new Date(state.checkedAt * 1000).toLocaleString(uiLanguage);
     panel.append(el("p", "help", tr("Son kontrol {time}", { time })));
