@@ -256,7 +256,13 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
         });
         return Ok(json!({"hash":digest,"text":text}));
     }
-    let _guard = core.operations.lock().unwrap();
+    let repository = core.repository_operations.lock(&[directory.clone()])?;
+    repository.validate(&[directory.clone()])?;
+    if worktree_root(&directory)? != root { bail!(CHANGED); }
+    {
+        let _guard = core.operations.lock().unwrap();
+        if core.root(args)? != directory { bail!(crate::repository_operations::CHANGED); }
+    }
     let (current, status, stamp) = snapshot(&root)?;
     if string(args, "stamp")? != stamp {
         bail!(CHANGED)

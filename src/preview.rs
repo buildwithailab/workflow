@@ -7,7 +7,7 @@ use std::{
     io::{Read, Write},
     net::{Ipv4Addr, TcpListener},
     os::windows::process::CommandExt,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -395,8 +395,18 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             .collect::<HashMap<_, _>>()));
     }
     let sid = string(args, "sessionId")?;
+    let initial = core.session(sid)?;
+    let paths = [PathBuf::from(string(&initial, "directory")?)];
+    let repository = if action == "start" {
+        let guard = core.repository_operations.lock(&paths)?;
+        guard.validate(&paths)?;
+        Some(guard)
+    } else { None };
     let _operation = core.operations.lock().unwrap();
     let session = core.session(sid)?;
+    if repository.is_some() && session["directory"] != initial["directory"] {
+        bail!(crate::repository_operations::CHANGED);
+    }
     if action == "stop" {
         let run = core.previews.get(sid).context("Önizleme başlatılmadı.")?;
         let mut run = run.lock().unwrap();

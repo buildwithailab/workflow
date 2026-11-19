@@ -86,7 +86,11 @@ pub(super) fn read(core: &Core, args: &Value) -> Result<Value> {
 }
 
 pub(super) fn save(core: &Core, args: &Value) -> Result<Value> {
+    let initial = core.root(args)?;
+    let repository = core.repository_operations.lock(&[initial.clone()])?;
+    repository.validate(&[initial.clone()])?;
     let _guard = core.operations.lock().unwrap();
+    if core.root(args)? != initial { bail!(crate::repository_operations::CHANGED); }
     let root = core.root(args)?.canonicalize()?;
     let name = string(args, "path")?;
     let path = editable_path(&root, name).context(CONFLICT)?;

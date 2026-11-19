@@ -15,6 +15,7 @@ mod models;
 #[cfg(windows)]
 mod preview;
 mod provider_setup;
+mod repository_operations;
 mod session_folders;
 mod sharing;
 #[cfg(windows)]
@@ -215,7 +216,6 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             Ok(project)
         }
         "clone" => {
-            let _guard = core.operations.lock().unwrap();
             let address = string(args, "url")?;
             if address.starts_with('-') || address.contains('\n') || address.contains('\r') {
                 bail!("Depo adresi geçersiz")
@@ -235,10 +235,18 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             };
             let destination = safe_path(&parent, name)?;
             core.check_project_directory(external_path(&destination))?;
-            if destination.exists() {
+            if destination.try_exists()? {
                 bail!("Hedef klasör zaten var")
             };
-            crate::core::git(
+            let _repository = core.repository_operations.lock_clone(&destination)?;
+            std::fs::create_dir(&destination).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    anyhow::anyhow!("Hedef klasör zaten var")
+                } else {
+                    anyhow::Error::from(error)
+                }
+            })?;
+            let clone = crate::core::git(
                 &parent,
                 &[
                     "-c",
@@ -249,7 +257,13 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
                     address,
                     &destination.to_string_lossy(),
                 ],
-            )?;
+            );
+            if let Err(error) = clone {
+                // Git can leave an empty, pre-existing destination after a failed clone.
+                // Preserve any files that appeared there while the command was running.
+                let _ = std::fs::remove_dir(&destination);
+                return Err(error);
+            }
             app_action(core, "add_project", &json!({"directory":destination}))
         }
         "remove_project" => {
@@ -290,18 +304,27 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             Ok(core.snapshot())
         }
         "create_session" => {
-            let _guard = core.operations.lock().unwrap();
             let project = core.project(string(args, "projectId")?)?;
+            let roots = [PathBuf::from(string(&project, "directory")?)];
+            let repository = core.repository_operations.lock(&roots)?;
+            repository.validate(&roots)?;
             let session = prepare_session(core, &project, args)?;
-            let mut db = core.db.lock().unwrap();
-            db["sessions"].as_array_mut().unwrap().push(session.clone());
-            if let Err(error) = core.save_workspace(&db) {
-                db["sessions"].as_array_mut().unwrap().pop();
-                drop(db);
+            let publish = (|| -> Result<()> {
+                let _operation = core.operations.lock().unwrap();
+                repository.validate(&roots)?;
+                validate_session_inputs(core, &project, &session)?;
+                let mut db = core.db.lock().unwrap();
+                db["sessions"].as_array_mut().unwrap().push(session.clone());
+                if let Err(error) = core.save_workspace(&db) {
+                    db["sessions"].as_array_mut().unwrap().pop();
+                    return Err(error);
+                }
+                Ok(())
+            })();
+            if let Err(error) = publish {
                 files::discard_new_workspace(core, &session)?;
                 return Err(error);
             }
-            drop(db);
             core.emit("workspace", core.snapshot());
             Ok(session)
         }
@@ -338,7 +361,13 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
                 }
             }
             if let Some(archive) = patch["archived"].as_bool() {
+                let roots = archive_roots(core, sid)?;
+                let repository = core.repository_operations.lock(&roots)?;
                 let _operation = core.operations.lock().unwrap();
+                if archive_roots(core, sid)? != roots {
+                    bail!(repository_operations::CHANGED);
+                }
+                repository.validate(&roots)?;
                 #[cfg(windows)]
                 if archive && core.previews.running(sid) {
                     bail!("Önce bu oturumun önizlemesini durdur")
@@ -460,16 +489,47 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
     }
 }
 
-fn prepare_session(core: &Core, project: &Value, args: &Value) -> Result<Value> {
-    let folder_id = session_folders::folder_id(project, &args["folderId"])?;
-    let provider = string(args, "provider")?;
-    if !["codex", "claude", "copilot"].contains(&provider) {
-        bail!("Sağlayıcı geçersiz");
+fn archive_roots(core: &Core, sid: &str) -> Result<Vec<PathBuf>> {
+    let session = core.session(sid)?;
+    if !matches!(session["workspaceKind"].as_str(), Some("worktree" | "copy")) {
+        return Ok(Vec::new());
     }
-    let account = accounts::Profile::get(core, provider, &args["accountId"])?;
+    let project = core.project(string(&session, "projectId")?)?;
+    let mut roots = vec![PathBuf::from(string(&project, "directory")?)];
+    let directory = PathBuf::from(string(&session, "directory")?);
+    if directory.try_exists()? {
+        roots.push(directory);
+    } else if session["workspaceKind"] == "copy" {
+        // Before a journaled move is committed, a copy can already be at its other slot.
+        let parent = if session["archivedFromDirectory"].is_string() { "workspaces" } else { "archive" };
+        let slot = safe_path(&core.directory, &format!("{parent}/{sid}/files"))?;
+        roots.push(slot);
+    }
+    Ok(roots)
+}
+
+fn validate_session_inputs(core: &Core, project: &Value, args: &Value) -> Result<accounts::Profile> {
+    let current = core.project(string(project, "id")?)?;
+    if current["removed"] == true {
+        bail!("Projeyi önce çalışma alanına ekle.");
+    }
+    if current["directory"] != project["directory"] {
+        bail!(repository_operations::CHANGED);
+    }
+    session_folders::folder_id(&current, &args["folderId"])?;
+    let account = accounts::Profile::get(core, string(args, "provider")?, &args["accountId"])?;
     if !account.verified() {
         bail!("Önce bu hesabı bağla.");
     }
+    Ok(account)
+}
+
+fn prepare_session(core: &Core, project: &Value, args: &Value) -> Result<Value> {
+    let account = {
+        let _operation = core.operations.lock().unwrap();
+        validate_session_inputs(core, project, args)?
+    };
+    let provider = string(args, "provider")?;
     let direct = match args["workspaceMode"].as_str() {
         None | Some("isolated") => false,
         Some("direct") => true,
@@ -485,7 +545,7 @@ fn prepare_session(core: &Core, project: &Value, args: &Value) -> Result<Value> 
     let sid = id();
     let w = files::create_workspace(core, project, &sid, direct)?;
     let mut session = json!({
-        "id":sid, "provider":provider, "accountId":account.id, "projectId":project["id"], "folderId":folder_id,
+        "id":sid, "provider":provider, "accountId":account.id, "projectId":project["id"], "folderId":args["folderId"],
         "name":args["name"].as_str().filter(|s|!s.trim().is_empty()).unwrap_or("Yeni oturum"),
         "createdAt":now(), "directory":w["directory"], "workspaceKind":w["kind"], "branch":w["branch"],
         "state":"stopped", "tools":args["tools"]!=false, "browserAccess":true,

@@ -397,13 +397,23 @@ fn is_codex_mcp_bootstrap_error(bytes: &[u8]) -> bool {
 }
 
 pub fn start(core: &Arc<Core>, session_id: &str) -> Result<Value> {
+    let initial = core.session(session_id)?;
+    let directory = PathBuf::from(string(&initial, "directory")?);
+    let repository = core.repository_operations.lock(&[directory.clone()])?;
+    repository.validate(&[directory])?;
     let _guard = core.operations.lock().unwrap();
+    let session = core.session(session_id)?;
+    if session["directory"] != initial["directory"] {
+        bail!(crate::repository_operations::CHANGED);
+    }
+    if session["archived"] == true {
+        bail!("Arşivlenmiş oturumu önce geri getir.");
+    }
     if let Some(t) = core.terms.lock().unwrap().get(session_id) {
         if !t.exited.load(Ordering::SeqCst) {
             return Ok(t.snapshot());
         }
     }
-    let session = core.session(session_id)?;
     let provider = string(&session, "provider")?;
     let profile = crate::accounts::Profile::get(core, provider, &session["accountId"])?;
     if profile.directory.is_some()

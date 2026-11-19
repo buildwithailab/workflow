@@ -1,6 +1,6 @@
 use crate::{
     core::{atomic, hash, id, safe_path, string, Core},
-    files, prepare_session, usage,
+    files, prepare_session, usage, validate_session_inputs,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -265,12 +265,19 @@ fn capture(core: &Core, args: &Value) -> Result<Template> {
 }
 
 fn apply(core: &Core, args: &Value) -> Result<Value> {
-    let _guard = core.operations.lock().unwrap();
     let project = core.project(string(args, "projectId")?)?;
-    if project["removed"] == true {
+    let roots = [PathBuf::from(string(&project, "directory")?)];
+    let repository = core.repository_operations.lock(&roots)?;
+    repository.validate(&roots)?;
+    let operation = core.operations.lock().unwrap();
+    let current = core.project(string(&project, "id")?)?;
+    if current["directory"] != project["directory"] {
+        bail!(crate::repository_operations::CHANGED);
+    }
+    if current["removed"] == true {
         bail!("Projeyi önce çalışma alanına ekle.");
     }
-    let folder_id = crate::session_folders::folder_id(&project, &args["folderId"])?;
+    let folder_id = crate::session_folders::folder_id(&current, &args["folderId"])?;
     let template_id = string(args, "id")?;
     let template = local_template(core, template_id)?;
     template.validate()?;
@@ -287,31 +294,9 @@ fn apply(core: &Core, args: &Value) -> Result<Value> {
             bail!("Her oturum için kurulu bir sağlayıcı seç.");
         }
     }
+    drop(operation);
     let mut sessions = Vec::new();
     let result = (|| -> Result<()> {
-        let bottom = {
-            let db = core.db.lock().unwrap();
-            db["sessions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|s| s["projectId"] == project["id"] && s["archived"] != true && s["folderId"] == folder_id)
-                .enumerate()
-                .map(|(i, s)| {
-                    s["position"]["y"]
-                        .as_f64()
-                        .unwrap_or(50. + (i / 2) as f64 * 580.)
-                        + s["size"]["height"].as_f64().unwrap_or(500.)
-                        + 80.
-                })
-                .reduce(f64::max)
-        };
-        let first_y = template
-            .sessions
-            .iter()
-            .map(|s| s.position.y)
-            .min()
-            .unwrap();
         for (entry, provider) in template.sessions.iter().zip(providers) {
             let model = (provider.as_str() == Some(entry.provider.as_str()))
                 .then(|| entry.model.as_deref())
@@ -323,17 +308,40 @@ fn apply(core: &Core, args: &Value) -> Result<Value> {
                     "name":entry.name, "provider":provider, "model":model, "workspaceMode":entry.workspace_mode, "folderId":folder_id,
                 }),
             )?;
+            session["initialPrompt"] = json!(entry.initial_prompt);
+            sessions.push(session);
+        }
+        let _operation = core.operations.lock().unwrap();
+        repository.validate(&roots)?;
+        for session in &sessions {
+            validate_session_inputs(core, &project, session)?;
+        }
+        if template_bytes(&local_template(core, template_id)?)? != template_bytes(&template)? {
+            bail!("Şablon değişti. Listeyi yeniden aç ve tekrar dene.");
+        }
+        let mut db = core.db.lock().unwrap();
+        let bottom = db["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["projectId"] == project["id"] && s["archived"] != true && s["folderId"] == folder_id)
+            .enumerate()
+            .map(|(i, s)| {
+                s["position"]["y"].as_f64().unwrap_or(50. + (i / 2) as f64 * 580.)
+                    + s["size"]["height"].as_f64().unwrap_or(500.)
+                    + 80.
+            })
+            .reduce(f64::max);
+        let first_y = template.sessions.iter().map(|s| s.position.y).min().unwrap();
+        for (session, entry) in sessions.iter_mut().zip(&template.sessions) {
             session["position"] = json!({
                 "x":entry.position.x, "y":bottom.map(|y| y + f64::from(entry.position.y - first_y)).unwrap_or(f64::from(entry.position.y)),
             });
-            session["initialPrompt"] = json!(entry.initial_prompt);
-            sessions.push(session);
         }
         let links = template.links.iter().map(|l| json!({
             "id":id(), "source":sessions[l.source]["id"], "target":sessions[l.target]["id"],
             "sourceConversation":null, "targetConversation":null, "read":l.read, "files":l.files, "work":l.work,
         }));
-        let mut db = core.db.lock().unwrap();
         let mut updated = db.clone();
         updated["sessions"]
             .as_array_mut()

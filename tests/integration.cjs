@@ -853,6 +853,10 @@ async function testArchiveStorage() {
   assertLocations(copy, true);
   assert.equal(fs.readFileSync(path.join(archivedCopy.directory, "copy-only.txt"), "utf8"), "preserved file\n");
   const archivedTree = await change(worktree, true);
+  for (const session of [direct, copy, worktree]) {
+    await assert.rejects(api("terminal", "start", { id: session.id }), /Arşivlenmiş|Restore the archived/);
+    assert.equal((await api("app", "state")).active.some(run => run.id === session.id), false);
+  }
   assertLocations(worktree, true);
   assert.equal(archivedTree.archivedFromDirectory, worktree.directory);
   assert.equal(fs.realpathSync(archivedTree.directory), fs.realpathSync(path.join(slot(worktree, true), "files", "component")));
@@ -963,6 +967,127 @@ async function testArchiveStorage() {
   console.log("PASS physical workspace archive and recovery, General and named folder archive and restore, and retry after a partial move");
 }
 
+async function testRepositoryConcurrency() {
+  const base = path.join(temporary, "repository-concurrency");
+  const main = path.join(base, "main"), peer = path.join(base, "peer"), other = path.join(base, "other");
+  const hooks = path.join(base, "hooks"), ready = path.join(base, "ready"), release = path.join(base, "release");
+  fs.mkdirSync(hooks, { recursive: true });
+  const gitAt = (cwd, ...args) => cp.execFileSync("git", args, { cwd, encoding: "utf8", windowsHide: true });
+  const initialize = folder => {
+    fs.mkdirSync(folder);
+    gitAt(folder, "init", "-b", "main");
+    gitAt(folder, "config", "user.name", "Workflow Test");
+    gitAt(folder, "config", "user.email", "test@localhost");
+    gitAt(folder, "config", "commit.gpgsign", "false");
+    gitAt(folder, "config", "core.autocrlf", "false");
+    gitAt(folder, "config", "core.hooksPath", hooks);
+    fs.writeFileSync(path.join(folder, "file.txt"), "base\n");
+    gitAt(folder, "add", "file.txt");gitAt(folder, "commit", "-m", "Synthetic concurrency baseline");
+  };
+  for (const folder of [main, other]) initialize(folder);
+  gitAt(main, "worktree", "add", "-b", "peer", peer);
+  await start("", path.join(base, "profile"));
+  const a = await api("app", "add_project", { directory: main });
+  const aPeer = await api("app", "add_project", { directory: peer });
+  const b = await api("app", "add_project", { directory: other });
+  assert.notEqual(a.id, aPeer.id);
+  const source = await api("app", "create_session", { projectId: a.id, provider: "codex" });
+  const peerSession = await api("app", "create_session", { projectId: aPeer.id, provider: "codex", workspaceMode: "direct" });
+  const bSession = await api("app", "create_session", { projectId: b.id, provider: "codex", workspaceMode: "direct" });
+  fs.writeFileSync(path.join(source.directory, "file.txt"), "merged source\n");
+  gitAt(source.directory, "add", "file.txt");gitAt(source.directory, "commit", "-m", "Synthetic concurrent merge");
+  const context = { projectId: a.id };
+  const peerContext = { projectId: aPeer.id, sessionId: peerSession.id, path: "file.txt" };
+  const bContext = { projectId: b.id, sessionId: bSession.id, path: "file.txt" };
+  const peerDraft = await api("files", "edit_read", peerContext), bDraft = await api("files", "edit_read", bContext);
+  const plan = await api("git", "state", context);
+  const sourceBranch = gitAt(source.directory, "branch", "--show-current").trim();
+  const sh = text => "'" + text.replace(/'/g, "'\\''") + "'";
+  const posix = file => file.replace(/\\/g, "/");
+  fs.writeFileSync(path.join(hooks, "post-merge"), [
+    "#!/bin/sh",
+    `if [ "$(git rev-parse --show-toplevel)" = ${sh(posix(main))} ]; then`,
+    `  printf ready > ${sh(posix(ready))}`,
+    "  i=0",
+    `  while [ ! -f ${sh(posix(release))} ] && [ "$i" -lt 600 ]; do sleep 0.1; i=$((i+1)); done`,
+    "fi", "",
+  ].join("\n"));
+  const requests = [];
+  const request = (domain, action, args) => {
+    const state = { done: false, value: undefined, error: null };
+    state.promise = api(domain, action, args).then(value => { state.value = value; state.done = true; }, error => { state.error = error; state.done = true; });
+    requests.push(state);return state;
+  };
+  const result = async state => { await state.promise;if (state.error) throw state.error;return state.value; };
+  try {
+    const merge = request("git", "merge", { ...context, target: sourceBranch, stamp: plan.stamp });
+    await until(() => fs.existsSync(ready), "real target post-merge hook", 15000);
+    assert.equal(merge.done, false);
+    // Queue the same-repository operations first: they must not hold the app-wide lock.
+    const peerStart = request("terminal", "start", { id: peerSession.id });
+    const peerSave = request("files", "edit_save", { ...peerContext, revision: peerDraft.revision, text: "peer saved\n" });
+    await sleep(150);
+    const bStart = request("terminal", "start", { id: bSession.id });
+    const bSave = request("files", "edit_save", { ...bContext, revision: bDraft.revision, text: "other saved\n" });
+    await until(() => bStart.done && bSave.done, "unrelated terminal and editor while Git hook waits", 8000);
+    assert((await result(bStart)).pid > 0);assert.equal(await result(bSave), true);
+    assert.equal(fs.readFileSync(path.join(other, "file.txt"), "utf8"), "other saved\n");
+    assert.equal(fs.existsSync(release), false);
+    assert.equal(merge.done, false);assert.equal(peerStart.done, false);assert.equal(peerSave.done, false);
+    fs.writeFileSync(release, "release\n");
+    assert.equal((await result(merge)).state.head, gitAt(source.directory, "rev-parse", "HEAD").trim());
+    assert((await result(peerStart)).pid > 0);assert.equal(await result(peerSave), true);
+    assert.equal(gitAt(main, "rev-parse", "HEAD").trim(), gitAt(source.directory, "rev-parse", "HEAD").trim());
+    assert.equal(fs.readFileSync(path.join(main, "file.txt"), "utf8"), "merged source\n");
+    assert.equal(fs.readFileSync(path.join(peer, "file.txt"), "utf8"), "peer saved\n");
+    const pendingFolder = path.join(base, "pending");initialize(pendingFolder);
+    const pendingProject = await api("app", "add_project", { directory: pendingFolder });
+    fs.unlinkSync(ready);fs.unlinkSync(release);
+    fs.writeFileSync(path.join(hooks, "post-checkout"), [
+      "#!/bin/sh", `printf ready > ${sh(posix(ready))}`, "i=0",
+      `while [ ! -f ${sh(posix(release))} ] && [ "$i" -lt 600 ]; do sleep 0.1; i=$((i+1)); done`, "",
+    ].join("\n"));
+    const creation = request("app", "create_session", { projectId: pendingProject.id, provider: "codex" });
+    await until(() => fs.existsSync(ready), "workspace preparation hook", 15000);
+    const removed = request("app", "remove_project", { id: pendingProject.id });
+    await until(() => removed.done, "metadata while workspace hook waits", 8000);await result(removed);
+    assert.equal(creation.done, false);
+    fs.writeFileSync(release, "release\n");await creation.promise;
+    assert(creation.error);assert.match(String(creation.error), /Projeyi önce|Add the project/);
+    assert.equal((await api("app", "state")).sessions.filter(s => s.projectId === pendingProject.id).length, 0);
+    assert.equal(gitAt(pendingFolder, "worktree", "list", "--porcelain").match(/worktree /g).length, 1);
+    assert.equal(gitAt(pendingFolder, "for-each-ref", "--format=%(refname)", "refs/heads/workflow/"), "");
+  } finally {
+    fs.writeFileSync(release, "release\n");
+    await Promise.all(requests.map(state => state.promise));
+    await stop();
+  }
+  console.log("PASS repository-scoped Git locking: real target hook blocks linked-worktree writes, independent project terminal and save finish before release");
+}
+
+async function testRepositoryWithoutGit() {
+  const base = path.join(temporary, "repository-without-git"), folder = path.join(base, "project"), emptyPath = path.join(base, "empty-path");
+  fs.mkdirSync(folder, { recursive: true });fs.mkdirSync(emptyPath);
+  const gitAt = (...args) => cp.execFileSync("git", args, { cwd: folder, encoding: "utf8", windowsHide: true });
+  gitAt("init", "-b", "main");
+  fs.writeFileSync(path.join(folder, "file.txt"), "source\n");
+  gitAt("add", "file.txt");
+  gitAt("-c", "core.hooksPath=" + emptyPath, "-c", "commit.gpgsign=false", "-c", "user.name=Fixture", "-c", "user.email=fixture@localhost", "commit", "-m", "Synthetic Git optional baseline");
+  await start("", path.join(base, "profile"), { PATH: emptyPath, Path: emptyPath });
+  const project = await api("app", "add_project", { directory: folder });
+  const session = await api("app", "create_session", { projectId: project.id, provider: "codex", tools: false });
+  assert.equal(session.workspaceKind, "copy");
+  const context = { projectId: project.id, sessionId: session.id, path: "file.txt" };
+  const draft = await api("files", "edit_read", context);
+  assert.equal(await api("files", "edit_save", { ...context, revision: draft.revision, text: "saved without Git\n" }), true);
+  assert((await api("terminal", "start", { id: session.id })).pid > 0);
+  assert.equal(fs.readFileSync(path.join(session.directory, "file.txt"), "utf8"), "saved without Git\n");
+  assert.equal(fs.readFileSync(path.join(folder, "file.txt"), "utf8"), "source\n");
+  assert.equal((await api("git", "state", context)).available, false);
+  await stop();
+  console.log("PASS Git optional: missing executable preserves copy workspaces, terminal startup and editor saves in an existing repository");
+}
+
 async function test() {
   const git = (args) =>
     cp.execFileSync("git", args, {
@@ -1041,6 +1166,8 @@ async function test() {
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   if (process.platform === "win32") {
+    await testRepositoryWithoutGit();
+    await testRepositoryConcurrency();
     await testCodexChat();
     await testAdditionalProviderChats();
     await testPendingChatInteraction();
@@ -2044,6 +2171,9 @@ async function test() {
   await historyRow.getByRole("button", { name: "Geri getir", exact: true }).waitFor();
   assert.match(await historyRow.locator("xpath=ancestor::details[@data-history-group='archive']").locator(":scope > summary").textContent(), /^Arşiv/);
   await historyRow.getByRole("button", { name: "Geri getir", exact: true }).click();
+  await page.locator("#dialog").waitFor({ state: "hidden" });
+  await loginCard.waitFor({ state: "visible" });
+  assert.equal((await api("app", "state")).sessions.find(s => s.id === login.id).archived, false);
   const secondRun = await api("terminal", "start", { id: login.id });
   pids.push(secondRun.pid);
   await loginOptions.click();

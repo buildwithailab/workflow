@@ -345,7 +345,11 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             Ok(d)
         }
         "restore" => {
+            let initial = core.root(args)?;
+            let repository = core.repository_operations.lock(&[initial.clone()])?;
+            repository.validate(&[initial.clone()])?;
             let _guard = core.operations.lock().unwrap();
+            if core.root(args)? != initial { bail!(crate::repository_operations::CHANGED); }
             let (root, b, _) = comparison(core, args)?;
             require_restore_checkout(core, args, &root)?;
             let name = string(args, "path")?;
@@ -398,7 +402,11 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             Ok(record)
         }
         "undo_restore" => {
+            let initial = core.root(args)?;
+            let repository = core.repository_operations.lock(&[initial.clone()])?;
+            repository.validate(&[initial.clone()])?;
             let _guard = core.operations.lock().unwrap();
+            if core.root(args)? != initial { bail!(crate::repository_operations::CHANGED); }
             let token = string(args, "token")?;
             uuid::Uuid::parse_str(token)?;
             let journal = core.directory.join("undo").join(format!("{token}.json"));
@@ -464,12 +472,20 @@ pub fn apply_bytes(p: &Path, bytes: Option<&[u8]>) -> Result<()> {
     }
 }
 fn transfer(core: &Core, args: &Value, undo: bool) -> Result<Value> {
+    let initial_root = core.root(args)?;
+    let initial_session = core.session(string(args, "sessionId")?)?;
+    let initial_project = core.project(string(&initial_session, "projectId")?)?;
+    let initial_main = PathBuf::from(string(&initial_project, "directory")?);
+    let paths = [initial_root.clone(), initial_main.clone()];
+    let repository = core.repository_operations.lock(&paths)?;
+    repository.validate(&paths)?;
     let _guard = core.operations.lock().unwrap();
     let sid = string(args, "sessionId")?;
     let session = core.session(sid)?;
     let project = core.project(string(&session, "projectId")?)?;
     let main = PathBuf::from(string(&project, "directory")?);
     let root = core.root(args)?;
+    if root != initial_root || main != initial_main { bail!(crate::repository_operations::CHANGED); }
     let mut record = if undo {
         let token = string(args, "token")?;
         uuid::Uuid::parse_str(token)?;

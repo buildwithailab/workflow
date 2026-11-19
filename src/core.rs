@@ -170,6 +170,7 @@ pub struct Core {
     #[cfg(windows)]
     pub updates: crate::updates::Updates,
     pub operations: Mutex<()>,
+    pub(crate) repository_operations: crate::repository_operations::RepositoryOperations,
     pub app: AppHandle,
     pub endpoint: Mutex<String>,
     pub pending: Mutex<HashMap<String, Value>>,
@@ -210,6 +211,7 @@ impl Core {
             #[cfg(windows)]
             previews: crate::preview::Previews::default(),
             operations: Mutex::new(()),
+            repository_operations: crate::repository_operations::RepositoryOperations::default(),
             app,
             endpoint: Mutex::new(String::new()),
             pending: Mutex::new(HashMap::new()),
