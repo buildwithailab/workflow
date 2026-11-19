@@ -148,6 +148,8 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
         "provider_install" => provider_setup::install(core, args),
         "provider_account_add" => accounts::add(core, args),
         "provider_account_verify" => usage::verify_account(core, args),
+        "provider_account_remove" => accounts::set_removed(core, args, true),
+        "provider_account_restore" => accounts::set_removed(core, args, false),
         "providers" => {
             let mut providers = vec![];
             for (name, label) in [
@@ -157,7 +159,7 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             ] {
                 let exe = usage::executable(core, name);
                 providers.push(
-                    json!({"id":name,"name":label,"installed":exe.is_some(),"executable":exe,"accounts":accounts::list(core,name)}),
+                    json!({"id":name,"name":label,"installed":exe.is_some(),"executable":exe,"accounts":accounts::list(core,name),"removedAccounts":accounts::removed(core,name)}),
                 );
             }
             Ok(json!(providers))

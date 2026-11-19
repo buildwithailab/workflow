@@ -951,6 +951,16 @@ body.no-left .sidebar {
   gap: 12px;
   margin-bottom: 12px;
 }
+.removed-provider-accounts {
+  margin: 12px 0;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+.removed-provider-accounts summary {
+  color: var(--muted);
+  cursor: pointer;
+  margin-bottom: 12px;
+}
 .account-manager-row .grow {
   min-width: 0;
   overflow-wrap: anywhere;

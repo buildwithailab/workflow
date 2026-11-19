@@ -69,7 +69,7 @@ fn list(core: &Core, session: &Value) -> Result<Vec<Value>> {
     let provider = string(session, "provider")?;
     let directory = string(session, "directory")?;
     let canonical = Path::new(directory).canonicalize().ok();
-    let profile = Profile::get(core, provider, &session["accountId"])?;
+    let profile = Profile::for_history(core, provider, &session["accountId"])?;
     let mut out = logs(provider, &profile)
         .iter()
         .filter_map(|p| metadata(p, provider))
@@ -110,7 +110,7 @@ fn matches_session_directory(cwd: &str, current: Option<&Path>, session: &Value)
 
 pub(crate) fn bound_log(core: &Core, session: &Value, thread: &str) -> Result<Option<PathBuf>> {
     let provider = string(session, "provider")?;
-    let profile = Profile::get(core, provider, &session["accountId"])?;
+    let profile = Profile::for_history(core, provider, &session["accountId"])?;
     let paths = logs(provider, &profile);
     let suffix = format!("-{thread}");
     let named = |path: &Path| {

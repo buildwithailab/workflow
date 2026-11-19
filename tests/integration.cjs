@@ -3216,6 +3216,8 @@ async function test() {
     await dialog.getByPlaceholder("Örn. İş").fill(accountName);
     await dialog.getByRole("button", { name: "Hesap ekle", exact: true }).click();
     await dialog.getByText("Sağlayıcının giriş adımlarını takip et.").waitFor();
+    const signingIn = (await api("app", "providers")).find(p => p.id === provider).accounts.find(a => a.name === accountName);
+    await assert.rejects(api("app", "provider_account_remove", { provider, accountId: signingIn.id }), /giriş işlemini tamamla veya kapat/);
     await dialog.locator(".xterm-helper-textarea").focus();
     await page.keyboard.type("connect");
     await page.keyboard.press("Enter");
@@ -3259,7 +3261,61 @@ async function test() {
       const attached = await api("terminal", "attach", { id: session.id });
       return Buffer.from(attached.data, "base64").toString().includes("Account: " + account.id);
     }, provider + " selected account PTY");
+    await assert.rejects(api("app", "provider_account_remove", { provider, accountId: account.id }), /çalışan oturumları durdur/);
+    await assert.rejects(api("app", "provider_account_remove", { provider, accountId: "default" }), /Varsayılan hesap/);
+    await card.getByRole("button", { name: "Hesaplar", exact: true }).click();
+    assert(await dialog.locator(`[data-account-id="${account.id}"]`).getByRole("button", { name: "Kaldır", exact: true }).isDisabled());
+    assert.equal(await dialog.locator('[data-account-id="default"]').getByRole("button", { name: "Kaldır", exact: true }).count(), 0);
+    await dialog.locator("#dialog-footer button").click();
+    await api("terminal", "stop", { id: session.id, runId: run.runId });
+    await until(async () => !(await api("app", "state")).active.some(a => a.id === session.id), "account session stopped");
+    const variable = { codex: "CODEX_HOME", claude: "CLAUDE_CONFIG_DIR", copilot: "COPILOT_HOME" }[provider];
+    const accountDirectory = path.join(data, "accounts", variable, account.id);
+    const conversationId = require("crypto").randomUUID();
+    const logDirectory = path.join(accountDirectory, { codex: "sessions", claude: "projects", copilot: "session-state" }[provider]);
+    fs.mkdirSync(logDirectory, { recursive: true });
+    const metadata = provider === "codex"
+      ? { type: "session_meta", payload: { id: conversationId, cwd: session.directory, timestamp: new Date().toISOString() } }
+      : provider === "claude" ? { sessionId: conversationId, cwd: session.directory }
+      : { type: "session.start", data: { sessionId: conversationId, cwd: session.directory } };
+    const historyMessage = provider === "copilot" ? { type: "user.message", data: { content: "Synthetic preserved history" } } : { role: "user", content: "Synthetic preserved history" };
+    fs.writeFileSync(path.join(logDirectory, conversationId + ".jsonl"), [metadata, historyMessage].map(v => JSON.stringify(v)).join("\n") + "\n");
+    await api("history", "bind", { id: session.id, conversationId });
+    const retainedSession = (await api("app", "state")).sessions.find(s => s.id === session.id);
+    const fileHashes = (directory) => Object.fromEntries(fs.readdirSync(directory, { recursive: true, withFileTypes: true })
+      .filter(entry => entry.isFile()).map(entry => {
+        const file = path.join(entry.parentPath || entry.path, entry.name);
+        return [path.relative(directory, file), createHash("sha256").update(fs.readFileSync(file)).digest("hex")];
+      }));
+    const preserved = fileHashes(accountDirectory);
+    await page.evaluate(() => window.sync());
+    await card.getByRole("button", { name: "Hesaplar", exact: true }).click();
+    await dialog.locator(`[data-account-id="${account.id}"]`).getByRole("button", { name: "Kaldır", exact: true }).click();
+    await dialog.locator(`[data-account-id="${account.id}"]`).waitFor({ state: "hidden" });
+    const removedProvider = (await api("app", "providers")).find(p => p.id === provider);
+    assert(!removedProvider.accounts.some(a => a.id === account.id));
+    assert(removedProvider.removedAccounts.some(a => a.id === account.id));
+    assert.deepEqual(fileHashes(accountDirectory), preserved);
+    assert.deepEqual((await api("app", "state")).sessions.find(s => s.id === session.id), retainedSession);
+    assert((await api("history", "list", { id: session.id })).some(row => row.id === conversationId));
+    const retainedHistory = await api("history", "messages", { id: session.id });
+    assert.equal(retainedHistory.conversationId, conversationId);
+    assert(retainedHistory.messages.some(message => message.text.includes("Synthetic preserved history")));
+    for (const [domain, action, args] of [
+      ["terminal", "start", { id: session.id }], ["app", "provider_usage", { provider, accountId: account.id }],
+      ["provider_login", "start", { provider, accountId: account.id }],
+      ["app", "create_session", { projectId: p.id, provider, accountId: account.id }],
+    ]) await assert.rejects(api(domain, action, args), /Workflow’dan kaldırılmış/);
+    await dialog.locator(".removed-provider-accounts summary").click();
+    await dialog.locator(`[data-removed-account-id="${account.id}"]`).getByRole("button", { name: "Geri ekle", exact: true }).click();
+    await dialog.locator(`[data-account-id="${account.id}"]`).waitFor();
+    await dialog.locator("#dialog-footer button").click();
+    assert.equal(await quota(account.id), managedQuota);
+    const resumed = await api("terminal", "start", { id: session.id });
+    pids.push(resumed.pid);
+    assert.equal((await api("app", "state")).sessions.find(s => s.id === session.id).accountId, account.id);
   }
+  console.log("PASS three-provider account removal and restore, live/login guards, retained files/history, and no account fallback");
   const changedAuth = path.join(data, "accounts", "COPILOT_HOME", addedAccounts.copilot, "auth-status.json");
   const originalAuth = fs.readFileSync(changedAuth);
   fs.writeFileSync(changedAuth, JSON.stringify({ login: "fixture" }));

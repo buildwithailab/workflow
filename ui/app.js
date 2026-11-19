@@ -1136,7 +1136,7 @@ function renderCards() {
     v.account.hidden =
       (!s.accountId || s.accountId === defaultAccount) &&
       (providerInfo(s.provider)?.accounts.length || 0) < 2;
-    v.account.textContent = account ? accountLabel(account) : tr("Hesap");
+    v.account.textContent = account ? accountLabel(account) : tr("Kaldırılmış hesap");
     v.account.title = tr("Sağlayıcı hesabı · ") + v.account.textContent;
     v.card.style.left = (s.position?.x ?? 40 + (index % 2) * 780) + "px";
     v.card.style.top =
@@ -2644,21 +2644,58 @@ function openProviderAccounts(provider) {
   const list = el("div", "provider-account-manager");
   const name = input("", tr("Örn. İş"));
   const connect = (accountId) => openProviderLogin(provider, accountId);
-  for (const account of providerInfo(provider).accounts) {
-    const row = el("div", "row account-manager-row");
-    const label = el("div", "grow");
-    label.append(
-      el("strong", "", accountLabel(account)),
-      el("small", "", account.id === defaultAccount
-        ? tr("Bilgisayardaki mevcut sağlayıcı girişi")
-        : account.verified ? tr("Hesap bağlandı") : tr("Giriş bekleniyor")),
-    );
-    row.append(label, button(
-      account.verified ? tr("Girişi aç") : tr("Hesabı bağla"),
-      () => connect(account.id),
-    ));
-    list.append(row);
-  }
+  const rows = el("div");
+  list.append(rows);
+  const changeMembership = async (accountId, removed) => {
+    await api("app", removed ? "provider_account_remove" : "provider_account_restore", { provider, accountId });
+    await scanProviders();
+    await sync();
+    if (list.isConnected && $("#dialog").open) paintRows();
+    toast(tr(removed ? "Hesap Workflow’dan kaldırıldı. Geçmiş ve yerel dosyalar korundu." : "Hesap yeniden eklendi."));
+  };
+  const paintRows = () => {
+    rows.replaceChildren();
+    for (const account of providerInfo(provider).accounts) {
+      const row = el("div", "row account-manager-row");
+      row.dataset.accountId = account.id;
+      const label = el("div", "grow");
+      const running = db.sessions.some((session) => session.provider === provider &&
+        session.accountId === account.id && active(session.id));
+      label.append(
+        el("strong", "", accountLabel(account)),
+        el("small", "", account.id === defaultAccount
+          ? tr("Bilgisayardaki mevcut sağlayıcı girişi")
+          : running ? tr("Kaldırmak için bu hesaba bağlı çalışan oturumları durdur.")
+          : account.verified ? tr("Hesap bağlandı") : tr("Giriş bekleniyor")),
+      );
+      row.append(label, button(
+        account.verified ? tr("Girişi aç") : tr("Hesabı bağla"),
+        () => connect(account.id),
+      ));
+      if (account.id !== defaultAccount) {
+        const remove = button(tr("Kaldır"), () => {}, "quiet", tr("Hesabı Workflow’dan kaldır"));
+        remove.disabled = running;
+        remove.onclick = busy(remove, () => changeMembership(account.id, true));
+        row.append(remove);
+      }
+      rows.append(row);
+    }
+    const removed = providerInfo(provider).removedAccounts || [];
+    if (removed.length) {
+      const details = el("details", "removed-provider-accounts");
+      details.append(el("summary", "", tr("Kaldırılan hesaplar") + " · " + removed.length));
+      for (const account of removed) {
+        const row = el("div", "row account-manager-row");
+        row.dataset.removedAccountId = account.id;
+        const restore = button(tr("Geri ekle"), () => {});
+        restore.onclick = busy(restore, () => changeMembership(account.id, false));
+        row.append(el("strong", "grow", accountLabel(account)), restore);
+        details.append(row);
+      }
+      rows.append(details);
+    }
+  };
+  paintRows();
   const add = button(tr("Hesap ekle"), () => {}, "primary");
   add.onclick = busy(add, async () => {
     const err = list.querySelector(".dialog-error");
@@ -2673,7 +2710,8 @@ function openProviderAccounts(provider) {
       list.append(el("p", "dialog-error", uiError(e)));
     }
   });
-  list.append(field(tr("Yeni hesap adı"), name), add);
+  list.append(field(tr("Yeni hesap adı"), name), add,
+    el("p", "help", tr("Kaldırılan hesapların oturum geçmişi ve yerel dosyaları korunur. Eski oturumlar başka bir hesaba geçirilmez.")));
   modal(names[provider] + tr(" · Hesaplar"), list);
 }
 async function openProviderLogin(provider, accountId = defaultAccount) {

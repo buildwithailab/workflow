@@ -731,6 +731,14 @@ pub struct LoginTerminal {
     pub terminal: Arc<LiveTerminal>,
 }
 
+impl LoginTerminal {
+    pub(crate) fn uses_account(&self, provider: &str, account_id: &str) -> bool {
+        self.provider == provider
+            && self.account_id == account_id
+            && !self.terminal.exited.load(Ordering::SeqCst)
+    }
+}
+
 pub fn login(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
     let _guard = (action == "start").then(|| core.operations.lock().unwrap());
     let mut current = core.login_terminal.lock().unwrap();

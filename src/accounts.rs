@@ -14,6 +14,15 @@ pub struct Profile {
 
 impl Profile {
     pub fn get(core: &Core, provider: &str, value: &Value) -> Result<Self> {
+        Self::resolve(core, provider, value, false)
+    }
+
+    // History may read a retired profile, but launches, login, models and quota requests may not.
+    pub(crate) fn for_history(core: &Core, provider: &str, value: &Value) -> Result<Self> {
+        Self::resolve(core, provider, value, true)
+    }
+
+    fn resolve(core: &Core, provider: &str, value: &Value, allow_removed: bool) -> Result<Self> {
         let variable = match provider {
             "codex" => "CODEX_HOME",
             "claude" => "CLAUDE_CONFIG_DIR",
@@ -38,6 +47,9 @@ impl Profile {
         let entry = &db["providers"][provider]["accounts"][id];
         if !entry.is_object() {
             bail!("Bu sağlayıcı için hesap bulunamadı");
+        }
+        if !allow_removed && entry["removed"] == true {
+            bail!("Bu hesap Workflow’dan kaldırılmış. Hesaplar bölümünden geri ekle.");
         }
         let directory = core.directory.join("accounts").join(variable).join(id);
         Ok(Self {
@@ -146,12 +158,89 @@ impl Profile {
     }
 }
 
-pub fn list(core: &Core, provider: &str) -> Vec<Value> {
-    let db = core.db.lock().unwrap();
-    let mut rows = vec![json!({"id":DEFAULT,"name":"Varsayılan hesap","verified":true})];
+fn rows(db: &Value, provider: &str, removed: bool) -> Vec<Value> {
+    let mut rows = if removed {
+        vec![]
+    } else {
+        vec![json!({"id":DEFAULT,"name":"Varsayılan hesap","verified":true})]
+    };
     rows.extend(db["providers"][provider]["accounts"].as_object().into_iter().flatten()
+        .filter(|(_, entry)| (entry["removed"] == true) == removed)
         .map(|(id, entry)| json!({"id":id,"name":entry["name"],"verified":entry["identity"].is_string()})));
     rows
+}
+
+pub fn list(core: &Core, provider: &str) -> Vec<Value> {
+    rows(&core.db.lock().unwrap(), provider, false)
+}
+
+pub fn removed(core: &Core, provider: &str) -> Vec<Value> {
+    rows(&core.db.lock().unwrap(), provider, true)
+}
+
+fn change_membership(
+    db: &mut Value,
+    provider: &str,
+    account_id: &str,
+    removed: bool,
+) -> Result<()> {
+    if account_id == DEFAULT {
+        bail!("Varsayılan hesap Workflow’dan kaldırılamaz.");
+    }
+    let entry = db
+        .get_mut("providers")
+        .and_then(|providers| providers.get_mut(provider))
+        .and_then(|provider| provider.get_mut("accounts"))
+        .and_then(|accounts| accounts.get_mut(account_id))
+        .filter(|entry| entry.is_object())
+        .context("Bu sağlayıcı için hesap bulunamadı")?;
+    entry["removed"] = json!(removed);
+    Ok(())
+}
+
+pub fn set_removed(core: &Core, args: &Value, removed: bool) -> Result<Value> {
+    let provider = string(args, "provider")?;
+    let account_id = string(args, "accountId")?;
+    let _guard = core.operations.lock().unwrap();
+    Profile::for_history(core, provider, &args["accountId"])?;
+    if account_id == DEFAULT {
+        bail!("Varsayılan hesap Workflow’dan kaldırılamaz.");
+    }
+    if core
+        .login_terminal
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|login| login.uses_account(provider, account_id))
+    {
+        bail!("Bu hesap için açık olan giriş işlemini tamamla veya kapat.");
+    }
+    let mut db = core.db.lock().unwrap();
+    let terms = core.terms.lock().unwrap();
+    let running = db["sessions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|session| {
+            session["provider"] == provider
+                && session["accountId"] == account_id
+                && session["id"]
+                    .as_str()
+                    .and_then(|id| terms.get(id))
+                    .is_some_and(|terminal| {
+                        !terminal.exited.load(std::sync::atomic::Ordering::SeqCst)
+                    })
+        });
+    if running {
+        bail!("Hesabı kaldırmadan önce bu hesaba bağlı çalışan oturumları durdur.");
+    }
+    drop(terms);
+    let mut updated = db.clone();
+    change_membership(&mut updated, provider, account_id, removed)?;
+    // Commit the metadata only after durable storage succeeds. Account files and sessions stay intact.
+    core.save_workspace(&updated)?;
+    *db = updated;
+    Ok(json!(true))
 }
 
 pub fn add(core: &Core, args: &Value) -> Result<Value> {
@@ -185,6 +274,9 @@ pub fn verify(core: &Core, provider: &str, profile: &Profile, identity: &str) ->
             bail!("Bu hesap zaten başka bir profil olarak ekli.");
         }
         let entry = accounts.get_mut(&profile.id).context("Hesap bulunamadı")?;
+        if entry["removed"] == true {
+            bail!("Bu hesap Workflow’dan kaldırılmış. Hesaplar bölümünden geri ekle.");
+        }
         if entry["identity"]
             .as_str()
             .is_some_and(|previous| previous != identity)
@@ -194,4 +286,35 @@ pub fn verify(core: &Core, provider: &str, profile: &Profile, identity: &str) ->
         entry["identity"] = json!(identity);
     }
     core.save()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removing_and_restoring_accounts_keeps_session_binding_and_identity() {
+        let account_id = id();
+        let mut db = json!({"providers":{"codex":{"accounts":{}}},
+            "sessions":[{"accountId":account_id,"conversationId":id()}],"preferences":{"unchanged":true}});
+        db["providers"]["codex"]["accounts"][&account_id] =
+            json!({"name":"Synthetic account","identity":id()});
+        let original = db.clone();
+        change_membership(&mut db, "codex", &account_id, true).unwrap();
+        assert_eq!(rows(&db, "codex", false).len(), 1);
+        assert_eq!(rows(&db, "codex", true).len(), 1);
+        assert_eq!(db["sessions"], original["sessions"]);
+        assert_eq!(db["preferences"], original["preferences"]);
+        assert_eq!(
+            db["providers"]["codex"]["accounts"][&account_id]["identity"],
+            original["providers"]["codex"]["accounts"][&account_id]["identity"]
+        );
+        change_membership(&mut db, "codex", &account_id, false).unwrap();
+        assert_eq!(rows(&db, "codex", false).len(), 2);
+        assert!(rows(&db, "codex", true).is_empty());
+        let before = db.clone();
+        assert!(change_membership(&mut db, "codex", DEFAULT, true).is_err());
+        assert!(change_membership(&mut db, "claude", &account_id, true).is_err());
+        assert_eq!(db, before);
+    }
 }
