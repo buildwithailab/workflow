@@ -607,6 +607,276 @@ async function testAdditionalProviderChats() {
   console.log("PASS Claude and Copilot Chat retain native conversation, file references, draft and approval settings");
 }
 
+async function testSessionNotifications() {
+  const profile = path.join(temporary, "notification-profile");
+  const folder = path.join(temporary, "notification-project");
+  const other = path.join(temporary, "notification-other-project");
+  for (const directory of [folder, other]) {
+    fs.mkdirSync(directory);
+    fs.writeFileSync(path.join(directory, "chat-terminal-fixture"), "");
+  }
+  await start("", profile);
+  const skip = page.locator("#dialog").getByRole("button", { name: "Skip", exact: true });
+  if (await skip.isVisible()) await skip.click();
+  const p = await api("app", "add_project", { directory: folder });
+  const q = await api("app", "add_project", { directory: other });
+  const followed = await api("app", "create_session", { projectId: q.id, provider: "codex", workspaceMode: "direct", tools: false });
+  await page.evaluate(async id => { await window.workflow.refresh(); window.workflow.selectSession(id, true); setMode("focus"); }, followed.id);
+  const notificationMainHandle = cp.execFileSync("powershell", ["-NoProfile", "-Command",
+    '(Get-Process -Id ' + child.pid + ').MainWindowHandle.ToInt64()'], { windowsHide: true, encoding: "utf8" }).trim();
+  assert(/^\d+$/.test(notificationMainHandle) && Number(notificationMainHandle) > 0);
+  // Focus the synthetic application window, never an existing user terminal.
+  const focusWindow = () => cp.execFileSync("powershell", ["-NoProfile", "-Command",
+    'Add-Type -TypeDefinition \'using System; using System.Runtime.InteropServices; public static class WorkflowFocusFixture { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n); }\'; $w=[IntPtr]' + notificationMainHandle + '; [WorkflowFocusFixture]::ShowWindow($w,9) | Out-Null; [WorkflowFocusFixture]::SetForegroundWindow($w) | Out-Null'
+  ], { windowsHide: true, stdio: "pipe" });
+  focusWindow();
+  await page.locator("#project-title").click();
+  await until(() => page.evaluate(() => document.hasFocus()), "native notification test window focused");
+  assert.equal((await api("notifications", "read")).enabled, true, "notifications default to enabled");
+  const nativePage = await api("browser", "open", {
+    sessionId: followed.id, url: "http://127.0.0.1:" + server.address().port, newTab: true,
+  });
+  await page.evaluate(() => window.workflow.openPanel("browser"));
+  await until(async () => (await api("browser", "read", { sessionId: followed.id, pageId: nativePage.id })).elements.some(element => element.text === "Save"), "native child browser active during notification test");
+
+  const cases = [];
+  for (const provider of ["codex", "claude", "copilot"]) {
+    const s = await api("app", "create_session", { projectId: p.id, provider, workspaceMode: "direct", tools: false });
+    const logs = provider === "codex" ? path.join(profile, "test-codex-home/sessions")
+      : provider === "claude" ? path.join(profile, "test-claude-home/projects/notice")
+      : path.join(profile, "test-copilot-home/session-state", s.id);
+    fs.mkdirSync(logs, { recursive: true });
+    const log = path.join(logs, provider === "copilot" ? "events.jsonl" : s.id + ".jsonl");
+    const append = (...rows) => fs.appendFileSync(log, rows.map(row => JSON.stringify(row) + "\n").join(""));
+    const row = (type, payload = {}) => provider === "codex" ? { type: "event_msg", timestamp: new Date().toISOString(), payload: { type, ...payload } }
+      : provider === "claude" ? { type, timestamp: new Date().toISOString(), sessionId: s.id, cwd: s.directory, message: { content: payload.text || "" }, ...payload }
+      : { type, timestamp: new Date().toISOString(), data: { ...payload, content: payload.text || "" } };
+    if (provider === "codex") append({ type: "session_meta", payload: { id: s.id, cwd: s.directory, timestamp: new Date().toISOString() } });
+    if (provider === "copilot") append(row("session.start", { sessionId: s.id, context: { cwd: s.directory } }));
+    const work = text => provider === "codex" ? append(row("task_started"), row("user_message", { message: text }))
+      : append(row(provider === "claude" ? "user" : "user.message", { text }));
+    const finish = answer => provider === "codex" ? append(row("task_complete", { last_agent_message: answer }))
+      : provider === "claude" ? append(row("assistant", { message: { content: [{ type: "text", text: answer }], stop_reason: "end_turn" } }))
+      : append(row("assistant.message", { text: answer }), row("assistant.turn_end"));
+    work("An earlier synthetic request."); finish("An earlier result.");
+    await api("history", "bind", { id: s.id, conversationId: s.id });
+    const run = await api("terminal", "start", { id: s.id });
+    await page.evaluate(id => window.workflow.selectSession(id, true), followed.id);
+    cases.push({ s, run, work, finish, append, row });
+  }
+  await sleep(2200);
+  assert.deepEqual((await api("notifications", "read")).entries, [], "old history and initial ready prompts never notify");
+  const first = cases[0];
+  first.work("Perform the synthetic change.");
+  await sleep(1100);
+  first.finish("The requested change is ready.");
+  const entries = async () => (await api("notifications", "read")).entries;
+  const notice = await until(async () => (await entries()).find(entry => entry.sessionId === first.s.id), "unattached session completion notification");
+  assert.equal(notice.kind, "completed");
+  await page.locator("#session-notification").getByRole("button", { name: "View result", exact: true }).waitFor();
+  assert(await page.evaluate(() => {
+    const card = document.querySelector("#session-notification").getBoundingClientRect();
+    const child = document.querySelector("#browser-surface").getBoundingClientRect();
+    return card.right <= child.left;
+  }), "notification is outside the native child browser and cannot be occluded by it");
+  assert.equal(await page.locator('.rail-project[data-project-id="' + p.id + '"] .project-attention').textContent(), "✓");
+  const captures = path.join(root, "target/notification-qa");
+  fs.mkdirSync(captures, { recursive: true });
+  await page.screenshot({ path: path.join(captures, "single-card.png") });
+  await sleep(9500);
+  assert(await page.locator("#session-notification").isHidden(), "context heartbeat does not restart the completion-card timer");
+  assert((await entries()).some(entry => entry.id === notice.id), "transient-card expiry leaves the unseen completion marker");
+  await page.locator("#notifications-toggle").click();
+  await page.locator("#notification-list .notification-row-open").first().click();
+  assert.equal(await page.evaluate(() => focusId), first.s.id);
+  assert.equal((await api("terminal", "attach", { id: first.s.id })).runId, first.run.runId, "opening a notification keeps the same run");
+  await until(async () => !(await entries()).length, "viewing completion clears its badge");
+
+  first.work("A foreground request."); await sleep(1100); first.finish("The foreground request is ready.");
+  await sleep(1800);
+  assert(await page.locator("#session-notification").isHidden(), "followed foreground session never shows a card");
+  assert(!(await entries()).some(entry => entry.sessionId === first.s.id), "followed result is already seen");
+  await page.evaluate(id => window.workflow.selectSession(id, true), followed.id);
+  for (const item of cases.slice(1)) {
+    const background = item.s.provider === "copilot";
+    const nativeBefore = (await api("notifications", "read")).diagnostics;
+    assert.equal(nativeBefore.desktopAttempts, 0, "embedded browser does not make a foreground window look like background");
+    if (background) {
+      cp.execFileSync("powershell", ["-NoProfile", "-Command", 'Add-Type -TypeDefinition \'using System; using System.Runtime.InteropServices; public static class WorkflowMinimizeFixture { [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n); }\'; [WorkflowMinimizeFixture]::ShowWindow([IntPtr]' + notificationMainHandle + ',6) | Out-Null'], { windowsHide: true, stdio: "pipe" });
+      await until(async () => !(await api("notifications", "read")).foreground, "minimized native window is not foreground");
+    }
+    item.work("Check this synthetic change."); await sleep(1100); item.finish("The check passed.");
+    await until(async () => (await entries()).some(entry => entry.sessionId === item.s.id && entry.kind === "completed"), item.s.provider + " completion");
+    if (background) {
+      const native = await until(async () => {
+        const snapshot = await api("notifications", "read");
+        return snapshot.diagnostics.desktopShown > nativeBefore.desktopShown && snapshot.diagnostics.popupVisible && snapshot.diagnostics.overlayApplied && snapshot;
+      }, "visible independent Windows notification card and taskbar overlay");
+      assert.equal(native.diagnostics.overlayKind, "completed");
+      assert.equal(native.diagnostics.mainMinimized, true);
+      assert.equal(native.diagnostics.popupMinimized, false);
+      await until(() => page.locator("#session-notification").isHidden(), "background native alert has no duplicate in-app card");
+      focusWindow();
+      await page.locator("#project-title").click();
+    }
+  }
+  await page.locator("#notifications-toggle").click();
+  assert.equal(await page.locator("#notification-list .notification-row").count(), 2);
+  await page.keyboard.press("Escape");
+  const idsBeforeReload = (await entries()).map(entry => entry.id).sort();
+  await page.reload();
+  await page.waitForFunction(() => !!window.workflow);
+  await sleep(1000);
+  assert.deepEqual((await entries()).map(entry => entry.id).sort(), idsBeforeReload, "reattaching UI does not duplicate history");
+  assert(await page.locator("#session-notification").isHidden(), "reload does not replay cards");
+  await page.locator("#app-settings").click();
+  const enabled = page.getByRole("checkbox", { name: "Session notifications", exact: true });
+  assert(await enabled.isChecked());
+  await enabled.uncheck();
+  await until(async () => !(await api("notifications", "read")).enabled, "master notification toggle saves");
+  assert.equal(await page.locator(".project-attention").count(), 0);
+  assert(await page.locator("#notifications-count").isHidden());
+  await page.locator("#dialog-close").click();
+  first.work("Muted synthetic request."); await sleep(1100); first.finish("Muted result.");
+  await sleep(1300);
+  assert(await page.locator("#session-notification").isHidden());
+  await page.locator("#app-settings").click();
+  await enabled.check();
+  await page.locator("#dialog-close").click();
+  await sleep(1700);
+  assert.deepEqual(await entries(), [], "re-enable does not replay results completed while muted");
+  assert(await page.locator("#session-notification").isHidden());
+  focusWindow();
+  await page.locator("#project-title").click();
+  await until(async () => (await api("notifications", "read")).foreground, "main window focused for the in-app question card");
+  first.work("Choose the files for this synthetic check.");
+  await sleep(1100);
+  first.finish("Which files should I check?\n1. One file\n2. All files");
+  const question = await until(async () => (await entries()).find(entry => entry.sessionId === first.s.id && entry.kind === "question"), "structured response question is actionable attention");
+  await until(async () => (await api("notifications", "read")).diagnostics.overlayKind === "attention", "pending attention has taskbar priority");
+  if (!(await page.locator("#session-notification").isVisible())) {
+    console.log("In-app question presentation", JSON.stringify(await page.evaluate(() => ({ foreground:notificationState.foreground,
+      dialog:document.querySelector('#dialog').open, queued:notificationState.entries.map(e=>({kind:e.kind,presentation:e.presentation,presented:e.presented,silent:e.silent,dismissed:e.dismissed})),
+      hasCard:!!notificationCardId }))));
+  }
+  await page.locator("#session-notification").getByRole("button", { name: "Dismiss notification", exact: true }).click();
+  assert((await entries()).some(entry => entry.id === question.id), "closing pending card keeps its marker");
+  await page.evaluate(id => window.workflow.selectSession(id, true), first.s.id);
+  assert((await entries()).some(entry => entry.id === question.id), "opening a question keeps pending attention");
+  first.work("I choose one file.");
+  await until(async () => !(await entries()).some(entry => entry.id === question.id), "next user turn resolves the structured question");
+  await page.locator("#app-settings").click();
+  await enabled.uncheck();
+  await page.locator("#dialog-close").click();
+  await stop();
+  await start("", profile);
+  assert.equal((await api("notifications", "read")).enabled, false, "notification preference persists after application restart");
+  assert.equal((await api("app", "state")).active.length, 0, "notification support does not restart providers");
+  await stop();
+  console.log("PASS notification cards, all-provider completions, project badges, focused-session suppression, deduplication, routing and persistent master switch");
+}
+
+async function testMinimizedSelectedNotifications() {
+  const profile = path.join(temporary, "minimized-selected-profile");
+  const folder = path.join(temporary, "minimized-selected-workspace");
+  fs.mkdirSync(folder);
+  for (const marker of ["chat-terminal-fixture", "notification-terminal-fixture"]) fs.writeFileSync(path.join(folder, marker), "");
+  await start("", profile);
+  const skip = page.locator("#dialog").getByRole("button", { name: "Skip", exact: true });
+  if (await skip.isVisible()) await skip.click();
+  const project = await api("app", "add_project", { directory: folder });
+  const s = await api("app", "create_session", { projectId: project.id, provider: "codex", workspaceMode: "direct", tools: false });
+  await page.evaluate(async id => { await window.workflow.refresh(); window.workflow.selectSession(id, true); setMode("focus"); }, s.id);
+  const run = await api("terminal", "start", { id: s.id });
+  await page.evaluate(() => window.workflow.refresh());
+  const nativeWindow = (operation, handle = 0) => cp.execFileSync("powershell", ["-NoProfile", "-Command",
+    'Add-Type -TypeDefinition \'using System; using System.Runtime.InteropServices; public static class NotificationWindowFixture { [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int n); [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h,uint m,IntPtr w,IntPtr l); }\'; '
+      + (operation === "handle" ? '(Get-Process -Id ' + child.pid + ').MainWindowHandle.ToInt64()'
+        : operation === "foreground" ? '[NotificationWindowFixture]::GetForegroundWindow().ToInt64()'
+        : operation === "minimize" ? '[NotificationWindowFixture]::ShowWindow([IntPtr]' + handle + ',6) | Out-Null'
+        : operation === "close" ? '[NotificationWindowFixture]::PostMessageW([IntPtr]' + handle + ',16,[IntPtr]::Zero,[IntPtr]::Zero) | Out-Null'
+        : '[NotificationWindowFixture]::ShowWindow([IntPtr]' + handle + ',9) | Out-Null; [NotificationWindowFixture]::SetForegroundWindow([IntPtr]' + handle + ') | Out-Null')
+  ], { windowsHide: true, encoding: "utf8", stdio: "pipe" }).trim();
+  const mainHandle = nativeWindow("handle");
+  assert(Number(mainHandle) > 0);
+  nativeWindow("restore", mainHandle);
+  await page.locator("#project-title").click();
+  await until(() => page.evaluate(() => notificationFollowing() === focusId), "selected live session is being followed");
+  assert((await api("app", "state")).sessions.find(item => item.id === s.id).conversationId == null);
+  const popupPage = await until(() => browser.contexts().flatMap(c => c.pages()).find(p => /\/notification\.html$/.test(p.url())), "isolated popup WebView");
+  for (const [domain, action] of [["app", "state"], ["terminal", "start"], ["files", "list"], ["teams", "send"]]) {
+    await assert.rejects(popupPage.evaluate(({ domain, action }) => window.__TAURI__.core.invoke("dispatch", { domain, action, args: {} }), { domain, action }), /erişemez/);
+  }
+  const externalBrowser = await playwright.chromium.launch({ channel: "msedge", headless: false, args: ["--no-first-run", "--no-default-browser-check"] });
+  try {
+    const external = await externalBrowser.newPage();
+    await external.setContent("<!doctype html><title>Workflow notification focus fixture</title><h1>Notification focus fixture</h1>");
+    const send = text => api("terminal", "write", { id: s.id, runId: run.runId, data: text + "\r" });
+    const entries = async () => (await api("notifications", "read")).entries;
+    const waitPopup = async kind => {
+      const state = await until(async () => {
+        const state = await api("notifications", "read");
+        return state.diagnostics.popupVisible && !state.diagnostics.popupMinimized && state.entries.some(entry => entry.sessionId === s.id && entry.kind === kind && entry.presented) && state;
+      }, "visible desktop " + kind + " card while main remains minimized");
+      assert.equal(state.diagnostics.mainMinimized, true);
+      await popupPage.locator('#card[data-kind="' + kind + '"]').waitFor();
+      const content = await popupPage.locator("body").textContent();
+      assert(!content.includes(folder) && !content.includes(s.id) && !content.includes(project.name), "desktop card contains no session paths or project identity");
+      return state.entries.find(entry => entry.sessionId === s.id && entry.kind === kind);
+    };
+    nativeWindow("restore", mainHandle);
+    await page.locator("#project-title").click();
+    await page.evaluate(() => updateNotificationContext(true));
+    const stale = await page.evaluate(() => ({ sessionId: focusId, focused: true, contextToken: notificationContextToken, contextRevision: ++notificationContextRevision, language: uiLanguage }));
+    await send("short");
+    nativeWindow("minimize", mainHandle);
+    await external.bringToFront();
+    const externalFocus = nativeWindow("foreground");
+    assert.notEqual(externalFocus, mainHandle);
+    const completed = await waitPopup("completed");
+    assert.equal(nativeWindow("foreground"), externalFocus, "desktop card never steals foreground focus");
+    await api("notifications", "context", stale);
+    await api("notifications", "seen", { id: completed.id });
+    assert((await entries()).some(entry => entry.id === completed.id), "stale foreground context or seen cannot consume a minimized selected session result");
+    const captures = path.join(root, "target/notification-qa");
+    fs.mkdirSync(captures, { recursive: true });
+    await popupPage.screenshot({ path: path.join(captures, "desktop-completed.png") });
+    await popupPage.locator("#open").click();
+    await until(async () => !(await api("notifications", "read")).diagnostics.mainMinimized, "popup opens the existing main window");
+    await until(() => page.evaluate(id => focusId === id, s.id), "popup selects the same existing session");
+    assert.equal((await api("terminal", "attach", { id: s.id })).runId, run.runId);
+    assert(!(await entries()).some(entry => entry.id === completed.id));
+
+    for (const kind of ["approval", "question"]) {
+      await send(kind);
+      nativeWindow("minimize", mainHandle);
+      await external.bringToFront();
+      const foregroundBefore = nativeWindow("foreground");
+      const pending = await waitPopup(kind);
+      assert.equal(nativeWindow("foreground"), foregroundBefore);
+      await popupPage.screenshot({ path: path.join(captures, "desktop-" + kind + ".png") });
+      if (kind === "approval") {
+        console.log("PASS independent approval card visibly displayed without restoring main or taking focus");
+        await sleep(process.env.WORKFLOW_TEST_NOTIFICATION_CAPTURE === "1" ? 30000 : 10500);
+        assert((await api("notifications", "read")).diagnostics.popupVisible, "approval card does not expire like a completed card");
+        await popupPage.locator("#dismiss").click();
+        assert((await entries()).some(entry => entry.id === pending.id), "desktop dismiss preserves approval marker");
+        await send("answer");
+        await waitPopup("completed");
+        await popupPage.locator("#open").click();
+        await until(async () => !(await api("notifications", "read")).diagnostics.mainMinimized, "restore after approval answer");
+      } else {
+        nativeWindow("close", mainHandle);
+        await until(() => child.exitCode !== null, "closing main also destroys the independent question card", 10000);
+        let alive = true;
+        try { process.kill(run.pid, 0); } catch { alive = false; }
+        assert.equal(alive, false, "main close stops its provider even while popup is visible");
+      }
+    }
+  } finally { await externalBrowser.close(); await stop(); }
+  console.log("PASS actual selected-session minimize order, short Codex reply without duration footer, stale acknowledgement rejection, visible completion/approval/question cards, exact routing and main-close lifecycle");
+}
+
 async function testPendingChatInteraction() {
   for (const [provider, replyMode] of [["codex", "choice"], ["claude", "choice"], ["copilot", "choice"], ["codex", "custom"]]) {
     const profile = path.join(temporary, provider + "-" + replyMode + "-interaction-profile");
@@ -705,6 +975,12 @@ async function testPendingChatInteraction() {
       await send.click();
     }
     await card.getByText("Approval required", { exact: true }).waitFor();
+    const attentionEntries = async () => (await api("notifications", "read")).entries.filter(entry => entry.sessionId === s.id);
+    const approvalNotice = await until(async () => (await attentionEntries()).find(entry => entry.kind === "approval"), provider + " approval notification independent of terminal rendering");
+    await api("notifications", "dismiss", { id: approvalNotice.id });
+    assert((await attentionEntries()).some(entry => entry.id === approvalNotice.id), "dismissing the card does not resolve approval");
+    await api("notifications", "seen", { id: approvalNotice.id });
+    assert((await attentionEntries()).some(entry => entry.id === approvalNotice.id), "opening the session does not resolve approval");
     assert.match(await card.locator("pre").textContent(), /Read the sample notes/);
     assert.match(await card.locator("pre").textContent(), /2\. No/);
     const live = await api("chat", "read", { id: s.id });
@@ -723,6 +999,10 @@ async function testPendingChatInteraction() {
     const answerFixture = () => api("terminal", "write", { id: s.id, runId, data: "1\r" });
     await answerFixture();
     await card.getByRole("radiogroup", { name: "Apply the change where?" }).waitFor();
+    const questionNotice = await until(async () => (await attentionEntries()).find(entry => entry.kind === "question"), provider + " question replaces answered approval");
+    assert(!(await attentionEntries()).some(entry => entry.id === approvalNotice.id), "answered approval clears its marker");
+    await sleep(1000);
+    assert.equal((await attentionEntries()).find(entry => entry.kind === "question")?.id, questionNotice.id, "question redraw does not duplicate notifications");
     const choiceMenu = async () => (await api("chat", "read", { id: s.id })).terminalPrompt?.menu;
     const first = await choiceMenu();
     assert.deepEqual(first.choices, ["Only one", "All of them"]);
@@ -1295,7 +1575,24 @@ async function test() {
     );
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  if (process.env.WORKFLOW_TEST_NOTIFICATIONS_ONLY === "minimized") {
+    await testMinimizedSelectedNotifications();
+    return;
+  }
+  if (process.env.WORKFLOW_TEST_NOTIFICATIONS_ONLY === "existing") {
+    await testSessionNotifications();
+    await testPendingChatInteraction();
+    return;
+  }
+  if (process.env.WORKFLOW_TEST_NOTIFICATIONS_ONLY === "1") {
+    await testMinimizedSelectedNotifications();
+    await testSessionNotifications();
+    await testPendingChatInteraction();
+    return;
+  }
   if (process.platform === "win32") {
+    await testMinimizedSelectedNotifications();
+    await testSessionNotifications();
     await testRepositoryWithoutGit();
     await testRepositoryConcurrency();
     await testCodexChat();

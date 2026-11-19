@@ -136,6 +136,12 @@ Terminals that enable bracketed paste keep the original line breaks. Otherwise, 
 
 Workflow stores projects, session metadata, terminal output, layout, and conversation IDs locally. Closing the app stops its terminals and preview servers. Reopening restores the workspace, and the play button on a session card resumes a verified conversation. The default profile is `%LOCALAPPDATA%\local.workflow.desktop`. Set `WORKFLOW_DATA_DIR` before launch to use a separate profile.
 
+## Session notifications
+
+Workflow shows a single card when work finishes or a session needs an approval or answer. Project badges and the Windows taskbar indicator highlight waiting sessions. Waiting badges stay until you respond; dismissing a card does not answer the question. Click a card to open the existing session.
+
+When Workflow is minimized or in the background, a small desktop card appears without taking focus. It shows only the Workflow name and a general status. The session you are following stays quiet while its window is in the foreground. Turn cards and attention badges on or off in **Settings → Session notifications**.
+
 ## Updates
 
 Open **Settings → About and updates** to see the installed version, check for a newer release, and read the release notes. Automatic updates are on by default and can be turned off here. Workflow checks once a day while it is open. When a verified update is ready, choose **Update and restart** from the notification or the settings screen, or let Workflow install it when you close the app. Restarting stops open terminals and keeps your existing profile.

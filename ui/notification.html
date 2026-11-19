@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src ipc: http://ipc.localhost; base-uri 'none'; form-action 'none'; frame-src 'none'; object-src 'none'">
+    <title>Workflow</title>
+    <link rel="stylesheet" href="notification.css">
+    <script src="notification.js" defer></script>
+  </head>
+  <body>
+    <article id="card" aria-live="polite" aria-atomic="true">
+      <header>
+        <svg class="wordmark" viewBox="0 0 64 70" aria-hidden="true">
+          <path d="M6 17 16 54 28 27 39 54 50 17M55 50h3" />
+        </svg>
+        <strong>Workflow</strong>
+        <button id="dismiss" class="close" type="button" aria-label="Dismiss notification" disabled>
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8"/></svg>
+        </button>
+      </header>
+      <div class="state" hidden><span id="symbol" aria-hidden="true"></span><h1 id="message"></h1></div>
+      <footer hidden><button id="open" type="button" disabled></button></footer>
+    </article>
+  </body>
+</html>

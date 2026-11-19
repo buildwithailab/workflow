@@ -162,6 +162,9 @@ fn chat_terminal(provider: &str) -> io::Result<()> {
     } {
         return Err(io::Error::last_os_error());
     }
+    if env::current_dir()?.join("notification-terminal-fixture").is_file() {
+        return notification_terminal();
+    }
     let native = provider != "codex";
     let ready = "\x1b[?2004h\x1b[2J\x1b[H› Ask Codex to do anything\x1b[1;3H";
     let footer = if provider == "claude" {
@@ -434,5 +437,46 @@ fn chat_terminal(provider: &str) -> io::Result<()> {
     io::stdout().flush()?;
     // Keep the same process available so the renderer can reattach to it.
     while input.read(&mut packet)? > 0 {}
+    Ok(())
+}
+
+#[cfg(windows)]
+fn notification_terminal() -> io::Result<()> {
+    let signal = |kind: &str| print!("\x1b]7501;state={kind}:app=codex\x1b\\");
+    let ready = || print!("\x1b[?2004h\x1b[2J\x1b[HDone.\r\n› Ask Codex to do anything\x1b[2;3H");
+    signal("idle");
+    ready();
+    io::stdout().flush()?;
+    let mut pending = false;
+    let mut bytes = Vec::new();
+    for byte in io::stdin().bytes() {
+        let byte = byte?;
+        if byte != b'\r' && byte != b'\n' {
+            bytes.push(byte);
+            continue;
+        }
+        let command = String::from_utf8_lossy(&bytes).replace("\x1b[200~", "").replace("\x1b[201~", "");
+        bytes.clear();
+        if command.trim().is_empty() { continue; }
+        signal("working");
+        print!("\x1b[2J\x1b[HWorking…");
+        io::stdout().flush()?;
+        std::thread::sleep(std::time::Duration::from_millis(1800));
+        if !pending && matches!(command.trim(), "question" | "approval") {
+            pending = true;
+            if command.trim() == "question" {
+                print!("\x1b]7501;state=blocked:app=codex:kind=question\x1b\\");
+                print!("\x1b[2J\x1b[HQuestion 1/1 (1 unanswered)\r\nWhich files should I check?\r\n› 1. Only one\r\n  2. All files\r\nTab to add notes · Enter to submit answer · Esc to interrupt");
+            } else {
+                print!("\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\");
+                print!("\x1b[2J\x1b[HWould you like to run the following command?\r\n$ echo fixture\r\n› 1. Yes, proceed\r\n  2. No\r\nPress enter to confirm or esc to cancel");
+            }
+        } else {
+            pending = false;
+            if command.trim() == "error" { signal("error"); } else { signal("done"); }
+            ready();
+        }
+        io::stdout().flush()?;
+    }
     Ok(())
 }

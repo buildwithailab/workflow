@@ -111,6 +111,10 @@
           <h1 id="project-title">Çalışma alanı</h1>
           <span class="badge" id="session-count">0 oturum</span>
           <div class="grow"></div>
+          <button class="icon quiet" id="notifications-toggle" type="button" title="Bildirimler" aria-label="Bildirimler" aria-haspopup="dialog" aria-expanded="false" aria-controls="notification-list">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></svg>
+            <span id="notifications-count" hidden></span>
+          </button>
           <button
             class="quiet"
             id="show-providers"
@@ -514,11 +518,14 @@
       <p class="help">Yeniden başlatma açık oturumları durdurur.</p>
       <button id="update-now" class="primary" type="button">Güncelle ve yeniden başlat</button>
     </aside>
+    <section id="notification-list" popover="auto" role="dialog" aria-label="Bildirimler"></section>
+    <aside id="session-notification" aria-label="Oturum bildirimi" role="status" aria-live="polite" hidden></aside>
     <script src="vendor/xterm.js"></script>
     <script src="vendor/addon-fit.js"></script>
     <script src="i18n.js"></script>
     <script src="diff.js"></script>
     <script src="chat.js"></script>
+    <script src="notifications.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

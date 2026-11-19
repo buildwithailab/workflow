@@ -12,6 +12,8 @@ mod history;
 mod instructions;
 mod mcp;
 mod models;
+mod notifications;
+mod notification_popup;
 #[cfg(windows)]
 mod preview;
 mod provider_setup;
@@ -22,6 +24,7 @@ mod sharing;
 mod teams;
 mod templates;
 mod terminal;
+mod terminal_notifications;
 #[cfg(windows)]
 mod updates;
 #[cfg(windows)]
@@ -45,6 +48,11 @@ async fn dispatch(
     action: String,
     args: Value,
 ) -> std::result::Result<Value, String> {
+    if webview.label() == notification_popup::LABEL && domain == "notification_popup" {
+        let core = state.inner().clone();
+        return tauri::async_runtime::spawn_blocking(move || notification_popup::dispatch(&core, &action, &args))
+            .await.map_err(|e| e.to_string())?.map_err(|e| e.to_string());
+    }
     if webview.label() != "main" {
         return Err("Bu sayfa uygulama araçlarına erişemez".into());
     }
@@ -96,6 +104,7 @@ fn route(core: &Arc<Core>, domain: &str, action: &str, args: &Value) -> Result<V
         "git" => git::dispatch(core, action, args),
         "history" => history::dispatch(core, action, args),
         "chat" => chat::dispatch(core, action, args),
+        "notifications" => notifications::dispatch(core, action, args),
         "addons" => addons::dispatch(core, action, args),
         "models" => models::dispatch(core, action, args),
         "templates" => templates::dispatch(core, action, args),
@@ -116,25 +125,6 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             instructions::edit(core, action, args)
         }
         "sharing_warnings" => Ok(serde_json::to_value(sharing::warnings(&core.root(args)?)?)?),
-        "notify" => {
-            use tauri_plugin_notification::NotificationExt;
-            let sid = string(args, "id")?;
-            let s = core.session(sid)?;
-            let label = string(args, "label")?;
-            let key = (uuid::Uuid::new_v4().as_u128() & 0x7fffffff) as i32;
-            core.pending
-                .lock()
-                .unwrap()
-                .insert(format!("notification:{key}"), json!(sid));
-            core.app
-                .notification()
-                .builder()
-                .id(key)
-                .title(s["name"].as_str().unwrap_or("Workflow"))
-                .body(label)
-                .show()?;
-            Ok(json!(true))
-        }
         "preferences" => {
             let mut db = core.db.lock().unwrap();
             for (k, v) in args.as_object().context("Tercih geçersiz")? {
@@ -142,6 +132,9 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             }
             drop(db);
             core.save()?;
+            if args.get("notificationsEnabled").is_some() {
+                notifications::sync_enabled(core);
+            }
             Ok(core.snapshot())
         }
         "provider_usage" => usage::read(core, args),
@@ -745,11 +738,12 @@ fn main() {
         #[cfg(windows)]
         app.manage(teams::Teams::default());
         if let Some(config) = &config {
-            tauri::WebviewWindowBuilder::from_config(app, config)?.data_directory(webview_directory).build()?;
+            tauri::WebviewWindowBuilder::from_config(app, config)?.data_directory(webview_directory.clone()).build()?;
         }
+        notification_popup::initialize(&core, webview_directory)?;
         #[cfg(windows)]
         updates::start(&core);
-        {use tauri_plugin_notification::NotificationExt;let weak=Arc::downgrade(&core);app.notification().on_action(move|event|{if let(Some(core),Some(note))=(weak.upgrade(),event.notification()){let sid=core.pending.lock().unwrap().get(&format!("notification:{}",note.id())).and_then(Value::as_str).map(str::to_string);if let Some(sid)=sid{if let Some(w)=core.app.get_webview_window("main"){let _=w.unminimize();let _=w.set_focus();}core.emit("notification-session",json!(sid));}}})?;}
+        notifications::start(&core)?;
         if std::env::var("WORKFLOW_TEST_MODE").ok().as_deref()==Some("1"){let _=atomic(&core.directory.join("ready.json"),&serde_json::to_vec(&json!({"pid":std::process::id(),"endpoint":*core.endpoint.lock().unwrap()}))?);}
         Ok(())
     }).build(context);
@@ -785,7 +779,6 @@ fn main() {
         }
     };
     application.run(|app, event| {
-        #[cfg(windows)]
         if let tauri::RunEvent::WindowEvent {
             label,
             event: tauri::WindowEvent::CloseRequested { .. },
@@ -793,6 +786,8 @@ fn main() {
         } = &event
         {
             if label == "main" {
+                if let Some(core) = app.try_state::<Arc<Core>>() { notification_popup::shutdown(&core); }
+                #[cfg(windows)]
                 teams::close(app);
             }
         }

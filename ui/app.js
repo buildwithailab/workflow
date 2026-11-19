@@ -498,6 +498,7 @@ function render() {
   paintBrowserPermission();
   if (panel === "links") renderLinks();
   renderChatView();
+  scheduleNotificationContext();
 }
 function projectInitials(name) {
   const words = name.match(/[\p{L}\p{N}][\p{L}\p{N}\p{M}]*/gu) || [];
@@ -518,7 +519,12 @@ function renderProjectRail() {
     b.dataset.projectId = p.id;
     b.dataset.color = String([...p.id].reduce((sum, ch) => sum + ch.charCodeAt(0), 0) % 5);
     b.dataset.running = String(live);
-    b.setAttribute("aria-label", label);
+    const attention = notificationProjectBadge(p.id);
+    if (attention) {
+      b.append(attention.badge);
+      b.title = label + " · " + attention.label;
+    }
+    b.setAttribute("aria-label", b.title || label);
     b.setAttribute("aria-pressed", String(p.id === projectId));
     return b;
   });
@@ -1609,8 +1615,6 @@ function detectActivity(id, v) {
     }
     const view = views.get(id);
     if (view) view.state.replaceWith((view.state = stateBadge(id)));
-    if (["permission", "completed"].includes(s.key) && old)
-      notifySession(id, s.label);
   }
   v.activityTimer = setTimeout(() => {
     if (active(id) && activity.get(id)?.key === "working" && !v.inputDraft) {
@@ -1649,10 +1653,6 @@ function observeTerminal(id, v) {
   }
   const agentCount = active(id) && !session(id)?.login ? 1 + v.childAgents.size : 0;
   v.agentBadge.textContent = countLabel(agentCount, "{count} ajan");
-}
-function notifySession(id, label) {
-  if (document.hasFocus() && focusId === id) return;
-  api("app", "notify", { id, label }).catch(() => {});
 }
 function fitOne(v) {
   if (v.card.hidden) return;
@@ -2004,6 +2004,7 @@ function applyCamera() {
   world.style.setProperty("--edge-node-scale", Math.max(1, 0.6 / camera.z));
   linkTooltip.hidden = true;
   $("#zoom").textContent = Math.round(camera.z * 100) + "%";
+  scheduleNotificationContext();
 }
 function saveCard(id, patch) {
   Object.assign(session(id), patch);
@@ -2019,6 +2020,7 @@ function setMode(value) {
   applyCamera();
   drawEdges();
   fitTerminals();
+  scheduleNotificationContext();
   remember();
 }
 function zoom(amount, x, y) {
@@ -2335,6 +2337,7 @@ $("#app-settings").onclick = () => {
   };
   modal(tr("Ayarlar"), [
     field(tr("Arayüz dili"), language),
+    notificationSettings(),
     button(tr("Sağlayıcı kurulumu"), () => openProviderSetup()),
     button(tr("Hakkında ve güncellemeler"), openAbout),
   ]);
@@ -5312,6 +5315,7 @@ async function initialize() {
   });
   await sync();
   previews = await api("preview", "list").catch(() => ({}));
+  await initializeNotifications();
   for (const [id, view] of views) paintPreview(id, view);
   await scanProviders();
   setMode(mode);

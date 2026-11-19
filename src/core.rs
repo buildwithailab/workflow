@@ -164,6 +164,7 @@ pub struct Core {
     pub terms: Mutex<HashMap<String, Arc<LiveTerminal>>>,
     pub login_terminal: Mutex<Option<crate::terminal::LoginTerminal>>,
     pub(crate) chat_log: Mutex<crate::chat::LogCache>,
+    pub(crate) notifications: Mutex<crate::notifications::Notifications>,
     pub browsers: Mutex<BrowserState>,
     #[cfg(windows)]
     pub previews: crate::preview::Previews,
@@ -207,6 +208,7 @@ impl Core {
             terms: Mutex::new(HashMap::new()),
             login_terminal: Mutex::new(None),
             chat_log: Mutex::new(crate::chat::LogCache::default()),
+            notifications: Mutex::new(crate::notifications::Notifications::default()),
             browsers: Mutex::new(BrowserState::default()),
             #[cfg(windows)]
             previews: crate::preview::Previews::default(),
@@ -331,6 +333,7 @@ impl Core {
         Ok(out)
     }
     pub fn shutdown(&self) {
+        crate::notification_popup::shutdown(self);
         #[cfg(windows)]
         self.previews.shutdown();
         for t in self.terms.lock().unwrap().values() {

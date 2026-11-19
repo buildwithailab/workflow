@@ -53,6 +53,7 @@ function renderChatView() {
   $("#viewport").classList.toggle("show-chat", !!next);
   if (next) $("#empty").hidden = true;
   shownChatId = next;
+  scheduleNotificationContext();
   if (switched) {
     clearTimeout(chatPollTimer);
     chatPollTimer = undefined;

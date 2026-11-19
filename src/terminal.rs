@@ -1,6 +1,7 @@
 use crate::{
     core::{home, id, now, string, Core},
     history,
+    terminal_notifications::{CodexStatus, Signal},
 };
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -24,6 +25,10 @@ pub struct LiveTerminal {
     pub exited: AtomicBool,
     pub history: Mutex<Vec<u8>>,
     pub seq: Mutex<u64>,
+    submitted: std::sync::atomic::AtomicU64,
+    prompt_answers: std::sync::atomic::AtomicU64,
+    unbound_finished: std::sync::atomic::AtomicU64,
+    codex_status: Mutex<CodexStatus>,
     input: Mutex<TerminalInput>,
     chat_thread: Mutex<Option<String>>,
     provider: String,
@@ -634,6 +639,10 @@ fn spawn_terminal(
         run_id,
         pid,
         exited: AtomicBool::new(false),
+        submitted: std::sync::atomic::AtomicU64::new(0),
+        prompt_answers: std::sync::atomic::AtomicU64::new(0),
+        unbound_finished: std::sync::atomic::AtomicU64::new(0),
+        codex_status: Mutex::new(CodexStatus::default()),
         history: Mutex::new(vec![]),
         seq: Mutex::new(0),
         input: Mutex::new(TerminalInput {
@@ -669,6 +678,7 @@ fn read_terminal(
         };
         let mut buffer = [0u8; 16384];
         let mut query = Vec::<u8>::new();
+        let mut completion = CodexCompletion::default();
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) | Err(_) => break,
@@ -700,6 +710,21 @@ fn read_terminal(
                         }
                         // A fast turn can redraw straight from the verified draft to the empty composer.
                         let mut input = tt.input.lock().unwrap();
+                        let submitted = tt.submitted.load(Ordering::Relaxed);
+                        if tt.provider == "codex" && !input.thread_uncertain {
+                            tt.codex_status
+                                .lock()
+                                .unwrap()
+                                .observe(&buffer[..n], submitted);
+                        }
+                        if tt.provider == "codex"
+                            && submitted > tt.unbound_finished.load(Ordering::Relaxed)
+                            && !input.thread_uncertain
+                            && tt.chat_thread.lock().unwrap().is_none()
+                            && completion.observe(submitted, &buffer[..n], parser.screen())
+                        {
+                            tt.unbound_finished.store(submitted, Ordering::Relaxed);
+                        }
                         input.chat_pending = false;
                         if let Some(answered) = &input.answered_prompt {
                             let different_menu = !input.chat_pasting
@@ -1473,6 +1498,106 @@ pub(crate) struct ChatTerminalState {
     pub run_id: Option<String>,
 }
 
+// A shared PTY screen is authoritative even when its WebView card was never mounted.
+// Keep the change token internal; terminal text never leaves this observer.
+pub(crate) struct NoticeScreen {
+    pub semantic: Option<Signal>,
+    pub prompt: Option<(&'static str, String)>,
+    pub ready: bool,
+    pub submitted: u64,
+    pub answered: u64,
+    pub finished_submission: u64,
+}
+
+#[derive(Default)]
+struct CodexCompletion {
+    submission: u64,
+    matched: usize,
+    marker_written: bool,
+}
+
+impl CodexCompletion {
+    fn observe(&mut self, submitted: u64, packet: &[u8], screen: &vt100::Screen) -> bool {
+        if self.submission != submitted {
+            *self = Self {
+                submission: submitted,
+                ..Self::default()
+            };
+        }
+        // Keep only a count when the PTY splits a freshly written footer.
+        // A marker already in scrollback cannot complete the next submission.
+        const PREFIX: &[u8] = b"Worked for ";
+        for &byte in packet {
+            if byte == PREFIX[self.matched] {
+                self.matched += 1;
+            } else {
+                self.matched = usize::from(byte == PREFIX[0]);
+            }
+            if self.matched == PREFIX.len() {
+                self.matched = 0;
+                self.marker_written = true;
+            }
+        }
+        if !self.marker_written || !codex_prompt_ready(screen) {
+            return false;
+        }
+        let mut finished = false;
+        for row in screen
+            .rows(0, screen.size().1)
+            .take(screen.cursor_position().0 as usize)
+        {
+            let line = row.trim();
+            if line.starts_with(['›', '❯', '>']) || line.contains("Conversation interrupted") {
+                finished = false;
+            } else if let Some(rest) = line.strip_prefix('─').or_else(|| line.strip_prefix('•'))
+            {
+                if rest
+                    .trim_start_matches(['─', ' '])
+                    .strip_prefix("Worked for ")
+                    .is_some_and(|duration| duration.starts_with(|c: char| c.is_ascii_digit()))
+                {
+                    finished = true;
+                }
+            }
+        }
+        finished
+    }
+}
+
+pub(crate) fn notice_screen(terminal: &LiveTerminal, session: &Value) -> Option<NoticeScreen> {
+    if terminal.exited.load(Ordering::SeqCst) || !chat_thread_matches(terminal, session) {
+        return None;
+    }
+    let screen = terminal.screen.lock().unwrap();
+    let input = terminal.input.lock().unwrap();
+    if input.thread_uncertain {
+        return None;
+    }
+    let screen = screen.screen();
+    let prompt = terminal_prompt(screen, &terminal.provider);
+    let resolved = prompt.as_ref().is_some_and(|prompt| {
+        input
+            .answered_prompt
+            .as_ref()
+            .is_some_and(|answer| answer.matches(prompt))
+    });
+    let ready = prompt.is_none() && native_prompt_ready(screen, &terminal.provider);
+    let prompt = prompt.filter(|_| !resolved).map(|prompt| {
+        // Some provider menus can only be answered in the terminal. Their mere
+        // presence is enough. Never key an alert on text/cursor movement in them.
+        let key = prompt.menu.map(|menu| menu.key).unwrap_or_default();
+        (prompt.kind, key)
+    });
+    Some(NoticeScreen {
+        semantic: terminal.codex_status.lock().unwrap().last,
+        prompt,
+        ready: ready || resolved,
+        submitted: terminal.submitted.load(Ordering::Relaxed),
+        answered: terminal.prompt_answers.load(Ordering::Relaxed),
+        finished_submission: terminal.unbound_finished.load(Ordering::Relaxed),
+    })
+}
+
 fn chat_is_bound(session: &Value) -> bool {
     session["workspaceKind"] != "direct" || !session["conversationId"].is_null()
 }
@@ -1644,6 +1769,7 @@ pub(crate) fn answer_chat_prompt(core: &Core, args: &Value) -> Result<Value> {
                             custom_choice: None,
                         });
                         input.write(b"\r")?;
+                        terminal.prompt_answers.fetch_add(1, Ordering::Relaxed);
                         return Ok(json!(true));
                     }
                     // Move one row at a time and verify the provider highlights
@@ -1863,6 +1989,7 @@ fn submit_question_text(
                         },
                     });
                     input.write(b"\r")?;
+                    terminal.prompt_answers.fetch_add(1, Ordering::Relaxed);
                     return Ok(json!(true));
                 } else if !(pasted && (empty || text.starts_with(&draft))) {
                     bail!("Özel yanıt alanı doğrulanamadı. Terminali kontrol et.");
@@ -2160,6 +2287,7 @@ fn submit_chat_draft(
             };
             if verified {
                 input.write(b"\r")?;
+                current.submitted.fetch_add(1, Ordering::Relaxed);
                 input.chat_pending = true;
                 return Ok(input.revision);
             }
@@ -2217,6 +2345,19 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
                     input.thread_uncertain = true;
                 }
                 input.write_from_terminal(data, composer_empty, visible_draft.as_deref())?;
+                if matches!(data, b"\r" | b"\n" | b"\x1b" | b"\x03")
+                    && terminal_prompt(screen.screen(), &terminal.provider).is_some()
+                {
+                    terminal.prompt_answers.fetch_add(1, Ordering::Relaxed);
+                }
+                if !data.starts_with(b"\x1b[200~")
+                    && visible_draft.as_deref().is_some_and(|draft| {
+                        !draft.is_empty() && draft != CODEX_EMPTY_PROMPT && !draft.starts_with('/')
+                    })
+                    && terminal_prompt(screen.screen(), &terminal.provider).is_none()
+                {
+                    terminal.submitted.fetch_add(1, Ordering::Relaxed);
+                }
             } else {
                 terminal.write(data)?;
             }
@@ -2234,6 +2375,21 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn notifications_require_a_new_codex_footer_per_submission_even_when_durations_match() {
+        let mut parser = vt100::Parser::new(12, 100, 0);
+        let mut completion = CodexCompletion::default();
+        parser.process(
+            "\x1b[?2004h─ Worked for 1s ───\r\n› Ask Codex to do anything\x1b[2;3H".as_bytes(),
+        );
+        assert!(!completion.observe(1, b"cursor redraw", parser.screen()));
+        assert!(!completion.observe(1, b"Work", parser.screen()));
+        assert!(completion.observe(1, b"ed for 1s", parser.screen()));
+        assert!(!completion.observe(2, b"cursor redraw", parser.screen()));
+        assert!(completion.observe(2, b"Worked for 1s", parser.screen()));
+        parser.process("\x1b[2J\x1b[H─ Worked for 1s ───\r\n› Next task\r\n› Ask Codex to do anything\x1b[3;3H".as_bytes());
+        assert!(!completion.observe(3, b"Worked for 1s", parser.screen()));
+    }
     #[test]
     fn chat_submission_frames_multiline_text_once_and_rejects_terminal_commands() {
         #[cfg(windows)]
