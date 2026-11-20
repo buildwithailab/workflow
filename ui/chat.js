@@ -3,6 +3,50 @@
 const chatViews = new Map();
 let shownChatId = null;
 let chatPollTimer;
+let chatInteractionTimer;
+
+function scheduleChatInteraction(delay = 0) {
+  if (chatInteractionTimer !== undefined || !shownChatId) return;
+  chatInteractionTimer = setTimeout(() => {
+    chatInteractionTimer = undefined;
+    readChatInteraction().catch(error);
+  }, delay);
+}
+
+async function readChatInteraction() {
+  const id = shownChatId;
+  if (!id) return;
+  const view = chatView(id);
+  if (view.readingInteraction) return;
+  const bindingRevision = view.bindingRevision;
+  view.readingInteraction = true;
+  try {
+    // Native questions must never wait for transcript discovery or filesystem IO.
+    const update = await api("chat", "interaction", { id, terminalOutput: true });
+    if (!session(id) || view.bindingRevision !== bindingRevision || view.conversation !== update.conversationId
+      || (session(id).conversationId || null) !== update.conversationId) return;
+    view.mismatch = update.mismatch;
+    view.ticket = update.ticket;
+    view.liveApproval = update.liveApprovalMode;
+    if (!view.answeringPrompt) view.terminalPrompt = update.terminalPrompt;
+    view.terminalOutput = update.terminalOutput;
+    view.terminalRunId = update.terminalRunId;
+  } catch {
+    if (view.bindingRevision === bindingRevision) {
+      view.ticket = null;
+      view.terminalPrompt = null;
+      view.terminalOutput = null;
+      view.terminalRunId = null;
+      view.liveApproval = null;
+    }
+  } finally {
+    view.readingInteraction = false;
+    if (shownChatId === id) {
+      paintChatComposer(session(id), view);
+      scheduleChatInteraction(active(id) ? 300 : 850);
+    } else if (shownChatId) scheduleChatInteraction();
+  }
+}
 
 function selectedChatSession() {
   const selected = session(focusId);
@@ -57,6 +101,8 @@ function renderChatView() {
   if (switched) {
     clearTimeout(chatPollTimer);
     chatPollTimer = undefined;
+    clearTimeout(chatInteractionTimer);
+    chatInteractionTimer = undefined;
   }
   for (const [id, view] of chatViews) {
     const owner = session(id);
@@ -73,14 +119,15 @@ function renderChatView() {
     scheduleChatRead();
   }
   if (active(next)) scheduleChatRead();
+  scheduleChatInteraction();
   paintChatComposer(selected, view);
 }
 
 function syncChatBinding(selected, view) {
   const conversation = selected.conversationId || null;
   if (view.conversation === conversation) return false;
+  view.bindingRevision++;
   if (view.conversation) {
-    view.bindingRevision++;
     const images = view.images;
     view.draft = "";
     view.images = [];
@@ -95,7 +142,7 @@ function syncChatBinding(selected, view) {
   view.terminalPrompt = null;
   view.terminalOutput = null;
   view.terminalRunId = null;
-  view.terminalPreviewOpen = false;
+  view.terminalPreviewOpen = null;
   view.questionReply = null;
   return true;
 }
@@ -114,12 +161,6 @@ async function readChat() {
     const last = view.turns.at(-1);
     const wasWorking = last?.state === "working" || !!view.pending;
     view.found = update.found;
-    view.mismatch = update.mismatch;
-    view.ticket = update.ticket;
-    view.liveApproval = update.liveApprovalMode;
-    if (!view.answeringPrompt) view.terminalPrompt = update.terminalPrompt;
-    view.terminalOutput = update.terminalOutput;
-    view.terminalRunId = update.terminalRunId;
     view.loadError = !!update.logError;
     if (Array.isArray(update.turns)) {
       const next = update.turns.at(-1);
@@ -138,12 +179,7 @@ async function readChat() {
       if (shownChatId === id) paintChatTurns(view);
     }
   } catch {
-    view.ticket = null;
-    view.liveApproval = null;
-    view.terminalPrompt = null;
-    view.terminalOutput = null;
-    view.terminalRunId = null;
-    view.loadError = true;
+    if (view.bindingRevision === bindingRevision) view.loadError = true;
   } finally {
     view.reading = false;
     if (shownChatId === id) {
@@ -171,9 +207,10 @@ function paintChatComposer(selected, chat) {
   const id = selected.id;
   const terminal = views.get(id);
   const running = active(id);
-  const currentRun = running && terminal?.runId && chat.terminalRunId === terminal.runId;
+  const runId = db.active.find(item => item.id === id)?.runId;
+  const currentRun = running && runId && chat.terminalRunId === runId;
   const prompt = currentRun ? chat.terminalPrompt : null;
-  const ready = running && terminal?.ready && !terminal.replaying && !prompt && chat.ticket?.runId === terminal.runId;
+  const ready = currentRun && !prompt && chat.ticket?.runId === runId;
   const terminalInputPending = terminal?.hasPendingInput();
   const needsLink = selected.provider === "codex" && selected.workspaceKind === "direct" && !chat.conversation;
   $("#chat-bind").hidden = running || !needsLink;
@@ -199,7 +236,7 @@ function paintChatComposer(selected, chat) {
   if (promptText.textContent !== (prompt?.text || "")) promptText.textContent = prompt?.text || "";
   const choiceArea = $("#chat-terminal-choices");
   const menu = prompt?.menu;
-  const choiceKey = menu ? `${id}:${terminal.runId}:${menu.key}` : "";
+  const choiceKey = menu ? `${id}:${runId}:${menu.key}` : "";
   const questionCard = prompt?.kind === "question" && menu;
   choiceArea.classList.toggle("chat-choices", !questionCard);
   const renderKey = `${choiceKey}:${uiLanguage}`;
@@ -223,13 +260,13 @@ function paintChatComposer(selected, chat) {
   $("#chat-terminal-prompt").classList.toggle("question-card", !!questionCard);
   promptText.hidden = !!questionCard;
   choiceArea.hidden = !menu;
-  updateQuestionControls(choiceArea, !!chat.answeringPrompt || !!terminalInputPending || !!terminal?.replaying);
+  updateQuestionControls(choiceArea, !!chat.answeringPrompt || !!terminalInputPending);
   for (const card of $("#chat-turns").querySelectorAll(".chat-question-card")) {
     updateQuestionControls(card, !ready || terminalInputPending || chat.sending || !!chat.pending || !!chat.loadError
       || !!chat.applyingModel || !!chat.applyingApproval || !!chat.attaching);
   }
   const peek = running && !ready && !prompt && !chat.mismatch;
-  const expanded = peek && !!chat.terminalPreviewOpen;
+  const expanded = peek && chat.terminalPreviewOpen !== false;
   $("#chat-terminal-peek").hidden = !peek;
   const toggle = $("#chat-show-terminal-output");
   toggle.setAttribute("aria-expanded", String(expanded));
@@ -245,15 +282,16 @@ function paintChatComposer(selected, chat) {
 async function answerTerminalChoice(id, key, response) {
   const chat = chatView(id);
   const terminal = views.get(id);
+  const runId = db.active.find(item => item.id === id)?.runId;
   const menu = chat.terminalPrompt?.menu;
-  if (shownChatId !== id || !active(id) || chat.answeringPrompt || !menu || terminal?.replaying
-    || terminal?.hasPendingInput() || chat.terminalRunId !== terminal?.runId
-    || key !== `${id}:${terminal.runId}:${menu.key}`) return false;
+  if (shownChatId !== id || !runId || chat.answeringPrompt || !menu
+    || terminal?.hasPendingInput() || chat.terminalRunId !== runId
+    || key !== `${id}:${runId}:${menu.key}`) return false;
   chat.answeringPrompt = true;
   paintChatComposer(session(id), chat);
   try {
     await api("chat", "answer_prompt", {
-      id, runId: terminal.runId, key: menu.key, inputRevision: menu.inputRevision,
+      id, runId, key: menu.key, inputRevision: menu.inputRevision,
       selected: menu.selected, ...response,
     });
     if (chat.terminalPrompt?.menu?.key === menu.key) delete chat.terminalPrompt.menu;
@@ -263,6 +301,7 @@ async function answerTerminalChoice(id, key, response) {
     if (shownChatId === id) {
       paintChatComposer(session(id), chat);
       readChat().catch(error);
+      readChatInteraction().catch(error);
     }
   }
 }
@@ -374,18 +413,25 @@ const approvalLabels = {
   edits: "Düzenlemeleri onayla", plan: "Plan modu",
 };
 
+function approvalModes(provider) {
+  return provider === "claude" ? ["default", "manual", "auto", "edits", "plan"]
+    : ["default", "manual", "auto"];
+}
+
+function approvalOptions(provider) {
+  return approvalModes(provider).map(mode => {
+    const option = new Option(tr(approvalLabels[mode]), mode);
+    option.disabled = provider === "copilot" && mode === "default";
+    return option;
+  });
+}
+
 function paintChatApproval(selected, chat) {
   const control = $("#chat-approval");
-  const options = selected.provider === "claude" ? ["default", "manual", "auto", "edits", "plan"]
-    : ["default", "manual", "auto"];
   if (control.dataset.provider !== selected.provider || control.dataset.language !== uiLanguage) {
     control.dataset.provider = selected.provider;
     control.dataset.language = uiLanguage;
-    control.replaceChildren(...options.map(mode => {
-      const option = new Option(tr(approvalLabels[mode]), mode);
-      if (mode === "default" && selected.provider === "copilot") option.disabled = true;
-      return option;
-    }));
+    control.replaceChildren(...approvalOptions(selected.provider));
   }
   control.value = selected.provider === "copilot" && active(selected.id)
     ? chat.liveApproval || "default"
@@ -417,6 +463,7 @@ async function selectChatApproval(mode) {
     if (shownChatId === selected.id) {
       paintChatComposer(session(selected.id), chat);
       scheduleChatRead();
+      scheduleChatInteraction();
     }
   }
 }
@@ -552,7 +599,7 @@ function paintChatModelControls(selected, chat) {
     ["#chat-effort", "Düşünme seviyesi", effort && tr(reasoningLabels[effort] || effort)],
   ]) {
     const control = $(selector);
-    control.hidden = selector === "#chat-effort" && selected.provider !== "codex";
+    control.hidden = selector === "#chat-effort" && !["codex", "claude", "copilot"].includes(selected.provider);
     const text = value || tr(label);
     if (control.firstElementChild.textContent !== text) control.firstElementChild.textContent = text;
     const accessible = value ? `${tr(label)} · ${value}` : tr(label);
@@ -888,9 +935,9 @@ function initChatControls() {
     const id = shownChatId;
     if (!id) return;
     const view = chatView(id);
-    view.terminalPreviewOpen = !view.terminalPreviewOpen;
+    view.terminalPreviewOpen = view.terminalPreviewOpen === false;
     paintChatComposer(session(id), view);
-    if (view.terminalPreviewOpen) readChat().catch(error);
+    if (view.terminalPreviewOpen) readChatInteraction().catch(error);
   };
   $("#chat-approval").onchange = (event) => selectChatApproval(event.target.value).catch(error);
   $("#chat-attach-image").onclick = async () => {

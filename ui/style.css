@@ -1339,6 +1339,9 @@ body.no-left .sidebar {
   border-radius: 9px;
   padding: 7px;
   background: var(--panel);
+  min-height: 0;
+  max-height: calc(100% - 10px);
+  overflow: auto;
 }
 #chat-terminal-prompt {
   margin-bottom: 7px;
@@ -1864,6 +1867,9 @@ body.no-left .sidebar {
   text-overflow: ellipsis;
   direction: rtl;
   text-align: left;
+}
+.card-path[data-kind="branch"] .card-path-value {
+  direction: ltr;
 }
 .card-summary {
   font-size: 11px;

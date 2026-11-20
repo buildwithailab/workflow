@@ -164,6 +164,7 @@ pub struct Core {
     pub terms: Mutex<HashMap<String, Arc<LiveTerminal>>>,
     pub login_terminal: Mutex<Option<crate::terminal::LoginTerminal>>,
     pub(crate) chat_log: Mutex<crate::chat::LogCache>,
+    pub(crate) model_catalog: crate::models::CatalogCache,
     pub(crate) notifications: Mutex<crate::notifications::Notifications>,
     pub browsers: Mutex<BrowserState>,
     #[cfg(windows)]
@@ -208,6 +209,7 @@ impl Core {
             terms: Mutex::new(HashMap::new()),
             login_terminal: Mutex::new(None),
             chat_log: Mutex::new(crate::chat::LogCache::default()),
+            model_catalog: crate::models::CatalogCache::default(),
             notifications: Mutex::new(crate::notifications::Notifications::default()),
             browsers: Mutex::new(BrowserState::default()),
             #[cfg(windows)]

@@ -619,18 +619,23 @@ impl NoticeLog {
     }
 }
 
-fn read(core: &Core, session: &Value, args: &Value) -> Result<Value> {
+fn interaction(core: &Core, session: &Value, args: &Value) -> Value {
     let terminal = terminal::chat_state(core, session, args["terminalOutput"] == true);
-    let thread = session["conversationId"].as_str();
-    let mut result = json!({
-        "conversationId":thread,"found":false,"turns":[],"ticket":terminal.ticket,
+    json!({
+        "conversationId":session["conversationId"],"ticket":terminal.ticket,
         "mismatch":terminal.mismatch,"liveApprovalMode":terminal.approval_mode,
         "terminalPrompt":terminal.prompt,"terminalOutput":terminal.output,"terminalRunId":terminal.run_id,
-    });
-    if terminal.mismatch {
+    })
+}
+
+fn read(core: &Core, session: &Value, args: &Value) -> Result<Value> {
+    let mut result = interaction(core, session, args);
+    result["found"] = json!(false);
+    result["turns"] = json!([]);
+    if result["mismatch"] == true {
         return Ok(result);
     }
-    let Some(thread) = thread else {
+    let Some(thread) = session["conversationId"].as_str() else {
         return Ok(result);
     };
     if read_turns(core, session, thread, &args["revision"], &mut result).is_err() {
@@ -683,6 +688,7 @@ pub(crate) fn dispatch(core: &Core, action: &str, args: &Value) -> Result<Value>
     }
     match action {
         "read" => read(core, &session, args),
+        "interaction" => Ok(interaction(core, &session, args)),
         "send" => terminal::send_chat(core, args),
         "answer_prompt" => terminal::answer_chat_prompt(core, args),
         "image_reference" => file_reference(&session, string(args, "path")?, true),

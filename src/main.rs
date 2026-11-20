@@ -626,6 +626,14 @@ fn rpc_fixture(provider: &str) -> Result<()> {
         if request_id.is_null() {
             continue;
         }
+        let catalog_request = v["method"] == "model/list" || v["method"] == "models.list"
+            || (provider == "claude" && v["request"]["subtype"] == "initialize");
+        if catalog_request && std::env::current_dir()?.join("model-dialog-fixture").is_file() {
+            let file = std::env::current_dir()?.join(format!("model-requests-{provider}.txt"));
+            let mut log = std::fs::OpenOptions::new().create(true).append(true).open(file)?;
+            writeln!(log, "request")?;
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
         let result = if v["method"] == "account/read" {
             json!({"account":login.as_ref().map(|login| json!({"type":"chatgpt","email":format!("{login}@localhost"),"planType":"test"}))})
         } else if v["method"] == "account/rateLimits/read" {
@@ -637,14 +645,24 @@ fn rpc_fixture(provider: &str) -> Result<()> {
         } else if v["method"] == "account.getQuota" {
             json!({"quotaSnapshots":{"premium_interactions":{"remainingPercentage":if profile.is_some() {70} else {40},"resetDate":"2033-05-18T03:33:20Z"},"chat":{"entitlementRequests":-1}}})
         } else if provider == "claude" {
-            json!({"models":[{"value":"fixture-claude","displayName":"Fixture Claude"}]})
+            if std::env::current_dir()?.join("model-error-fixture").is_file() {
+                json!({"models":[]})
+            } else if std::env::current_dir()?.join("missing-effort-fixture").is_file() {
+                json!({"models":[{"value":"fixture-claude","displayName":"Fixture Claude"}]})
+            } else {
+                json!({"models":[{"value":"fixture-claude","displayName":"Fixture Claude","supportsEffort":true,"supportedEffortLevels":["low","medium","high","xhigh","max"]}]})
+            }
         } else if v["method"] == "model/list" {
             json!({"data":[
                 {"model":"fixture-codex","displayName":"Fixture Codex","isDefault":true,"defaultReasoningEffort":"medium","supportedReasoningEfforts":[{"reasoningEffort":"medium"}]},
                 {"model":"fixture-chat","displayName":"Fixture Chat","defaultReasoningEffort":"medium","supportedReasoningEfforts":[{"reasoningEffort":"medium"},{"reasoningEffort":"high"}]},
             ]})
         } else if v["method"] == "models.list" {
-            json!({"models":[{"id":"fixture-copilot","name":"Fixture Copilot"}]})
+            json!({"models":[
+                {"id":"fixture-copilot","name":"Fixture Copilot","supportedReasoningEfforts":["low","medium","high"],"defaultReasoningEffort":"medium"},
+                {"id":"fixture-copilot-basic","name":"Fixture Copilot Basic"},
+                {"id":"fixture-copilot-blocked","policy":{"state":"disabled"},"supportedReasoningEfforts":["high"]}
+            ]})
         } else {
             json!({})
         };

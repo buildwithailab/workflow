@@ -7,6 +7,7 @@
 - Keep credentials and signing keys out of source and distribution. Do not copy account caches into packages.
 - Implement our own application code. Test terminal lifecycle, browser selection and browser actions before distributing.
 - No local commits or remote pushes unless explicitly requested.
+- For every shared provider feature, inspect and test Codex, Claude Code and GitHub Copilot together. Cover provider capabilities, live interaction, conversation continuity and failure paths for all three; do not finish one provider and silently omit the others. Distinguish controlled CLI fixtures from verification with a signed-in real provider.
 
 ## Release scope
 

@@ -166,6 +166,10 @@ fn validate_session_workspace(core: &Core, directory: &Path, root: &Path, args: 
 
 pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
     let directory = core.root(args)?;
+    // Footer reads only HEAD, never status/diffs, remotes or provider processes.
+    if action == "current_branch" {
+        return Ok(json!({"branch":git(&directory, &["symbolic-ref", "--quiet", "--short", "HEAD"]).ok()}));
+    }
     let root = match worktree_root(&directory) {
         Ok(root) => root,
         Err(_) if action == "state" => return Ok(json!({"available":false})),

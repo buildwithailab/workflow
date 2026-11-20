@@ -345,6 +345,8 @@ fn provider_arguments(session: &Value, conversation: Option<&str>) -> Result<Vec
     if let Some(effort) = session["effort"].as_str().filter(|s| !s.is_empty()) {
         if provider == "codex" {
             args.extend(["-c".into(), format!("model_reasoning_effort='{effort}'")]);
+        } else if matches!(provider, "claude" | "copilot") && ["low", "medium", "high", "xhigh", "max"].contains(&effort) {
+            args.extend(["--effort".into(), effort.to_string()]);
         }
     }
     match (provider, session["approvalMode"].as_str()) {
@@ -952,6 +954,23 @@ fn native_prompt_ready(screen: &vt100::Screen, provider: &str) -> bool {
     })
 }
 
+fn screen_text(screen: &vt100::Screen, start: usize) -> String {
+    let mut text = String::new();
+    for (index, row) in screen.rows(0, screen.size().1).enumerate().skip(start) {
+        text.push_str(&row);
+        if !screen.row_wrapped(index as u16) {
+            text.push('\n');
+        }
+    }
+    text
+}
+
+fn question_overlay(text: &str) -> bool {
+    ["enter to select", "to submit answer", "to submit all", "to navigate questions",
+        "tab/arrow keys to navigate", "tab/arrow keys to switch"]
+        .iter().any(|hint| text.contains(hint))
+}
+
 fn provider_composer(screen: &vt100::Screen) -> Option<(String, String)> {
     if !screen.bracketed_paste() {
         return None;
@@ -966,7 +985,10 @@ fn provider_composer(screen: &vt100::Screen) -> Option<(String, String)> {
             return None;
         }
         let end = (start + 1..lines.len()).find(|&index| divider(&lines[index]))?;
-        let footer = lines[end + 1..].join(" ").to_ascii_lowercase();
+        let footer = screen_text(screen, end + 1).replace('\n', " ").to_ascii_lowercase();
+        if question_overlay(&footer) {
+            return None;
+        }
         if [
             "esc to cancel",
             "sign in to continue",
@@ -1009,12 +1031,10 @@ fn provider_composer(screen: &vt100::Screen) -> Option<(String, String)> {
 
 fn codex_composer_unblocked(screen: &vt100::Screen) -> bool {
     let cursor_row = screen.cursor_position().0 as usize;
-    let footer = screen
-        .rows(0, screen.size().1)
-        .skip(cursor_row + 1)
-        .collect::<Vec<_>>()
-        .join("\n")
-        .to_ascii_lowercase();
+    let footer = screen_text(screen, cursor_row + 1).replace('\n', " ").to_ascii_lowercase();
+    if question_overlay(&footer) {
+        return false;
+    }
     // Codex can render its running indicator immediately above the composer.
     // Match the status line itself so plain history text cannot block input.
     let running_above = screen
@@ -1488,6 +1508,25 @@ fn terminal_prompt(screen: &vt100::Screen, provider: &str) -> Option<TerminalPro
     })
 }
 
+// A wrapped or unfamiliar question may be visible without being safely actionable.
+// Display it read-only; only terminal_prompt's strict parser can offer choices.
+fn wrapped_question_preview(screen: &vt100::Screen, provider: &str) -> Option<TerminalPrompt> {
+    if native_prompt_ready(screen, provider) {
+        return None;
+    }
+    let text = screen_text(screen, 0);
+    if !question_overlay(&text.replace('\n', " ").to_ascii_lowercase()) {
+        return None;
+    }
+    Some(TerminalPrompt {
+        kind: "question",
+        text: text.trim().to_owned(),
+        menu: None,
+        first_row: 0,
+        end_row: screen.size().0 as usize,
+    })
+}
+
 #[derive(Default)]
 pub(crate) struct ChatTerminalState {
     pub ticket: Value,
@@ -1621,7 +1660,8 @@ pub(crate) fn chat_state(core: &Core, session: &Value, include_output: bool) -> 
         return state;
     }
     state.run_id = Some(terminal.run_id.clone());
-    state.prompt = terminal_prompt(screen.screen(), &terminal.provider);
+    state.prompt = terminal_prompt(screen.screen(), &terminal.provider)
+        .or_else(|| wrapped_question_preview(screen.screen(), &terminal.provider));
     if let Some(prompt) = &mut state.prompt {
         if !chat_is_bound(session)
             || input.chat_pasting
@@ -1645,7 +1685,7 @@ pub(crate) fn chat_state(core: &Core, session: &Value, include_output: bool) -> 
                 .rposition(|line| !line.trim().is_empty())
                 .map_or(0, |row| row + 1),
         );
-        state.output = Some(rows[rows.len().saturating_sub(24)..].join("\n"));
+        state.output = Some(rows.join("\n"));
     }
     state.approval_mode = if terminal.provider == "copilot" {
         provider_composer(screen.screen()).and_then(|(_, footer)| {
@@ -2376,6 +2416,27 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
 mod tests {
     use super::*;
     #[test]
+    fn claude_effort_is_scoped_to_new_and_resumed_provider_processes() {
+        let session = json!({"id":"sample","provider":"claude","model":"sample-model","effort":"high"});
+        for conversation in [None, Some("sample-conversation")] {
+            let args = provider_arguments(&session, conversation).unwrap();
+            assert!(args.windows(2).any(|pair| pair == ["--effort", "high"]));
+        }
+        let default = provider_arguments(&json!({"id":"sample","provider":"claude"}), None).unwrap();
+        assert!(!default.iter().any(|arg| arg == "--effort"));
+    }
+    #[test]
+    fn copilot_effort_is_scoped_to_new_and_resumed_provider_processes() {
+        let session = json!({"id":"sample","provider":"copilot","model":"sample-model","effort":"high"});
+        for conversation in [None, Some("sample-conversation")] {
+            let args = provider_arguments(&session, conversation).unwrap();
+            assert!(args.windows(2).any(|pair| pair == ["--effort", "high"]));
+            assert!(!args.iter().any(|arg| arg.starts_with("--allow-all")));
+        }
+        let default = provider_arguments(&json!({"id":"sample","provider":"copilot"}), None).unwrap();
+        assert!(!default.iter().any(|arg| arg == "--effort"));
+    }
+    #[test]
     fn notifications_require_a_new_codex_footer_per_submission_even_when_durations_match() {
         let mut parser = vt100::Parser::new(12, 100, 0);
         let mut completion = CodexCompletion::default();
@@ -2476,6 +2537,37 @@ mod tests {
 
             parser.process("\x1b[2J\x1b[HThe guide says:\r\nWould you like to run a command?\r\n1. Yes\r\n2. No\r\nWorking…".as_bytes());
             assert!(terminal_prompt(parser.screen(), provider).is_none());
+        }
+    }
+
+    #[test]
+    fn wrapped_questions_remain_visible_without_guessing_choices_for_every_provider() {
+        for provider in ["codex", "claude", "copilot"] {
+            let mut parser = vt100::Parser::new(30, 24, 0);
+            parser.process("\x1b[?2004hQuestion 1/1\r\nWhich change?\r\n❯ 1. Only one\r\n  2. Everything\r\nTab/arrow keys to navigate questions · Enter to select".as_bytes());
+            assert!(!native_prompt_ready(parser.screen(), provider));
+            let preview = wrapped_question_preview(parser.screen(), provider).unwrap();
+            assert!(preview.text.contains("Which change?"));
+            assert!(preview.menu.is_none());
+            assert!(preview.text.contains("Enter to select"));
+        }
+    }
+
+    #[test]
+    fn question_overlays_block_empty_composers_for_every_provider() {
+        for provider in ["codex", "claude", "copilot"] {
+            let mut parser = vt100::Parser::new(30, 32, 0);
+            let composer = match provider {
+                "codex" => "› Ask Codex to do anything\r\n",
+                "claude" => "─────────\r\n❯ \r\n─────────\r\n? for shortcuts\r\n",
+                _ => "─────────\r\n❯ \r\n─────────\r\nInteractive · Manual Approval\r\n",
+            };
+            parser.process(format!("\x1b[?2004h{composer}Question 1/1\r\nChoose where?\r\n❯ 1. Only one\r\n  2. All\r\nTab/arrow keys to navigate questions · Enter to select").as_bytes());
+            if provider == "codex" {
+                parser.process(b"\x1b[1;3H");
+            }
+            assert!(!native_prompt_ready(parser.screen(), provider), "{provider}");
+            assert!(wrapped_question_preview(parser.screen(), provider).is_some());
         }
     }
 

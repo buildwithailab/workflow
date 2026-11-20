@@ -1071,6 +1071,58 @@ async function scanProviders() {
   renderCards();
   await refreshProviderUsageAll();
 }
+const terminalLocations = new Map();
+
+function shortTerminalPath(directory, projectDirectory) {
+  const separator = directory.includes("\\") ? "\\" : "/";
+  const normalize = value => (value || "").replaceAll("\\", "/").replace(/\/+$/, "");
+  const full = normalize(directory);
+  const source = normalize(projectDirectory);
+  if (/^[a-z]:$/i.test(full) || !full) return directory;
+  const parent = source.includes("/") ? source.slice(0, source.lastIndexOf("/")) : "";
+  const compare = value => /^[a-z]:|^\/\//i.test(full) ? value.toLowerCase() : value;
+  if (parent && compare(full).startsWith(compare(parent) + "/")) {
+    const name = parent.slice(parent.lastIndexOf("/") + 1);
+    return (name + full.slice(parent.length)).replaceAll("/", separator);
+  }
+  // Isolated copies live in application storage; retain the project's useful name.
+  return (source || full).split("/").filter(Boolean).slice(-2).join(separator) || directory;
+}
+
+function paintTerminalLocation(s, v) {
+  const branch = terminalLocations.get(s.directory)?.branch;
+  v.pathMode.hidden = !branch;
+  v.pathMode.textContent = branch ? "⑂" : "";
+  v.pathValue.textContent = branch || shortTerminalPath(s.directory,
+    db.projects.find(project => project.id === s.projectId)?.directory);
+  v.path.dataset.kind = branch ? "branch" : "folder";
+  v.path.title = s.directory;
+}
+
+async function refreshTerminalLocations(force = false) {
+  const visible = visibleSessions();
+  const directories = new Map(visible.map(s => [s.directory, s]));
+  await Promise.allSettled([...directories].map(async ([directory, s]) => {
+    let entry = terminalLocations.get(directory);
+    if (entry?.reading || (!force && entry && Date.now() - entry.checkedAt < 5000)) return;
+    if (!entry) terminalLocations.set(directory, entry = {});
+    entry.reading = true;
+    try {
+      const state = await api("git", "current_branch", { projectId: s.projectId, sessionId: s.id });
+      entry.branch = state.branch || null;
+    } catch {
+      entry.branch = null;
+    } finally {
+      entry.checkedAt = Date.now();
+      entry.reading = false;
+      for (const owner of visibleSessions().filter(owner => owner.directory === directory)) {
+        const view = views.get(owner.id);
+        if (view) paintTerminalLocation(owner, view);
+      }
+    }
+  }));
+}
+
 function renderCards() {
   const ids = new Set(visibleSessions().map((s) => s.id));
   for (const [id, v] of views) {
@@ -1131,15 +1183,7 @@ function renderCards() {
         );
     }
     v.term.options.disableStdin = !active(s.id);
-    v.pathMode.textContent =
-      (s.workspaceKind === "direct"
-        ? tr("Mevcut klasör")
-        : s.workspaceKind === "worktree"
-          ? "Git worktree"
-          : tr("Ayrı klasör")) +
-      " · ";
-    v.pathValue.textContent = s.directory;
-    v.path.title = v.pathMode.textContent + s.directory;
+    paintTerminalLocation(s, v);
     const account = providerAccount(s.provider, s.accountId || defaultAccount);
     v.account.hidden =
       (!s.accountId || s.accountId === defaultAccount) &&
@@ -1156,6 +1200,7 @@ function renderCards() {
       tr("Bu oturum kapalı. Üstteki ▶ ile aynı konuşmaya devam et.");
   });
   drawEdges();
+  refreshTerminalLocations().catch(() => {});
   requestAnimationFrame(fitTerminals);
 }
 function terminalClipboard(term, host, writableRun, onInput, sessionId) {
@@ -1925,76 +1970,132 @@ function modelChangeBlock(id) {
 }
 
 async function openModels(id) {
-  const b = views.get(id)?.model;
-  if (b) {
-    b.disabled = true;
-    b.textContent = tr("Yükleniyor…");
+  const s = session(id);
+  if (!s) return;
+  const choices = select([], ""), effort = select([], s.effort), approval = select([], s.approvalMode || "default");
+  approval.replaceChildren(...approvalOptions(s.provider));
+  approval.value = s.approvalMode || "default";
+  const effortField = field(tr("Düşünme seviyesi"), effort);
+  effortField.hidden = !["codex", "claude", "copilot"].includes(s.provider);
+  const explanation = el("p", "help");
+  const loadState = el("p", "help", tr("Model listesi yükleniyor…"));
+  loadState.setAttribute("role", "status");
+  const refresh = button(tr("Model listesini yenile"), () => load(true));
+  const approvalHelp = el("p", "help", tr(s.provider === "copilot"
+    ? "Copilot düşünme seviyesi sonraki başlangıçta uygulanır. Onay seviyesi, çalışan oturum girişe hazırken değiştirilebilir."
+    : !active(id) ? "Seçimin bu oturumun sonraki başlangıcında kullanılır."
+    : s.provider === "claude" ? "Onay ve düşünme seviyesi terminalin bir sonraki başlangıcında uygulanır."
+    : "Onay seviyesi terminalin bir sonraki başlangıcında uygulanır."));
+  let models = [], loaded = false, loading = false, modelEdited = false, effortReady = false;
+  let approvalInitial = approval.value, approvalEdited = false, saving = false;
+  const ownDialog = () => choices.isConnected && $("#dialog").open;
+  const controls = () => {
+    if (!ownDialog()) return;
+    save.disabled = saving || loading || (!loaded && approval.value === approvalInitial);
+    choices.disabled = saving || !loaded || loading;
+    effort.disabled = saving || loading || !loaded || !models.find(m => m.id === choices.value)?.efforts?.length;
+    refresh.disabled = saving || loading;
+    approval.disabled = saving || (s.provider === "copilot" && !active(id));
+  };
+  function updateEffort() {
+    const model = models.find(m => m.id === choices.value);
+    const previous = effortReady ? effort.value : s.effort;
+    effort.replaceChildren(...(model?.efforts || []).map(option =>
+      new Option(tr(reasoningLabels[option.reasoningEffort] || option.reasoningEffort), option.reasoningEffort)));
+    effort.disabled = saving || loading || !effort.options.length;
+    if (s.provider === "claude" && effort.options.length)
+      effort.insertBefore(new Option(tr("Sağlayıcı varsayılanı"), ""), effort.firstChild);
+    const desired = previous ?? (s.provider === "claude" ? "" : model?.defaultEffort);
+    if ([...effort.options].some(option => option.value === desired)) effort.value = desired;
+    else if ([...effort.options].some(option => option.value === model?.defaultEffort)) effort.value = model.defaultEffort;
+    explanation.textContent = ["codex", "claude", "copilot"].includes(s.provider) && loaded && !effort.options.length
+      ? tr("Sağlayıcı bu modelin düşünme seviyelerini bildirmedi. Listeyi yenileyebilir veya CLI sürümünü kontrol edebilirsin.") : "";
+    explanation.hidden = !explanation.textContent;
+    if (!effort.options.length) effort.add(new Option(tr("Seviye bilgisi yok"), ""));
+    effortReady = true;
   }
-  try {
-    const models = await api("models", "list", { id });
-    const s = session(id),
-      choices = select(
-        models.map((m) => ({ id: m.id, label: m.name || m.id })),
-        (
-          models.find((m) => m.id === s.model) ||
-          models.find((m) => m.default) ||
-          models[0]
-        )?.id,
-      ),
-      effort = select([], s.effort);
-    function update() {
-      effort.replaceChildren();
-      const m = models.find((m) => m.id === choices.value);
-      for (const e of m?.efforts || [])
-        effort.add(new Option(e.reasoningEffort, e.reasoningEffort));
-      effort.hidden = !effort.options.length;
-      const saved = [...effort.options].some(
-        (option) => option.value === s.effort,
-      );
-      if (saved) effort.value = s.effort;
-      else if (
-        [...effort.options].some((option) => option.value === m?.defaultEffort)
-      )
-        effort.value = m.defaultEffort;
-    }
-    choices.onchange = update;
-    update();
-    modal(
-      tr("Model seç"),
-      [
-        field("Model", choices),
-        field(tr("Düşünme seviyesi"), effort),
-        el(
-          "p",
-          "help",
-          modelChangeBlock(id) ||
-            (active(id)
-              ? tr("Ajan giriş beklerken uygula. Terminalde yazılmış bir taslak varsa önce temizle.")
-              : tr("Seçimin bu oturumun sonraki başlangıcında kullanılır.")),
-        ),
-      ],
-      async () => {
-        const v = views.get(id);
+  choices.onchange = () => { modelEdited = true; updateEffort(); };
+  effort.onchange = () => { modelEdited = true; };
+  approval.onchange = () => { approvalEdited = true; controls(); };
+  modal(tr("Model seç"), [
+    field("Model", choices), effortField, explanation,
+    field(tr("Onay seviyesi"), approval), approvalHelp,
+    loadState, refresh,
+    ...(active(id) ? [el("p", "help", modelChangeBlock(id)
+      || tr("Ajan giriş beklerken uygula. Terminalde yazılmış bir taslak varsa önce temizle."))] : []),
+  ], async () => {
+    if (session(id)?.provider !== s.provider || session(id)?.accountId !== s.accountId)
+      throw Error(tr("Model listesi değişti; listeyi yeniden aç."));
+    const approvalChanged = approval.value !== approvalInitial;
+    const selectedEffort = !effort.disabled ? effort.value || null : null;
+    if (loading || (!loaded && !approvalChanged)) throw Error(tr("Model listesi yükleniyor…"));
+    saving = true;
+    controls();
+    try {
+      if (loaded && (modelEdited || !approvalChanged)) {
         const blocked = modelChangeBlock(id);
         if (blocked) throw Error(blocked);
-        await api("models", "apply", {
-          id,
-          model: choices.value,
-          effort: effort.hidden ? null : effort.value,
-          runId: v?.runId,
-          seq: v?.seq,
-        });
-        await sync();
-      },
-      tr("Uygula"),
-    );
-  } finally {
-    if (b) {
-      b.disabled = false;
-      b.textContent =
-        views.get(id)?.observedModel || session(id)?.model || tr("Model seç⌄");
+        const v = views.get(id);
+        await api("models", "apply", { id, model: choices.value,
+          effort: ["codex", "claude", "copilot"].includes(s.provider) ? selectedEffort : null,
+          runId: v?.runId, seq: v?.seq });
+        modelEdited = false;
+        if (s.provider === "claude" && active(id))
+          toast(tr("Claude Code düşünme seviyesi terminalin bir sonraki başlangıcında uygulanır; açık terminal yeniden başlatılmaz."));
+        if (s.provider === "copilot" && active(id))
+          toast(tr("Copilot düşünme seviyesi terminalin bir sonraki başlangıcında uygulanır."));
+      }
+      if (approvalChanged) {
+        const ticket = s.provider === "copilot" ? (await api("chat", "read", { id })).ticket : null;
+        if (s.provider === "copilot" && !ticket)
+          throw Error(tr("Copilot girişe döndüğünde onay seviyesi değiştirilebilir."));
+        await api("chat", "approval", { id, mode: approval.value, ...ticket });
+        approvalInitial = approval.value;
+        if (active(id) && s.provider !== "copilot")
+          toast(tr("Onay seviyesi terminalin bir sonraki başlangıcında uygulanır."));
+      }
+      await sync();
+    } finally { saving = false; controls(); }
+  }, tr("Uygula"));
+  const save = $("#dialog-footer .primary");
+  async function load(force = false) {
+    if (loading) return;
+    loading = true;
+    loadState.textContent = tr("Model listesi yükleniyor…");
+    loadState.hidden = false;
+    controls();
+    try {
+      const result = await api("models", "list", { id, refresh: force });
+      if (!ownDialog()) return;
+      models = result;
+      loaded = true;
+      const chosen = choices.value || views.get(id)?.observedModel || s.model;
+      choices.replaceChildren(...models.map(m => new Option(m.name || m.id, m.id)));
+      choices.value = (models.find(m => m.id === chosen || m.name === chosen) || models.find(m => m.default) || models[0])?.id || "";
+      loadState.hidden = true;
+    } catch (err) {
+      if (!ownDialog()) return;
+      loaded = false;
+      models = [];
+      choices.replaceChildren(new Option(tr("Model listesi alınamadı"), ""));
+      loadState.textContent = uiError(err);
+    } finally {
+      loading = false;
+      if (ownDialog()) { updateEffort(); controls(); }
     }
   }
+  choices.add(new Option(tr("Yükleniyor…"), ""));
+  effort.add(new Option(tr("Yükleniyor…"), ""));
+  effort.disabled = true;
+  controls();
+  if (s.provider === "copilot" && active(id)) api("chat", "read", { id }).then(state => {
+    if (ownDialog() && !approvalEdited && state.liveApprovalMode) {
+      approval.value = state.liveApprovalMode;
+      approvalInitial = approval.value;
+      controls();
+    }
+  }).catch(() => {});
+  await load();
 }
 
 function applyCamera() {
@@ -5350,6 +5451,11 @@ async function initialize() {
     850,
   );
   window.addEventListener("beforeunload", remember);
+  window.addEventListener("focus", () => refreshTerminalLocations(true).catch(() => {}));
+  setInterval(() => {
+    if (document.visibilityState === "visible" && !shownChatId)
+      refreshTerminalLocations().catch(() => {});
+  }, 5000);
   window.workflow = {
     api,
     state: () => db,

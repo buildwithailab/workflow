@@ -583,6 +583,27 @@ async function testAdditionalProviderChats() {
       await until(async () => await approval.inputValue() === "manual", "observed Copilot manual mode displayed");
     }
     const runId = (await api("terminal", "attach", { id: s.id })).runId;
+    if (!claude) {
+      const oldTicket = (await api("chat", "read", { id: s.id })).ticket;
+      await page.locator("#session-terminal-view").click();
+      await page.evaluate(id => window.workflow.views.get(id).model.click(), s.id);
+      const settings = page.locator("#dialog");
+      await until(async () => !await settings.getByLabel("Model", { exact: true }).isDisabled(), "Copilot terminal model controls");
+      const terminalApproval = settings.getByLabel("Approval level", { exact: true });
+      await until(async () => await terminalApproval.inputValue() === "manual", "terminal dialog observes live Copilot permission mode");
+      await terminalApproval.selectOption("auto");
+      await settings.getByRole("button", { name: "Apply", exact: true }).click();
+      await settings.waitFor({ state: "hidden" });
+      assert.equal((await api("chat", "read", { id: s.id })).liveApprovalMode, "auto");
+      await assert.rejects(api("chat", "approval", { id: s.id, mode: "manual", ...oldTicket }));
+      assert.equal((await api("chat", "read", { id: s.id })).liveApprovalMode, "auto");
+      assert.equal((await api("terminal", "attach", { id: s.id })).runId, runId);
+      await page.locator("#session-chat-view").click();
+      await until(async () => await approval.inputValue() === "auto", "Chat shows terminal permission change");
+      await approval.selectOption("manual");
+      await until(async () => (await api("chat", "read", { id: s.id })).liveApprovalMode === "manual", "Copilot returns to manual approval from Chat");
+      assert(await page.locator("#chat-effort").isVisible());
+    }
     if (!claude) await approval.selectOption("auto");
     await until(async () => {
       const row = (await api("app", "state")).sessions.find(row => row.id === s.id);
@@ -997,8 +1018,25 @@ async function testPendingChatInteraction() {
     assert.equal(await input.inputValue(), "Keep this separate draft.");
 
     const answerFixture = () => api("terminal", "write", { id: s.id, runId, data: "1\r" });
+    await page.waitForFunction(id => !chatView(id).reading, s.id);
+    await page.evaluate(id => {
+      const chat = chatView(id);
+      clearTimeout(chatPollTimer);
+      chatPollTimer = undefined;
+      // Simulate transcript IO still in flight while the native renderer is detached.
+      chat.reading = true;
+      chat.terminalPrompt = null;
+      chat.ticket = null;
+      const terminal = views.get(id);
+      window.interactionRendererState = { runId: terminal.runId, ready: terminal.ready, replaying: terminal.replaying };
+      terminal.runId = null;
+      terminal.ready = false;
+      terminal.replaying = true;
+      paintChatComposer(session(id), chat);
+    }, s.id);
     await answerFixture();
     await card.getByRole("radiogroup", { name: "Apply the change where?" }).waitFor();
+    assert(await page.evaluate(id => chatView(id).reading, s.id), "live question appears while transcript loading remains pending");
     const questionNotice = await until(async () => (await attentionEntries()).find(entry => entry.kind === "question"), provider + " question replaces answered approval");
     assert(!(await attentionEntries()).some(entry => entry.id === approvalNotice.id), "answered approval clears its marker");
     await sleep(1000);
@@ -1020,6 +1058,12 @@ async function testPendingChatInteraction() {
     assert.equal((await choiceMenu()).key, first.key, "arrow navigation does not send a reply");
     await card.getByRole("button", { name: "Send selection", exact: true }).click();
     await card.getByRole("radiogroup", { name: "Apply the test where?" }).waitFor();
+    await page.evaluate(id => {
+      Object.assign(views.get(id), window.interactionRendererState);
+      delete window.interactionRendererState;
+      chatView(id).reading = false;
+      scheduleChatRead();
+    }, s.id);
     const second = await choiceMenu();
     assert.notEqual(first.key, second.key);
     await assert.rejects(answerPrompt({ ...second, key: first.key }, 2), /Soru değişti/);
@@ -1034,6 +1078,15 @@ async function testPendingChatInteraction() {
       const customInput = card.getByRole("textbox", { name: "Your own answer", exact: true });
       const customAnswer = "Yalnızca yapılandırma dosyasını güncelle.";
       await customInput.fill(customAnswer);
+      await page.setViewportSize({ width: 1100, height: 620 });
+      await card.getByRole("textbox", { name: "Your own answer", exact: true }).scrollIntoViewIfNeeded();
+      assert(await card.getByRole("textbox", { name: "Your own answer", exact: true }).evaluate(field => {
+        const rect = field.getBoundingClientRect(), viewport = document.querySelector("#viewport").getBoundingClientRect();
+        return rect.top >= viewport.top && rect.bottom <= viewport.bottom;
+      }), provider + " question controls remain reachable in a short window");
+      const metrics = await page.context().newCDPSession(page);
+      await metrics.send("Emulation.clearDeviceMetricsOverride");
+      await metrics.detach();
       const captures = path.join(root, "target", "question-card-qa");
       fs.mkdirSync(captures, { recursive: true });
       await card.screenshot({ path: path.join(captures, provider + "-native-question.png") });
@@ -1053,8 +1106,10 @@ async function testPendingChatInteraction() {
     assert.equal((await api("terminal", "attach", { id: s.id })).runId, runId);
     assert.equal(fs.readFileSync(path.join(data, "test-input", `${provider}-choice-0.txt`), "utf8"), "2");
     assert.equal(fs.readFileSync(path.join(data, "test-input", `${provider}-choice-1.txt`), "utf8"), "1");
-    await page.getByRole("button", { name: "Show live Terminal output" }).click();
     await page.locator("#chat-terminal-output").getByText("Fixture interaction uses a different layout.").waitFor();
+    await page.getByRole("button", { name: "Hide live Terminal output" }).click();
+    assert(await page.locator("#chat-terminal-output").isHidden());
+    await page.getByRole("button", { name: "Show live Terminal output" }).click();
     await answerFixture();
     await page.locator("#chat-terminal-output").waitFor({ state: "hidden" });
     assert.equal(await input.inputValue(), "Keep this separate draft.");
@@ -1494,8 +1549,177 @@ async function testRepositoryWithoutGit() {
   assert.equal(fs.readFileSync(path.join(session.directory, "file.txt"), "utf8"), "saved without Git\n");
   assert.equal(fs.readFileSync(path.join(folder, "file.txt"), "utf8"), "source\n");
   assert.equal((await api("git", "state", context)).available, false);
+  assert.equal((await api("git", "current_branch", context)).branch, null, "missing Git falls back without claiming a branch");
   await stop();
   console.log("PASS Git optional: missing executable preserves copy workspaces, terminal startup and editor saves in an existing repository");
+}
+
+async function testTerminalLocations() {
+  const profile = path.join(temporary, "terminal-location-profile");
+  const base = path.join(temporary, "WorkspaceProjects");
+  const repository = path.join(base, "Sample App");
+  const plain = path.join(base, "Plain Project");
+  fs.mkdirSync(repository, { recursive: true });
+  fs.mkdirSync(plain);
+  fs.writeFileSync(path.join(repository, "sample.txt"), "Synthetic workspace\n");
+  const git = (directory, ...args) => cp.execFileSync("git", args, {
+    cwd: directory, encoding: "utf8", windowsHide: true,
+  }).trim();
+  git(repository, "init", "-b", "feature/footer");
+  git(repository, "add", "sample.txt");
+  git(repository, "-c", "user.name=Workflow Test", "-c", "user.email=test@localhost", "commit", "-m", "Synthetic workspace");
+  await start("", profile);
+  const skip = page.locator("#dialog").getByRole("button", { name: "Skip", exact: true });
+  if (await skip.isVisible()) await skip.click();
+  const p = await api("app", "add_project", { directory: repository });
+  const rows = [];
+  for (const provider of ["codex", "claude", "copilot"]) {
+    rows.push(await api("app", "create_session", { projectId: p.id, provider, workspaceMode: "direct", tools: false }));
+  }
+  const refresh = async () => page.evaluate(async () => {
+    await window.workflow.refresh();
+    await refreshTerminalLocations(true);
+  });
+  const footer = id => page.evaluate(id => {
+    const v = window.workflow.views.get(id);
+    return { text: v?.pathValue.textContent, title: v?.path.title, kind: v?.path.dataset.kind, modeHidden: v?.pathMode.hidden };
+  }, id);
+  await refresh();
+  for (const row of rows) {
+    assert.deepEqual(await footer(row.id), { text: "feature/footer", title: row.directory, kind: "branch", modeHidden: false });
+  }
+  git(repository, "switch", "-c", "feature/new-footer");
+  await until(async () => (await footer(rows[0].id)).text === "feature/new-footer", "footer follows external branch changes", 13000);
+  for (const row of rows) assert.equal((await footer(row.id)).text, "feature/new-footer");
+  const isolated = await api("app", "create_session", { projectId: p.id, provider: "claude", tools: false });
+  await refresh();
+  assert.equal((await footer(isolated.id)).text, git(isolated.directory, "symbolic-ref", "--short", "HEAD"), "isolated session shows its own worktree branch");
+  git(repository, "checkout", "--detach");
+  await refresh();
+  for (const row of rows) {
+    assert.deepEqual(await footer(row.id), { text: path.join("WorkspaceProjects", "Sample App"), title: row.directory, kind: "folder", modeHidden: true });
+  }
+  const plainProject = await api("app", "add_project", { directory: plain });
+  for (const provider of ["codex", "claude", "copilot"]) {
+    const row = await api("app", "create_session", { projectId: plainProject.id, provider, workspaceMode: "direct", tools: false });
+    await page.evaluate(async id => { await window.workflow.refresh(); window.workflow.selectSession(id, true); await refreshTerminalLocations(true); }, row.id);
+    assert.deepEqual(await footer(row.id), { text: path.join("WorkspaceProjects", "Plain Project"), title: row.directory, kind: "folder", modeHidden: true });
+  }
+  assert(!fs.existsSync(path.join(plain, ".git")), "footer lookup must never initialize Git");
+  const copy = await api("app", "create_session", { projectId: plainProject.id, provider: "copilot", tools: false });
+  await refresh();
+  assert.deepEqual(await footer(copy.id), { text: path.join("WorkspaceProjects", "Plain Project"), title: copy.directory, kind: "folder", modeHidden: true }, "isolated copies retain project context while hovering shows the actual working folder");
+  assert(await page.evaluate(() => {
+    return shortTerminalPath("C:\\long\\Projects\\App\\src", "C:\\long\\Projects\\App") === "Projects\\App\\src"
+      && shortTerminalPath("C:\\isolated\\copy", "C:\\long\\Projects\\App") === "Projects\\App"
+      && shortTerminalPath("C:\\", "C:\\") === "C:\\"
+      && shortTerminalPath("\\\\server\\share\\App", "\\\\server\\share\\App") === "share\\App";
+  }), "short paths preserve useful parent context, nested folders, drive roots and network shares");
+  await stop();
+  console.log("PASS compact terminal footers for all providers, live branch changes, worktrees, detached HEAD, no Git and full-path hover");
+}
+
+async function testModelSettings() {
+  const profile = path.join(temporary, "model-settings-profile");
+  const folder = path.join(temporary, "model-settings-project");
+  fs.mkdirSync(folder);
+  fs.writeFileSync(path.join(folder, "model-dialog-fixture"), "");
+  await start("", profile);
+  const setup = page.locator("#dialog").getByRole("button", { name: "Skip", exact: true });
+  if (await setup.isVisible()) await setup.click();
+  const p = await api("app", "add_project", { directory: folder });
+  const dialog = page.locator("#dialog");
+  const open = async id => {
+    await page.evaluate(async id => {
+      await window.workflow.refresh();
+      window.workflow.selectSession(id, true);
+      window.workflow.views.get(id).model.click();
+    }, id);
+    await dialog.getByRole("heading", { name: "Select model", exact: true }).waitFor();
+  };
+  const requests = provider => fs.readFileSync(path.join(folder, `model-requests-${provider}.txt`), "utf8").trim().split("\n").length;
+  let claude, copilot;
+  for (const provider of ["codex", "claude", "copilot"]) {
+    const s = await api("app", "create_session", { projectId: p.id, provider, workspaceMode: "direct", tools: false });
+    if (provider === "claude") claude = s;
+    if (provider === "copilot") copilot = s;
+    await open(s.id);
+    assert(await dialog.getByText("Loading model list…", { exact: true }).isVisible(), "dialog opens before the slow provider response");
+    assert(await dialog.getByLabel("Model", { exact: true }).isDisabled());
+    const efforts = dialog.getByLabel("Reasoning effort", { exact: true });
+    assert.equal(await efforts.isVisible(), true);
+    await page.locator("#dialog-close").click();
+    await page.evaluate(() => modal("Replacement dialog", el("p", "", "Replacement content")));
+    await api("models", "list", { id: s.id });
+    await dialog.getByRole("heading", { name: "Replacement dialog" }).waitFor();
+    assert.equal(requests(provider), 1, "concurrent requests share the same CLI lookup");
+    await page.locator("#dialog-close").click();
+    const warm = Date.now();
+    await open(s.id);
+    await until(async () => !await dialog.getByLabel("Model", { exact: true }).isDisabled(), "cached catalog visible");
+    assert(Date.now() - warm < 1600, "cached dialog must not wait for the two-second provider lookup");
+    assert.equal(requests(provider), 1);
+    const approvals = dialog.getByLabel("Approval level", { exact: true });
+    if (provider === "claude") {
+      assert.equal(await efforts.inputValue(), "", "missing saved effort must preserve the provider default");
+      await efforts.selectOption("high");
+      await approvals.selectOption("plan");
+    } else if (provider === "codex") {
+      await approvals.selectOption("manual");
+    } else {
+      assert(await approvals.isDisabled(), "Copilot live permissions require a running ready terminal");
+      assert.equal(await efforts.inputValue(), "medium");
+      await dialog.getByLabel("Model", { exact: true }).selectOption("fixture-copilot-basic");
+      assert(await efforts.isVisible());
+      assert(await efforts.isDisabled(), "unsupported models must not invent effort options");
+      await dialog.getByLabel("Model", { exact: true }).selectOption("fixture-copilot");
+      await efforts.selectOption("high");
+    }
+    await dialog.getByRole("button", { name: "Apply", exact: true }).click();
+    await dialog.waitFor({ state: "hidden" });
+    const saved = (await api("app", "state")).sessions.find(row => row.id === s.id);
+    if (provider !== "codex") assert.equal(saved.effort, "high");
+    if (provider === "copilot") await assert.rejects(api("models", "apply", { id: s.id, model: "fixture-copilot", effort: "ultra" }), /Düşünme seviyesi geçersiz/);
+    if (provider !== "copilot") assert.equal(saved.approvalMode, provider === "claude" ? "plan" : "manual");
+    await open(s.id);
+    await until(async () => !await dialog.getByLabel("Model", { exact: true }).isDisabled(), "saved model catalog");
+    if (provider !== "codex") assert.equal(await efforts.inputValue(), "high");
+    await page.locator("#dialog-close").click();
+  }
+  await page.evaluate(id => window.workflow.selectSession(id, true), claude.id);
+  await page.locator("#session-chat-view").click();
+  assert(await page.locator("#chat-effort").isVisible(), "Claude reasoning control is available in Chat too");
+  await page.locator("#session-terminal-view").click();
+  fs.writeFileSync(path.join(folder, "missing-effort-fixture"), "");
+  await open(claude.id);
+  await until(async () => !await dialog.getByLabel("Model", { exact: true }).isDisabled(), "cached Claude models");
+  await dialog.getByRole("button", { name: "Refresh model list", exact: true }).click();
+  await dialog.getByText(/The provider did not report reasoning efforts/).waitFor();
+  assert(await dialog.getByLabel("Reasoning effort", { exact: true }).isVisible());
+  assert(await dialog.getByLabel("Reasoning effort", { exact: true }).isDisabled());
+  await assert.rejects(api("models", "apply", { id: claude.id, model: "fixture-claude", effort: "high" }), /Düşünme seviyesi geçersiz/);
+  fs.unlinkSync(path.join(folder, "missing-effort-fixture"));
+  await dialog.getByRole("button", { name: "Refresh model list", exact: true }).click();
+  await until(async () => !await dialog.getByLabel("Reasoning effort", { exact: true }).isDisabled(), "explicit refresh restores reported efforts");
+  await page.locator("#dialog-close").click();
+  const config = path.join(profile, "test-claude-home", "settings.json");
+  fs.mkdirSync(path.dirname(config), { recursive: true });
+  fs.writeFileSync(config, JSON.stringify({ model: "fixture-claude" }));
+  await assert.rejects(api("models", "apply", { id: claude.id, model: "fixture-claude", effort: "high" }), /Model listesi değişti/);
+  await api("models", "list", { id: claude.id });
+  fs.writeFileSync(path.join(folder, "model-error-fixture"), "");
+  await assert.rejects(api("models", "list", { id: claude.id, refresh: true }), /seçilebilir model bulunamadı/);
+  await assert.rejects(api("models", "apply", { id: claude.id, model: "fixture-claude", effort: "high" }), /Önce model listesini aç/);
+  fs.unlinkSync(path.join(folder, "model-error-fixture"));
+  await api("models", "list", { id: claude.id });
+  await stop();
+  await start("", profile);
+  const restored = (await api("app", "state")).sessions.find(row => row.id === claude.id);
+  assert.equal(restored.effort, "high");
+  assert.equal(restored.approvalMode, "plan");
+  assert.equal((await api("app", "state")).sessions.find(row => row.id === copilot.id).effort, "high");
+  await stop();
+  console.log("PASS immediate model dialog, scoped/coalesced cache, forced refresh, stale context rejection, terminal approval controls, Claude effort metadata and persistence");
 }
 
 async function test() {
@@ -1575,6 +1799,21 @@ async function test() {
     );
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  if (process.env.WORKFLOW_TEST_MODELS_ONLY === "1") {
+    await testModelSettings();
+    await testCodexChat();
+    await testAdditionalProviderChats();
+    return;
+  }
+  if (process.env.WORKFLOW_TEST_INTERACTIONS_ONLY === "1") {
+    await testPendingChatInteraction();
+    return;
+  }
+  if (process.env.WORKFLOW_TEST_LOCATIONS_ONLY === "1") {
+    await testTerminalLocations();
+    await testRepositoryWithoutGit();
+    return;
+  }
   if (process.env.WORKFLOW_TEST_NOTIFICATIONS_ONLY === "minimized") {
     await testMinimizedSelectedNotifications();
     return;
@@ -1591,6 +1830,8 @@ async function test() {
     return;
   }
   if (process.platform === "win32") {
+    await testTerminalLocations();
+    await testModelSettings();
     await testMinimizedSelectedNotifications();
     await testSessionNotifications();
     await testRepositoryWithoutGit();

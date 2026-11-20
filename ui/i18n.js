@@ -2,6 +2,16 @@
 
 // Turkish source text is the default. Translate only messages authored by Workflow.
 const english = {
+  "Copilot düşünme seviyesi sonraki başlangıçta uygulanır. Onay seviyesi, çalışan oturum girişe hazırken değiştirilebilir.": "Copilot reasoning effort applies at the next start. Approval level can be changed when the running session is ready for input.",
+  "Copilot düşünme seviyesi terminalin bir sonraki başlangıcında uygulanır.": "Copilot reasoning effort applies the next time the terminal starts.",
+  "Onay ve düşünme seviyesi terminalin bir sonraki başlangıcında uygulanır.": "Approval and reasoning effort apply the next time the terminal starts.",
+  "Claude Code düşünme seviyesi terminalin bir sonraki başlangıcında uygulanır; açık terminal yeniden başlatılmaz.": "Claude Code reasoning effort applies the next time the terminal starts; the running terminal is not restarted.",
+  "Model listesi yükleniyor…": "Loading model list…",
+  "Model listesi alınamadı": "Could not load the model list",
+  "Model listesini yenile": "Refresh model list",
+  "Model listesi değişti; listeyi yeniden aç.": "The model list changed. Open it again.",
+  "Seviye bilgisi yok": "Effort information unavailable",
+  "Sağlayıcı bu modelin düşünme seviyelerini bildirmedi. Listeyi yenileyebilir veya CLI sürümünü kontrol edebilirsin.": "The provider did not report reasoning efforts for this model. Refresh the list or check the CLI version.",
   "Bildirimler": "Notifications",
   "Bildirimler ({count})": "Notifications ({count})",
   "Oturum bildirimi": "Session notification",
