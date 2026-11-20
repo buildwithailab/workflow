@@ -59,11 +59,35 @@ fn checkout(root: &Path) -> Option<String> {
         .or_else(|_| git(root, &["rev-parse", "--verify", "HEAD"]))
         .ok()
 }
+
+fn capture_baseline(
+    source: &Path,
+    mut save: impl FnMut(&[u8]) -> Result<String>,
+) -> Result<HashMap<String, String>> {
+    scan_with(source, |relative, _| {
+        let bytes = fs::read(safe_path(source, relative)?)?;
+        save(&bytes)
+    })
+}
+
+fn verify_baseline(
+    source: &Path,
+    before: &HashMap<String, String>,
+    direct: bool,
+    baseline_ref: &Option<String>,
+) -> Result<()> {
+    // Always re-read all included source files, including additions and deletions.
+    if scan(source)? != *before || (direct && checkout(source) != *baseline_ref) {
+        bail!("Kaynak proje işlem sırasında değişti; yeni oturum başlatılamadı")
+    }
+    Ok(())
+}
+
 pub fn create_workspace(core: &Core, project: &Value, sid: &str, direct: bool) -> Result<Value> {
     let source = dunce::canonicalize(string(project, "directory")?)?;
     core.check_project_directory(&source)?;
     let baseline_ref = direct.then(|| checkout(&source)).flatten();
-    let before = scan(&source)?;
+    let before = capture_baseline(&source, |bytes| store(core, bytes))?;
     let slot = core.directory.join("workspaces").join(sid);
     fs::create_dir_all(&slot)?;
     let worktree = slot.join("files");
@@ -101,29 +125,20 @@ pub fn create_workspace(core: &Core, project: &Value, sid: &str, direct: bool) -
             fs::create_dir_all(&worktree)?;
             fs::create_dir_all(safe_path(&worktree, &subdir.to_string_lossy())?)?;
         }
-        let mut saved = serde_json::Map::new();
-        for (rel, digest) in &before {
-            let bytes = fs::read(safe_path(&source, rel)?)?;
-            if hash(&bytes) != *digest {
-                bail!("Çalışma alanı hazırlanırken kaynak değişti; yeniden dene")
-            }
-            store(core, &bytes)?;
-            saved.insert(rel.clone(), json!(digest));
-            if !direct {
+        if !direct {
+            for (rel, digest) in &before {
+                // Copy the captured bytes, not a later revision of the source.
+                let bytes = blob(core, &json!(digest))?.context("Başlangıç yedeği bulunamadı")?;
                 atomic(&safe_path(&root, rel)?, &bytes)?;
             }
-        }
-        if !direct {
             for rel in scan(&root)?.keys() {
                 if !before.contains_key(rel) {
                     fs::remove_file(safe_path(&root, rel)?)?;
                 }
             }
         }
-        if scan(&source)? != before || (direct && checkout(&source) != baseline_ref) {
-            bail!("Kaynak proje işlem sırasında değişti; yeni oturum başlatılamadı")
-        }
-        atomic(&slot.join("baseline.json"), &serde_json::to_vec(&saved)?)
+        verify_baseline(&source, &before, direct, &baseline_ref)?;
+        atomic(&slot.join("baseline.json"), &serde_json::to_vec(&before)?)
     })();
     if prepared.is_err() {
         if let Some(branch) = branch.as_deref().filter(|_| kind == "worktree") {
@@ -615,6 +630,106 @@ fn transfer(core: &Core, args: &Value, undo: bool) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SnapshotDirectory(PathBuf);
+    impl SnapshotDirectory {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(id());
+            fs::create_dir(&root).unwrap();
+            Self(dunce::canonicalize(root).unwrap())
+        }
+    }
+    impl Drop for SnapshotDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn snapshot_hashes_and_backups_share_one_capture_per_included_file() {
+        let directory = SnapshotDirectory::new();
+        let root = &directory.0;
+        fs::create_dir(root.join("nested")).unwrap();
+        fs::create_dir(root.join("node_modules")).unwrap();
+        fs::write(root.join(".workflowignore"), "ignored.txt\n").unwrap();
+        fs::write(root.join("ignored.txt"), "ignored content").unwrap();
+        fs::write(root.join("node_modules/generated.txt"), "generated content").unwrap();
+        fs::write(root.join("nested/data.bin"), [0, 255, 42]).unwrap();
+        fs::write(root.join("empty.txt"), []).unwrap();
+        let mut saves = 0;
+        let mut objects = HashMap::new();
+        let baseline = capture_baseline(root, |bytes| {
+            saves += 1;
+            let digest = hash(bytes);
+            objects.insert(digest.clone(), bytes.to_vec());
+            Ok(digest)
+        }).unwrap();
+        assert_eq!(saves, 3);
+        assert_eq!(baseline, scan(root).unwrap());
+        for (relative, digest) in &baseline {
+            assert_eq!(objects[digest], fs::read(root.join(relative)).unwrap());
+        }
+        assert!(!baseline.contains_key("ignored.txt"));
+        assert!(!baseline.contains_key("node_modules/generated.txt"));
+        verify_baseline(root, &baseline, false, &None).unwrap();
+    }
+
+    #[test]
+    fn final_verification_rejects_edits_additions_and_deletions_after_capture() {
+        for change in ["edit", "add", "delete"] {
+            let directory = SnapshotDirectory::new();
+            let root = &directory.0;
+            let file = root.join("source.txt");
+            fs::write(&file, "first bytes").unwrap();
+            let mut backup = Vec::new();
+            let baseline = capture_baseline(root, |bytes| {
+                backup = bytes.to_vec();
+                if change == "edit" {
+                    // Same-length edits during persistence must not be hidden by metadata.
+                    fs::write(&file, "other bytes")?;
+                }
+                Ok(hash(bytes))
+            }).unwrap();
+            assert_eq!(backup, b"first bytes");
+            assert_eq!(baseline["source.txt"], hash(&backup));
+            match change {
+                "add" => fs::write(root.join("new.txt"), "new bytes").unwrap(),
+                "delete" => fs::remove_file(&file).unwrap(),
+                _ => {}
+            }
+            assert!(verify_baseline(root, &baseline, false, &None).is_err());
+        }
+    }
+
+    #[test]
+    fn snapshot_failures_and_file_limits_never_return_a_valid_baseline() {
+        let directory = SnapshotDirectory::new();
+        let file = directory.0.join("source.txt");
+        fs::write(&file, "synthetic bytes").unwrap();
+        assert!(capture_baseline(&directory.0, |_| bail!("backup unavailable")).is_err());
+        fs::OpenOptions::new().write(true).open(file).unwrap()
+            .set_len(128 * 1024 * 1024 + 1).unwrap();
+        let mut calls = 0;
+        assert!(capture_baseline(&directory.0, |bytes| {
+            calls += 1;
+            Ok(hash(bytes))
+        }).is_err());
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn final_verification_keeps_the_direct_workspace_branch_guard() {
+        let directory = SnapshotDirectory::new();
+        git(&directory.0, &["init", "-b", "snapshot-start"]).unwrap();
+        fs::write(directory.0.join("source.txt"), "synthetic bytes").unwrap();
+        let reference = checkout(&directory.0);
+        assert!(reference.is_some());
+        let baseline = capture_baseline(&directory.0, |bytes| Ok(hash(bytes))).unwrap();
+        verify_baseline(&directory.0, &baseline, true, &reference).unwrap();
+        git(&directory.0, &["symbolic-ref", "HEAD", "refs/heads/snapshot-other"]).unwrap();
+        assert!(verify_baseline(&directory.0, &baseline, true, &reference).is_err());
+    }
+
     #[test]
     fn line_diff_keeps_indices() {
         let v = diff(Some(b"a\nb\n"), Some(b"a\nc\n"));

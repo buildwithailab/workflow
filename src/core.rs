@@ -107,6 +107,15 @@ pub fn file_hash(p: &Path) -> Result<Option<String>> {
     Ok(read_optional(p)?.map(|b| hash(&b)))
 }
 pub fn scan(root: &Path) -> Result<HashMap<String, String>> {
+    scan_with(root, |_, path| Ok(hash(&fs::read(path)?)))
+}
+
+// Share enumeration, ignore rules and limits while letting snapshot creation
+// hash and persist the same bytes without a second source-file read.
+pub(crate) fn scan_with(
+    root: &Path,
+    mut read: impl FnMut(&str, &Path) -> Result<String>,
+) -> Result<HashMap<String, String>> {
     let mut out = HashMap::new();
     let walker = ignore::WalkBuilder::new(root)
         .add_custom_ignore_filename(".agentloomignore")
@@ -153,7 +162,8 @@ pub fn scan(root: &Path) -> Result<HashMap<String, String>> {
         if out.len() > 100_000 {
             bail!("Çalışma alanı dosya sınırını aşıyor")
         };
-        out.insert(relative, hash(&fs::read(e.path())?));
+        let digest = read(&relative, e.path())?;
+        out.insert(relative, digest);
     }
     Ok(out)
 }

@@ -1554,6 +1554,108 @@ async function testRepositoryWithoutGit() {
   console.log("PASS Git optional: missing executable preserves copy workspaces, terminal startup and editor saves in an existing repository");
 }
 
+async function testBaselineSnapshots() {
+  const profile = path.join(temporary, "baseline-snapshot-profile");
+  const original = Buffer.from("First line\r\nOriginal line\r\n", "utf8");
+  const image = Buffer.from([0, 255, 42, 13, 10, 128]);
+  const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+  const git = (folder, ...args) => cp.execFileSync("git", args, {
+    cwd: folder, encoding: "utf8", windowsHide: true,
+  }).trim();
+  await start("", profile);
+  const skip = page.locator("#dialog").getByRole("button", { name: "Skip", exact: true });
+  if (await skip.isVisible()) await skip.click();
+  for (const repository of [false, true]) {
+    const folder = path.join(temporary, repository ? "baseline-repository" : "baseline-plain");
+    fs.mkdirSync(path.join(folder, "nested"), { recursive: true });
+    fs.mkdirSync(path.join(folder, "generated"));
+    fs.writeFileSync(path.join(folder, ".workflowignore"), "generated/\n");
+    fs.writeFileSync(path.join(folder, "generated/omit.txt"), "generated data\n");
+    fs.writeFileSync(path.join(folder, "sample.txt"), original);
+    fs.writeFileSync(path.join(folder, "nested/data.bin"), image);
+    fs.writeFileSync(path.join(folder, "empty.txt"), "");
+    for (let index = 0; index < 96; index++) {
+      fs.writeFileSync(path.join(folder, "nested", `source-${index}.txt`), `Synthetic source ${index}\n`);
+    }
+    if (repository) {
+      git(folder, "init", "-b", "snapshot-main");
+      git(folder, "add", ".");
+      git(folder, "-c", "user.name=Workflow Test", "-c", "user.email=test@localhost", "commit", "-m", "Synthetic snapshot baseline");
+    }
+    const project = await api("app", "add_project", { directory: folder });
+    for (const provider of ["codex", "claude", "copilot"]) {
+      for (const workspaceMode of ["direct", "isolated"]) {
+        const s = await api("app", "create_session", { projectId: project.id, provider, workspaceMode, tools: false });
+        assert.equal(s.workspaceKind, workspaceMode === "direct" ? "direct" : repository ? "worktree" : "copy");
+        const file = path.join(s.directory, "sample.txt");
+        const baselinePath = path.join(profile, "workspaces", s.id, "baseline.json");
+        const baselineBytes = fs.readFileSync(baselinePath);
+        const baseline = JSON.parse(baselineBytes);
+        assert.equal(baseline["sample.txt"], digest(original));
+        assert.equal(baseline["nested/data.bin"], digest(image));
+        assert.equal(baseline["empty.txt"], digest(Buffer.alloc(0)));
+        assert.equal(Object.keys(baseline).length, 100);
+        assert(!Object.keys(baseline).some(name => name.startsWith("generated/")));
+        for (const [name, hash] of Object.entries(baseline)) {
+          const stored = fs.readFileSync(path.join(profile, "objects", hash));
+          assert.equal(digest(stored), hash);
+          assert.deepEqual(fs.readFileSync(path.join(s.directory, name)), stored);
+        }
+        const changed = Buffer.from(`Changed by ${provider} in ${workspaceMode}\n`);
+        fs.writeFileSync(file, changed);
+        const diff = await api("files", "diff", { sessionId: s.id, path: "sample.txt" });
+        const restore = { sessionId: s.id, path: "sample.txt", stamp: diff.stamp };
+        if (!repository && provider === "codex" && workspaceMode === "direct") {
+          const journal = path.join(profile, "undo");
+          fs.writeFileSync(journal, "block journal creation");
+          await assert.rejects(api("files", "restore", restore));
+          assert.deepEqual(fs.readFileSync(file), changed, "failed undo journal preserves the current file");
+          fs.unlinkSync(journal);
+          const object = path.join(profile, "objects", baseline["sample.txt"]);
+          fs.writeFileSync(object, "damaged synthetic backup");
+          try {
+            await assert.rejects(api("files", "restore", restore), /bütünlüğü/);
+            assert.deepEqual(fs.readFileSync(file), changed, "corrupt backup cannot overwrite the current file");
+          } finally { fs.writeFileSync(object, original); }
+        }
+        const undo = await api("files", "restore", restore);
+        assert.deepEqual(fs.readFileSync(file), original);
+        await api("files", "undo_restore", { sessionId: s.id, token: undo.id });
+        assert.deepEqual(fs.readFileSync(file), changed);
+        fs.writeFileSync(file, original);
+        const binary = path.join(s.directory, "nested/data.bin");
+        fs.writeFileSync(binary, Buffer.from([1, 2, 3]));
+        const binaryDiff = await api("files", "diff", { sessionId: s.id, path: "nested/data.bin" });
+        await api("files", "restore", { sessionId: s.id, path: "nested/data.bin", stamp: binaryDiff.stamp });
+        assert.deepEqual(fs.readFileSync(binary), image);
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const run = await api("terminal", "start", { id: s.id });
+          await until(async () => Buffer.from((await api("terminal", "attach", { id: s.id })).data, "base64").toString().includes(`Workflow terminal test · ${provider}`), provider + " startup with captured baseline");
+          await api("terminal", "stop", { id: s.id, runId: run.runId });
+          await until(async () => !(await api("app", "state")).active.some(row => row.id === s.id), provider + " stopped");
+        }
+        assert.deepEqual(fs.readFileSync(baselinePath), baselineBytes, "starting and resuming never replaces the original baseline");
+        assert.deepEqual(fs.readFileSync(path.join(folder, "sample.txt")), original);
+      }
+    }
+  }
+  await stop();
+  const failedProfile = path.join(temporary, "baseline-failure-profile");
+  const failedSource = path.join(temporary, "baseline-failure-source");
+  fs.mkdirSync(failedSource);
+  fs.writeFileSync(path.join(failedSource, "sample.txt"), "synthetic source\n");
+  await start("", failedProfile);
+  const project = await api("app", "add_project", { directory: failedSource });
+  fs.writeFileSync(path.join(failedProfile, "objects"), "block backup storage");
+  for (const provider of ["codex", "claude", "copilot"]) {
+    await assert.rejects(api("app", "create_session", { projectId: project.id, provider, workspaceMode: "direct", tools: false }));
+  }
+  assert.equal((await api("app", "state")).sessions.length, 0, "failed capture never publishes a session");
+  assert.deepEqual(fs.readFileSync(path.join(failedSource, "sample.txt")), Buffer.from("synthetic source\n"));
+  await stop();
+  console.log("PASS single-read snapshots for all providers across direct, copy and Git worktree modes; exact backups, text/binary restore, undo, restart and fail-closed persistence");
+}
+
 async function testTerminalLocations() {
   const profile = path.join(temporary, "terminal-location-profile");
   const base = path.join(temporary, "WorkspaceProjects");
@@ -1805,6 +1907,10 @@ async function test() {
     await testAdditionalProviderChats();
     return;
   }
+  if (process.env.WORKFLOW_TEST_BASELINE_ONLY === "1") {
+    await testBaselineSnapshots();
+    return;
+  }
   if (process.env.WORKFLOW_TEST_INTERACTIONS_ONLY === "1") {
     await testPendingChatInteraction();
     return;
@@ -1830,6 +1936,7 @@ async function test() {
     return;
   }
   if (process.platform === "win32") {
+    await testBaselineSnapshots();
     await testTerminalLocations();
     await testModelSettings();
     await testMinimizedSelectedNotifications();
