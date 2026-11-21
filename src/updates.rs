@@ -604,6 +604,11 @@ impl Updates {
         }
     }
 
+    #[cfg(all(target_os = "macos", feature = "desktop-tests"))]
+    pub(crate) fn exit_installation_started(&self) -> bool {
+        self.installation.lock().unwrap().closing
+    }
+
     fn install_and_restart(&self) -> Result<()> {
         let mut installation = self.installation.lock().unwrap();
         if installation.closing {

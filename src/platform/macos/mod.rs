@@ -3,6 +3,8 @@ pub(crate) mod webview;
 pub(crate) mod preview;
 mod update;
 mod addons;
+mod startup;
+pub(crate) use startup::{complete_startup, handle_startup_failure, startup_completed, startup_error};
 pub(crate) use addons::prepare as prepare_openspec;
 pub(crate) use update::install as update_installer;
 #[cfg(feature = "desktop-tests")]
@@ -21,19 +23,6 @@ pub(crate) fn own_window_state(window: &tauri::WebviewWindow) -> anyhow::Result<
     };
     if objc2::MainThreadMarker::new().is_some() {apply();}else{window.run_on_main_thread(apply)?;}
     Ok(())
-}
-
-pub(crate) fn startup_error(error: &dyn std::fmt::Display) {
-    let Some(mtm)=objc2::MainThreadMarker::new() else {return;};
-    let message=error.to_string();
-    let detail=if message.contains("zaten açık") {"Workflow bu veri klasörüyle zaten açık."}
-        else if message.contains("özel") || message.contains("kullanıcıya ait") || message.contains("sembolik") {"Workflow verileri için kendi kullanıcı hesabına ait, ayrı ve özel bir klasör kullan."}
-        else {"Uygulama paketi veya veri klasörü yüklenemedi. Klasör izinlerini ve kullanılabilir disk alanını kontrol et."};
-    let alert=objc2_app_kit::NSAlert::new(mtm);
-    alert.setMessageText(&objc2_foundation::NSString::from_str("Workflow açılamadı"));
-    alert.setInformativeText(&objc2_foundation::NSString::from_str(detail));
-    alert.window().setRestorable(false);
-    alert.runModal();
 }
 
 pub(crate) fn private_data_directory(directory: &std::path::Path, default_directory: Option<&std::path::Path>) -> anyhow::Result<()> {

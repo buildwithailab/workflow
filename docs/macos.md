@@ -47,6 +47,24 @@ Controlled providers verify application mechanics; they do not establish that an
 
 Also verify Finder file and image drops, screenshot paste in both Terminal and Chat, Dock and popup behavior while minimized/backgrounded, and application close/quit paths. Teams requires a signed-in Mac Teams Web connection and an explicitly authorized destination and message. Do not send a real message merely to satisfy a fixture test.
 
+## Startup error acceptance
+
+Recoverable Mac setup errors are handled before they can reach Tauri's panic boundary. The error dialog is scheduled on the native main operation queue after the event callback returns. A failure after window creation uses a non-blocking sheet; an earlier failure uses a standalone alert. Dismissing the error exits with status 1. Partially initialized resources are stopped, and exit-time update installation is permitted only after the entire setup succeeds. Profile permission and ownership checks still reject unsafe directories without changing their contents or modes.
+
+Run the assisted startup checks with a fresh run name. They create only synthetic profiles and app copies under ignored `target/startup-checks`. Child environments use an explicit system-variable allowlist, synthetic HOME and provider directories, and missing custom provider executables so fixed installation paths cannot reach real CLIs. Automatic updates are disabled in the synthetic profile. Normal builds omit `WORKFLOW_TEST_MODE` entirely. Observe each requested window, dismiss an expected error with **OK**, and quit healthy windows normally. The duplicate-instance check also asks you to verify and quit the first application.
+
+```sh
+WORKFLOW_MAC_STARTUP_RUN=debug-check WORKFLOW_MAC_STARTUP_BRIDGE=1 node tests/macos-startup.cjs permissions
+WORKFLOW_MAC_STARTUP_RUN=debug-check WORKFLOW_MAC_STARTUP_BRIDGE=1 node tests/macos-startup.cjs corrupt
+WORKFLOW_MAC_STARTUP_RUN=debug-check WORKFLOW_MAC_STARTUP_BRIDGE=1 node tests/macos-startup.cjs duplicate
+WORKFLOW_MAC_STARTUP_RUN=debug-check WORKFLOW_MAC_STARTUP_BRIDGE=1 node tests/macos-startup.cjs late
+WORKFLOW_MAC_STARTUP_RUN=debug-check WORKFLOW_MAC_STARTUP_BRIDGE=1 node tests/macos-startup.cjs normal
+```
+
+The debug checks require the explicitly enabled `desktop-tests` build above. The late case creates an ordinary I/O failure in the test bridge's control-file write after the main window and services have initialized. Its exit observer reads the updater's actual installation state; failed setup must leave that state untouched, whereas a healthy exit must enter the normal update check. The bridge and observer are absent from a normal release build.
+
+Also repeat `permissions`, `corrupt`, `duplicate`, and `normal` against the normal app extracted from the final locally tested ZIP: set `WORKFLOW_MAC_STARTUP_APP` to that bundle, use a fresh `WORKFLOW_MAC_STARTUP_RUN`, and omit `WORKFLOW_MAC_STARTUP_BRIDGE`. No launch-state suppression arguments are used. Keep the installed user application, its account caches, and its project/conversation data outside these tests. Neither running these checks nor building a local candidate authorizes a commit or publication.
+
 ## Updates and Windows compatibility
 
 Mac updates use `Workflow-Update-macOS-arm64.app.zip` and the signed `Workflow-Update-macOS-arm64.json`. They share the pinned public verification key with Windows but use a platform-specific package and manifest. Apple application signing and update-manifest signing are separate checks. A signature that authorizes a Windows asset cannot authorize a Mac installation.

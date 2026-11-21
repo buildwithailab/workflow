@@ -5,6 +5,13 @@ use serde_json::{json, Value};
 use std::{io::{BufRead, BufReader, Read, Write}, net::{TcpListener,TcpStream}, sync::Arc, time::Duration};
 use tauri::Manager;
 
+pub(crate) fn record_startup_exit(core: &Core) {
+    if std::env::var("WORKFLOW_TEST_MODE").ok().as_deref() != Some("1") || crate::profile_override().is_none() { return; }
+    let result = json!({"startupCompleted":super::startup_completed(&core.app),
+        "exitInstallationStarted":core.updates.exit_installation_started()});
+    let _ = serde_json::to_vec(&result).map(|bytes| atomic(&core.directory.join("test-startup-exit.json"), &bytes));
+}
+
 pub(crate) fn start(core: &Arc<Core>) -> Result<()> {
     if std::env::var("WORKFLOW_TEST_MODE").ok().as_deref() != Some("1") || crate::profile_override().is_none() { return Ok(()); }
     let listener = TcpListener::bind(("127.0.0.1",0))?;

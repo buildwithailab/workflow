@@ -17,9 +17,8 @@ async function until(read,label,timeout=15000) { const end=Date.now()+timeout;le
 async function start() {
   control=null;
   fs.rmSync(path.join(profile,"test-control.json"),{force:true});
-  // Other local app copies share the bundle ID. Keep stale AppKit saved windows
-  // out of this isolated-profile test without changing any OS preferences.
-  child = cp.spawn(executable,["-ApplePersistenceIgnoreState","YES"],{stdio:"ignore",env:{...process.env,WORKFLOW_DATA_DIR:profile,WORKFLOW_TEST_MODE:"1",
+  // Exercise normal launch arguments; native window restoration is owned by Workflow.
+  child = cp.spawn(executable,[],{stdio:"ignore",env:{...process.env,WORKFLOW_DATA_DIR:profile,WORKFLOW_TEST_MODE:"1",
     WORKFLOW_TEST_PROVIDER:fixture,WORKFLOW_TEST_RPC_EXE:executable,WORKFLOW_TEST_INPUT_DIR:path.join(profile,"test-input"),
     CODEX_HOME:homes.codex,CLAUDE_CONFIG_DIR:homes.claude,COPILOT_HOME:homes.copilot}});
   control = await until(()=>fs.existsSync(path.join(profile,"test-control.json"))&&JSON.parse(fs.readFileSync(path.join(profile,"test-control.json"))),"test startup",30000).catch(error=>{child.kill("SIGTERM");throw error;});

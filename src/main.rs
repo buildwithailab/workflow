@@ -745,6 +745,9 @@ fn main() {
         window.clone()
     });
     let application=tauri::Builder::default().plugin(tauri_plugin_dialog::init()).plugin(tauri_plugin_opener::init()).plugin(tauri_plugin_notification::init()).invoke_handler(tauri::generate_handler![dispatch]).setup(move|app|{
+        // Tauri runs this hook from its event loop and panics if it returns Err.
+        // Keep the platform's startup-error handling inside that boundary.
+        let result = (|| -> std::result::Result<(), Box<dyn std::error::Error>> {
         let (directory, webview_directory) = if let Some(override_path) = profile_override() {
             let directory = PathBuf::from(override_path);
             let webview_directory = directory.join("ui-profile");
@@ -760,7 +763,10 @@ fn main() {
             (directory.clone(), directory)
         };
         let core = Core::new(directory, app.handle().clone())?;
+        #[cfg(target_os = "macos")]
+        app.manage(core.clone());
         mcp::start(&core)?;
+        #[cfg(not(target_os = "macos"))]
         app.manage(core.clone());
         #[cfg(any(windows, target_os = "macos"))]
         app.manage(teams::Teams::default());
@@ -780,6 +786,14 @@ fn main() {
         crate::platform::macos::test_bridge::start(&core)?;
         if std::env::var("WORKFLOW_TEST_MODE").ok().as_deref()==Some("1"){let _=atomic(&core.directory.join("ready.json"),&serde_json::to_vec(&json!({"pid":std::process::id(),"endpoint":*core.endpoint.lock().unwrap()}))?);}
         Ok(())
+        })();
+        #[cfg(target_os = "macos")]
+        {
+            crate::platform::macos::complete_startup(app, result);
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        result
     }).build(context);
     let application = match application {
         Ok(app) => app,
@@ -815,6 +829,10 @@ fn main() {
         }
     };
     application.run(|app, event| {
+        #[cfg(target_os = "macos")]
+        if matches!(event, tauri::RunEvent::Ready) {
+            crate::platform::macos::handle_startup_failure(app);
+        }
         if let tauri::RunEvent::WindowEvent {
             label,
             event: tauri::WindowEvent::CloseRequested { .. },
@@ -837,8 +855,14 @@ fn main() {
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
         ) {
             if let Some(core) = app.try_state::<Arc<Core>>() {
-                #[cfg(any(windows, target_os = "macos"))]
+                #[cfg(windows)]
                 core.updates.install_on_exit();
+                #[cfg(target_os = "macos")]
+                if crate::platform::macos::startup_completed(app) {
+                    core.updates.install_on_exit();
+                }
+                #[cfg(all(target_os = "macos", feature = "desktop-tests"))]
+                crate::platform::macos::test_bridge::record_startup_exit(&core);
                 core.shutdown();
             }
         }
