@@ -1,0 +1,64 @@
+name: macOS stable update channel
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: macos-stable-update-channel
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    if: github.event_name == 'workflow_dispatch' || (github.event.release.prerelease == false && endsWith(github.event.release.tag_name, '-macos'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Select and verify the newest immutable Mac release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/macos-channel/assets
+          gh api --paginate --slurp repos/buildwithailab/workflow/releases > target/macos-channel/releases.json
+          tag=$(node scripts/macos-update-feed.cjs select target/macos-channel/releases.json)
+          gh release download "$tag" --repo buildwithailab/workflow --dir target/macos-channel/assets \
+            --pattern Workflow-Update-macOS-arm64.json --pattern Workflow-Update-macOS-arm64.app.zip
+          previous=()
+          status=$(curl --proto '=https' --tlsv1.2 --silent --show-error --output target/macos-channel/previous.json --write-out '%{http_code}' \
+            https://buildwithailab.github.io/workflow/updates/Workflow-Update-macOS-arm64.json)
+          case "$status" in
+            200) previous=(target/macos-channel/previous.json) ;;
+            404) ;;
+            *) echo 'Existing Mac channel could not be verified; deployment stopped.' >&2; exit 1 ;;
+          esac
+          node scripts/macos-update-feed.cjs \
+            target/macos-channel/assets/Workflow-Update-macOS-arm64.json \
+            target/macos-channel/assets/Workflow-Update-macOS-arm64.app.zip \
+            "$tag" target/macos-channel/pages "${previous[@]}"
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: target/macos-channel/pages
+  deploy:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+        id: deployment

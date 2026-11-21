@@ -1,5 +1,5 @@
 use crate::core::{atomic, hash, Core};
-use crate::update_manifest::{version, Package, Release, SignedManifest, ASSET, FEED, MAX_FEED};
+use crate::update_manifest::{version, Package, Release, SignedManifest, MAX_FEED};
 use anyhow::{bail, Context, Result};
 #[cfg(windows)]
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -210,6 +210,22 @@ enum Mode {
     Download,
 }
 
+// A debug-only, explicitly isolated transport exercises the real verifier,
+// download and installer. Normal release packages cannot select another feed.
+#[cfg(all(target_os = "macos", debug_assertions, feature = "desktop-tests"))]
+fn test_origin() -> Option<url::Url> {
+    if std::env::var("WORKFLOW_TEST_MODE").ok().as_deref() != Some("1") || crate::profile_override().is_none() {return None;}
+    let value = url::Url::parse(&std::env::var("WORKFLOW_TEST_UPDATE_ORIGIN").ok()?).ok()?;
+    (value.scheme()=="http" && value.host_str()==Some("127.0.0.1") && value.port().is_some_and(|port|port>0)
+        && value.username().is_empty() && value.password().is_none() && value.path()=="/"
+        && value.query().is_none() && value.fragment().is_none()).then_some(value)
+}
+
+#[cfg(not(all(target_os = "macos", debug_assertions, feature = "desktop-tests")))]
+fn test_origin() -> Option<url::Url> {None}
+
+fn supported() -> bool {SUPPORTED || test_origin().is_some()}
+
 fn is_newer(candidate: &str, installed: &str) -> bool {
     matches!((version(candidate), version(installed)), (Some(a), Some(b)) if a > b)
 }
@@ -219,29 +235,46 @@ fn due(last: Option<i64>, now: i64) -> bool {
 }
 
 fn download_url(version: &str) -> String {
-    format!("{REPO}/releases/download/v{version}/{ASSET}")
+    if let Some(origin)=test_origin() {return format!("{origin}releases/download/{}/Workflow-Update-macOS-arm64.app.zip",release_tag(version,true));}
+    package_url(version, cfg!(target_os = "macos"))
+}
+
+fn release_tag(version: &str, macos: bool) -> String {
+    format!("v{version}{}", if macos { "-macos" } else { "" })
+}
+
+fn package_url(version: &str, macos: bool) -> String {
+    let asset = if macos { "Workflow-Update-macOS-arm64.app.zip" }
+        else { "Workflow-Update-Windows-x64.exe" };
+    format!("{REPO}/releases/download/{}/{asset}", release_tag(version, macos))
 }
 
 fn client() -> Result<Client> {
+    let test = test_origin();
     Ok(Client::builder()
         .user_agent(concat!("Workflow/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(90))
-        .redirect(Policy::custom(|attempt| {
+        .redirect(Policy::custom(move |attempt| {
             let url = attempt.url();
+            if let Some(origin) = &test {
+                return if attempt.previous().len()<5 && url.origin()==origin.origin() && url.username().is_empty() && url.password().is_none() {
+                    attempt.follow()
+                } else {attempt.error("Unsupported update redirect")};
+            }
             if attempt.previous().len() < 5
                 && url.scheme() == "https"
                 && url.port().is_none()
                 && url.username().is_empty()
                 && url.password().is_none()
-                && matches!(
+                && (matches!(
                     url.host_str(),
                     Some(
                         "github.com"
                             | "release-assets.githubusercontent.com"
                             | "objects.githubusercontent.com"
                     )
-                )
+                ) || (cfg!(target_os = "macos") && url.host_str() == Some("buildwithailab.github.io")))
             {
                 attempt.follow()
             } else {
@@ -253,12 +286,27 @@ fn client() -> Result<Client> {
 }
 
 fn metadata_url(reference: &str) -> Option<String> {
+    if let Some(origin)=test_origin() {
+        let suffix=if reference=="latest" {"updates".to_owned()}
+            else {let tag=reference.strip_prefix("tags/v")?;version(tag)?;format!("releases/download/{}",release_tag(tag,true))};
+        return Some(format!("{origin}{suffix}/Workflow-Update-macOS-arm64.json"));
+    }
+    platform_metadata_url(reference, cfg!(target_os = "macos"))
+}
+
+fn platform_metadata_url(reference: &str, macos: bool) -> Option<String> {
     if reference == "latest" {
-        return Some(format!("{REPO}/releases/latest/download/{FEED}"));
+        return Some(if macos {
+            "https://buildwithailab.github.io/workflow/updates/Workflow-Update-macOS-arm64.json".into()
+        } else {
+            format!("{REPO}/releases/latest/download/Workflow-Update-Windows-x64.json")
+        });
     }
     let tag = reference.strip_prefix("tags/v")?;
     version(tag)?;
-    Some(format!("{REPO}/releases/download/v{tag}/{FEED}"))
+    let feed = if macos { "Workflow-Update-macOS-arm64.json" }
+        else { "Workflow-Update-Windows-x64.json" };
+    Some(format!("{REPO}/releases/download/{}/{feed}", release_tag(tag, macos)))
 }
 
 fn read_release(client: &Client, reference: &str) -> Result<Option<Release>> {
@@ -327,6 +375,7 @@ impl Updates {
         if let Ok(value) = fs::read_to_string(&receipt) {
             match value.as_str() {
                 "failed" => cache.error = Some("Güncelleme kurulamadı.".into()),
+                "rollback-failed" => cache.error = Some("Güncelleme geri alınamadı. Önceki uygulama kurtarma için korundu.".into()),
                 "restart-failed" => {
                     cache.error = Some("Güncellemeden sonra Workflow yeniden açılamadı.".into())
                 }
@@ -372,14 +421,14 @@ impl Updates {
             });
         json!({
             "version": VERSION,
-            "automatic": cache.automatic() && SUPPORTED,
-            "supported": SUPPORTED,
+            "automatic": cache.automatic() && supported(),
+            "supported": supported(),
             "checkedAt": cache.checked_at,
             "installedNotes": installed.map(|release| release.notes.as_str()),
             "available": latest.map(|release| json!({
                 "version": release.version,
                 "notes": release.notes,
-                "downloadable": SUPPORTED && release.trusted_package().is_some()
+                "downloadable": supported() && release.trusted_package().is_some()
             })),
             "pendingVersion": installation.pending.as_ref().map(|update| update.version.as_str()),
             "error": cache.error,
@@ -390,7 +439,7 @@ impl Updates {
     }
 
     fn set_automatic(&self, enabled: bool) -> Result<()> {
-        if enabled && !SUPPORTED {
+        if enabled && !supported() {
             bail!("Bu derleme otomatik güncellemeyi desteklemiyor.");
         }
         let mut cache = self.cache.lock().unwrap();
@@ -440,7 +489,7 @@ impl Updates {
                 .and_then(|failure| failure.retry_at)
                 .is_some_and(|retry| retry <= now);
             if mode == Mode::Automatic
-                && (!SUPPORTED || !cache.automatic() || (!due(cache.checked_at, now) && !retry_due))
+                && (!supported() || !cache.automatic() || (!due(cache.checked_at, now) && !retry_due))
             {
                 return Ok(());
             }
@@ -517,7 +566,7 @@ impl Updates {
             is_newer(&release.version, VERSION) && release.trusted_package().is_some()
         });
         let automatic = mode != Mode::Download;
-        if SUPPORTED && (!automatic || self.cache.lock().unwrap().automatic()) {
+        if supported() && (!automatic || self.cache.lock().unwrap().automatic()) {
             if let Some(release) = candidate {
                 return self.download(&client, release, automatic);
             }
@@ -663,14 +712,14 @@ fn run_installer(update: &Pending, receipt: &Path, restart: bool) -> Result<()> 
 
 #[cfg(target_os = "macos")]
 fn run_installer(update: &Pending, receipt: &Path, restart: bool) -> Result<()> {
-    if !SUPPORTED { bail!("Unsupported Workflow application"); }
+    if !supported() { bail!("Unsupported Workflow application"); }
     crate::platform::macos::update_installer(
         &update.path, receipt, restart, &update.sha256, &update.version,
     )
 }
 
 pub fn start(core: &Arc<Core>) {
-    if !SUPPORTED || std::env::var_os("WORKFLOW_TEST_MODE").is_some() {
+    if !supported() || (std::env::var_os("WORKFLOW_TEST_MODE").is_some() && test_origin().is_none()) {
         return;
     }
     let weak = Arc::downgrade(core);
@@ -797,14 +846,32 @@ mod tests {
         #[cfg(target_os = "macos")]
         {
             assert_eq!(metadata_url("latest").unwrap(),
-                "https://github.com/buildwithailab/workflow/releases/latest/download/Workflow-Update-macOS-arm64.json");
+                "https://buildwithailab.github.io/workflow/updates/Workflow-Update-macOS-arm64.json");
             assert_eq!(metadata_url("tags/v1.2.3").unwrap(),
-                "https://github.com/buildwithailab/workflow/releases/download/v1.2.3/Workflow-Update-macOS-arm64.json");
+                "https://github.com/buildwithailab/workflow/releases/download/v1.2.3-macos/Workflow-Update-macOS-arm64.json");
             assert_eq!(download_url("1.2.3"),
-                "https://github.com/buildwithailab/workflow/releases/download/v1.2.3/Workflow-Update-macOS-arm64.app.zip");
+                "https://github.com/buildwithailab/workflow/releases/download/v1.2.3-macos/Workflow-Update-macOS-arm64.app.zip");
         }
         assert!(metadata_url("tags/v1.2.3-rc").is_none());
         assert!(metadata_url("tags/v1.2.3/../latest").is_none());
+    }
+
+    #[test]
+    fn mac_channel_is_separate_without_changing_windows_urls() {
+        let mac = platform_metadata_url("latest", true).unwrap();
+        let windows = platform_metadata_url("latest", false).unwrap();
+        assert_eq!(mac, "https://buildwithailab.github.io/workflow/updates/Workflow-Update-macOS-arm64.json");
+        assert_eq!(windows, "https://github.com/buildwithailab/workflow/releases/latest/download/Workflow-Update-Windows-x64.json");
+        for macos in [false, true] {
+            let suffix = if macos { "-macos" } else { "" };
+            let platform = if macos { "macOS-arm64" } else { "Windows-x64" };
+            assert_eq!(platform_metadata_url("tags/v1.2.3", macos).unwrap(),
+                format!("{REPO}/releases/download/v1.2.3{suffix}/Workflow-Update-{platform}.json"));
+            assert!(package_url("1.2.3", macos).contains(&format!("/v1.2.3{suffix}/")));
+            for reference in ["tags/v1.2.3-macos", "tags/v1.2.3-rc", "tags/v1.2.3/../latest", "https://example.invalid/feed", "tags/v01.2.3"] {
+                assert!(platform_metadata_url(reference, macos).is_none());
+            }
+        }
     }
 
     #[test]
@@ -981,6 +1048,20 @@ mod tests {
         let suppressed = cache.failure.as_ref().unwrap();
         assert_eq!(suppressed.kind, FailureKind::RateLimited);
         assert_eq!(suppressed.retry_at, Some(retry_at));
+    }
+
+    #[test]
+    fn failed_rollback_receipt_is_visible_and_does_not_erase_profile_data() {
+        let profile = std::env::temp_dir().join(crate::core::id());
+        let updates = Updates::load(&profile);
+        updates.save(&Cache::default()).unwrap();
+        let preserved = profile.join("preserved.txt");
+        fs::write(&preserved, b"synthetic profile marker").unwrap();
+        fs::write(updates.directory.join("install-result"), b"rollback-failed").unwrap();
+        let restored = Updates::load(&profile);
+        assert_eq!(restored.status()["error"], "Güncelleme geri alınamadı. Önceki uygulama kurtarma için korundu.");
+        assert_eq!(fs::read(&preserved).unwrap(), b"synthetic profile marker");
+        fs::remove_dir_all(profile).unwrap();
     }
 
     #[test]

@@ -10,12 +10,8 @@ use windows::Win32::Security::Cryptography::{
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) const ASSET: &str = "Workflow-Update-Windows-x64.exe";
-#[cfg(not(target_os = "macos"))]
-pub(crate) const FEED: &str = "Workflow-Update-Windows-x64.json";
 #[cfg(target_os = "macos")]
 pub(crate) const ASSET: &str = "Workflow-Update-macOS-arm64.app.zip";
-#[cfg(target_os = "macos")]
-pub(crate) const FEED: &str = "Workflow-Update-macOS-arm64.json";
 pub(crate) const MAX_ASSET: u64 = 128 * 1024 * 1024;
 pub(crate) const MAX_PAYLOAD: usize = 192 * 1024;
 pub(crate) const MAX_FEED: usize = 272 * 1024;

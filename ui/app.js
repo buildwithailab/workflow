@@ -2532,7 +2532,7 @@ function renderAbout(state, panel = $("#about-updates")) {
   toggle.append(auto, document.createTextNode(tr("Otomatik güncelle")));
   const help = el("p", "help", tr(state.supported
     ? "Workflow açıkken her gün kontrol eder. İndirilen güncelleme uygulama kapatıldığında kurulur."
-    : "Otomatik güncelleme Windows x64 release derlemesinde kullanılabilir."));
+    : "Otomatik güncelleme Windows x64 ve Apple Silicon macOS release derlemelerinde kullanılabilir."));
   const status = el("p", "update-status");
   status.setAttribute("role", "status");
   const actions = el("div", "update-actions");

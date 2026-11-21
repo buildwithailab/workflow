@@ -7,6 +7,7 @@ mod startup;
 pub(crate) use startup::{complete_startup, handle_startup_failure, startup_completed, startup_error};
 pub(crate) use addons::prepare as prepare_openspec;
 pub(crate) use update::install as update_installer;
+pub(crate) use update::helper as update_helper;
 #[cfg(feature = "desktop-tests")]
 pub(crate) mod test_bridge;
 

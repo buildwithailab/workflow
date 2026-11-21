@@ -701,6 +701,10 @@ fn account_fixture_directory(provider: &str) -> Option<PathBuf> {
 
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
+    #[cfg(target_os = "macos")]
+    if let Some(status) = crate::platform::macos::update_helper(&args) {
+        std::process::exit(status);
+    }
     #[cfg(all(target_os = "macos", feature = "desktop-tests"))]
     if args.get(1).is_some_and(|arg| arg == "--clipboard-test-helper")
         && std::env::var("WORKFLOW_TEST_MODE").ok().as_deref() == Some("1") && profile_override().is_some()

@@ -1,6 +1,7 @@
 //! A bounded, application-owned installer. No privileged or persistent service.
 use anyhow::{bail, Context, Result};
-use std::{collections::HashSet, fs, io::{Cursor, Read, Write}, os::unix::fs::PermissionsExt, path::{Path, PathBuf}, process::{Command, Stdio}};
+use std::{collections::HashSet, ffi::CString, fs, io::{Cursor, Read, Write}, os::unix::{ffi::OsStrExt, fs::{MetadataExt, OpenOptionsExt, PermissionsExt}}, path::{Path, PathBuf}, process::{Command, Stdio}, time::Duration};
+use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 fn archive_path(name: &str) -> Result<PathBuf> {
@@ -113,11 +114,146 @@ fn verify_bundle(bundle: &Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Plan {
+    parent: u32,
+    destination: PathBuf,
+    receipt: PathBuf,
+    source: PathBuf,
+    restart: bool,
+    profile: Option<PathBuf>,
+    profile_environment: Vec<(String, PathBuf)>,
+    installed_version: String,
+    installed_hash: String,
+    version: String,
+    executable_hash: String,
+}
+
+const PROFILE_ENVIRONMENT: [&str; 5] = ["HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "COPILOT_HOME", "GH_CONFIG_DIR"];
+
+fn bundle_hash(bundle: &Path, expected: &str) -> Result<String> {
+    verify_bundle(bundle, expected)?;
+    Ok(crate::core::hash(&fs::read(bundle.join("Contents/MacOS").join(metadata(bundle, expected)?))?))
+}
+
+fn rename_exclusive(source: &Path, destination: &Path) -> Result<()> {
+    let source = CString::new(source.as_os_str().as_bytes())?;
+    let destination = CString::new(destination.as_os_str().as_bytes())?;
+    let result = unsafe { libc::renameatx_np(libc::AT_FDCWD, source.as_ptr(), libc::AT_FDCWD, destination.as_ptr(), libc::RENAME_EXCL) };
+    if result != 0 { return Err(std::io::Error::last_os_error().into()); }
+    Ok(())
+}
+
+fn same_directory(path: &Path, identity: (u64, u64)) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && (m.dev(), m.ino()) == identity)
+}
+
+fn replace_bundle(plan: &Plan, staging: &Path) -> Result<&'static str> {
+    let new = staging.join("Workflow.app");
+    let backup = staging.join("previous.app");
+    if bundle_hash(&plan.destination, &plan.installed_version)? != plan.installed_hash
+        || bundle_hash(&new, &plan.version)? != plan.executable_hash {
+        bail!("Güncelleme hazırlanırken uygulama değişti");
+    }
+    let m = fs::symlink_metadata(&new)?;
+    let identity = (m.dev(), m.ino());
+    rename_exclusive(&plan.destination, &backup)?;
+    if rename_exclusive(&new, &plan.destination).is_err() {
+        return Ok(if rename_exclusive(&backup, &plan.destination).is_ok() { "failed" } else { "rollback-failed" });
+    }
+    if bundle_hash(&plan.destination, &plan.version).ok().as_ref() != Some(&plan.executable_hash) {
+        if !same_directory(&plan.destination, identity)
+            || rename_exclusive(&plan.destination, &staging.join("rejected.app")).is_err()
+            || rename_exclusive(&backup, &plan.destination).is_err() {
+            return Ok("rollback-failed");
+        }
+        return Ok("failed");
+    }
+    // A cleanup failure must retain the recovery copy rather than hide it.
+    let _ = fs::remove_dir_all(backup);
+    Ok("installed")
+}
+
+fn parent_exited(parent: u32) -> Result<bool> {
+    if parent <= 1 || parent > i32::MAX as u32 || parent == std::process::id() { bail!("Kurulum işlemi geçersiz"); }
+    let result = unsafe { libc::kill(parent as i32, 0) };
+    if result == 0 { return Ok(false); }
+    if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) { return Ok(true); }
+    bail!("Uygulamanın kapanması doğrulanamadı")
+}
+
+fn read_plan(staging: &Path, helper: &Path) -> Result<Plan> {
+    let m = fs::symlink_metadata(staging)?;
+    let suffix = staging.file_name().and_then(|s|s.to_str()).and_then(|s|s.strip_prefix(".workflow-update-")).context("Kurulum klasörü geçersiz")?;
+    uuid::Uuid::parse_str(suffix)?;
+    if !m.is_dir() || m.uid() != unsafe {libc::geteuid()} || m.permissions().mode() & 0o077 != 0 { bail!("Kurulum klasörü özel değil"); }
+    let mut file = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(staging.join("install.json"))?;
+    if !file.metadata()?.is_file() || file.metadata()?.len() > 64*1024 {bail!("Kurulum bilgisi geçersiz");}
+    let mut bytes = Vec::new();Read::by_ref(&mut file).take(64*1024+1).read_to_end(&mut bytes)?;
+    if bytes.len()>64*1024 {bail!("Kurulum bilgisi çok büyük");}
+    let plan: Plan = serde_json::from_slice(&bytes)?;
+    if plan.installed_version != env!("CARGO_PKG_VERSION") || crate::update_manifest::version(&plan.version).is_none()
+        || plan.destination.extension().and_then(|s|s.to_str()) != Some("app")
+        || plan.destination.parent() != staging.parent()
+        || plan.destination.symlink_metadata().is_ok_and(|m|m.file_type().is_symlink())
+        || plan.receipt.file_name().and_then(|s|s.to_str()) != Some("install-result")
+        || plan.source.parent() != plan.receipt.parent()
+        || plan.source.extension().and_then(|s|s.to_str()) != Some("download")
+        || plan.receipt.parent().context("Kurulum sonucu klasörü eksik")?.canonicalize()?.join("install-result") != plan.receipt
+        || fs::metadata(plan.receipt.parent().unwrap())?.uid() != unsafe {libc::geteuid()}
+        || crate::core::hash(&fs::read(helper)?) != plan.installed_hash {
+        bail!("Kurulum bilgisi doğrulanamadı");
+    }
+    if plan.profile.as_ref().is_some_and(|p|!p.is_absolute()) {bail!("Veri klasörü geçersiz");}
+    let mut names=HashSet::new();
+    if plan.profile_environment.iter().any(|(name,path)|plan.profile.is_none() || !PROFILE_ENVIRONMENT.contains(&name.as_str())
+        || !path.is_absolute() || !names.insert(name)) {bail!("Profil klasörleri geçersiz");}
+    Ok(plan)
+}
+
+fn finish_install() -> Result<()> {
+    let helper = std::env::current_exe()?.canonicalize()?;
+    if helper.file_name().and_then(|s|s.to_str()) != Some("installer") {bail!("Kurulum yardımcısı geçersiz");}
+    let staging = helper.parent().context("Kurulum klasörü eksik")?;
+    let plan = read_plan(staging, &helper)?;
+    let result = (|| -> Result<&'static str> {
+        let mut exited = false;
+        for _ in 0..30 {
+            if parent_exited(plan.parent)? {exited=true;break;}
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        if !exited && !parent_exited(plan.parent)? {bail!("Uygulama kapanmadı");}
+        replace_bundle(&plan, staging)
+    })().unwrap_or("failed");
+    let receipt = crate::core::atomic(&plan.receipt, result.as_bytes());
+    let _ = fs::remove_file(&plan.source);
+    let restarted = if result == "installed" && plan.restart {
+        let mut command = Command::new("/usr/bin/open");
+        command.arg("-n").arg("-a").arg(&plan.destination);
+        if let Some(profile) = &plan.profile {command.arg("--env").arg(format!("WORKFLOW_DATA_DIR={}",profile.to_str().context("Veri klasörü geçersiz")?));}
+        for (name,path) in &plan.profile_environment {command.arg("--env").arg(format!("{name}={}",path.to_str().context("Profil klasörü geçersiz")?));}
+        command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|status|status.success())
+    } else {true};
+    if !restarted {let _ = crate::core::atomic(&plan.receipt,b"restart-failed");}
+    // Keep the only recovery copy if rollback or backup cleanup could not finish.
+    if !staging.join("previous.app").exists() {let _=fs::remove_dir_all(staging);}
+    receipt?;
+    if result != "installed" || !restarted {bail!("Güncelleme tamamlanamadı");}
+    Ok(())
+}
+
+pub(crate) fn helper(args: &[String]) -> Option<i32> {
+    args.get(1).filter(|arg|arg.as_str()=="--apply-update").map(|_| {
+        if args.len()==2 && finish_install().is_ok() {0} else {1}
+    })
+}
+
 pub(crate) fn install(source: &Path, receipt: &Path, restart: bool, expected_hash: &str, expected_version: &str) -> Result<()> {
     let executable = std::env::current_exe()?.canonicalize()?;
     let destination = executable.parent().and_then(Path::parent).and_then(Path::parent).context("Uygulama paketi bulunamadı")?;
     if destination.extension().and_then(|s| s.to_str()) != Some("app") || executable.parent().and_then(Path::file_name).and_then(|s|s.to_str()) != Some("MacOS") { bail!("Güncelleme bir uygulama paketi gerektirir"); }
-    metadata(destination, env!("CARGO_PKG_VERSION"))?;
+    let installed_hash=bundle_hash(destination, env!("CARGO_PKG_VERSION"))?;
     let mut bytes=Vec::new();fs::File::open(source)?.take(crate::update_manifest::MAX_ASSET+1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > crate::update_manifest::MAX_ASSET || crate::core::hash(&bytes) != expected_hash { bail!("Güncelleme dosyası doğrulanamadı"); }
     let parent = destination.parent().context("Uygulama klasörü bulunamadı")?;
@@ -127,11 +263,23 @@ pub(crate) fn install(source: &Path, receipt: &Path, restart: bool, expected_has
     fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
     let prepared = (|| -> Result<()> {
         let bundle = extract(&bytes, &staging)?;
-        verify_bundle(&bundle, expected_version)?;
-        let script = staging.join("install.sh");
-        crate::core::atomic(&script, include_bytes!("apply_update.sh"))?;
-        Command::new("/bin/sh").arg(&script).arg(std::process::id().to_string()).arg(destination).arg(&staging).arg(receipt)
-            .arg(if restart {"1"} else {"0"}).arg(env!("CARGO_PKG_VERSION"))
+        let profile=crate::profile_override().map(PathBuf::from).map(std::path::absolute).transpose()?;
+        // Explicit custom profiles must reopen in the same homes. Only location
+        // variables are forwarded; credentials and arbitrary environment are not.
+        let profile_environment=if profile.is_some() {PROFILE_ENVIRONMENT.iter().filter_map(|name|
+            std::env::var_os(name).map(PathBuf::from).filter(|path|path.is_absolute()).map(|path|(name.to_string(),path))).collect()} else {Vec::new()};
+        let plan=Plan {parent:std::process::id(),destination:destination.to_owned(),
+            receipt:receipt.parent().context("Kurulum sonucu klasörü eksik")?.canonicalize()?.join("install-result"),
+            source:source.canonicalize()?,restart,profile,profile_environment,
+            installed_version:env!("CARGO_PKG_VERSION").to_owned(),installed_hash,
+            version:expected_version.to_owned(),executable_hash:bundle_hash(&bundle, expected_version)?};
+        let helper=staging.join("installer");
+        fs::copy(&executable,&helper)?;
+        fs::set_permissions(&helper,fs::Permissions::from_mode(0o700))?;
+        crate::core::atomic(&staging.join("install.json"),&serde_json::to_vec(&plan)?)?;
+        // Validate the same plan before committing the application to exit.
+        read_plan(&staging,&helper)?;
+        Command::new(&helper).arg("--apply-update")
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
         Ok(())
     })();
@@ -142,6 +290,25 @@ pub(crate) fn install(source: &Path, receipt: &Path, restart: bool, expected_has
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exclusive_rename_never_nests_or_overwrites_an_existing_directory() {
+        let root=std::env::temp_dir().join(format!("workflow-rename-{}",uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let source=root.join("Workflow.app");let destination=root.join("existing.app");
+        fs::create_dir(&source).unwrap();fs::create_dir(&destination).unwrap();
+        fs::write(source.join("new"),b"synthetic new bundle").unwrap();
+        fs::write(destination.join("old"),b"synthetic old bundle").unwrap();
+        assert!(rename_exclusive(&source,&destination).is_err());
+        assert_eq!(fs::read(destination.join("old")).unwrap(),b"synthetic old bundle");
+        assert!(!destination.join("Workflow.app").exists());assert!(source.join("new").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn helper_rejects_invalid_parents_and_observes_a_reaped_child() {
+        assert!(parent_exited(0).is_err());assert!(parent_exited(1).is_err());assert!(parent_exited(std::process::id()).is_err());
+        let mut child=Command::new("/usr/bin/true").spawn().unwrap();let pid=child.id();child.wait().unwrap();
+        assert!(parent_exited(pid).unwrap());
+    }
     #[test]
     fn duplicate_metadata_is_rejected_even_if_the_first_value_is_a_collection() {
         let duplicate=br#"<plist version="1.0"><dict><key>CFBundleVersion</key><array/><key>CFBundleVersion</key><string>1.2.3</string></dict></plist>"#;
@@ -154,18 +321,27 @@ mod tests {
     fn local_package_extracts_verifies_and_installs_only_in_a_disposable_directory() {
         let path=std::env::var_os("WORKFLOW_MAC_PACKAGE").expect("Local candidate required");
         let bytes=fs::read(path).unwrap();
-        for tamper in [false,true] {
+        for scenario in ["install","tamper","rollback","occupied"] {
             let directory=std::env::temp_dir().join(format!("workflow-install-{}",uuid::Uuid::new_v4()));fs::create_dir(&directory).unwrap();
             let old=extract(&bytes,&directory).unwrap();verify_bundle(&old,env!("CARGO_PKG_VERSION")).unwrap();
             let staging=directory.join("staging");fs::create_dir(&staging).unwrap();
             let new=extract(&bytes,&staging).unwrap();verify_bundle(&new,env!("CARGO_PKG_VERSION")).unwrap();
-            if tamper { fs::write(new.join("Contents/Resources/LICENSE.txt"),b"synthetic tamper").unwrap(); }
-            let receipt=directory.join("receipt");
-            // An already exited, freshly reaped child is used instead of any user process.
-            let mut exited=Command::new("/usr/bin/true").spawn().unwrap();let pid=exited.id();exited.wait().unwrap();
-            assert!(Command::new("/bin/sh").arg("-c").arg(include_str!("apply_update.sh")).arg("workflow-update-test")
-                .arg(pid.to_string()).arg(&old).arg(&staging).arg(&receipt).arg("0").arg(env!("CARGO_PKG_VERSION")).status().unwrap().success());
-            assert_eq!(fs::read_to_string(receipt).unwrap(),if tamper {"failed"} else {"installed"});
+            let original=bundle_hash(&old,env!("CARGO_PKG_VERSION")).unwrap();
+            let plan=Plan {parent:2,destination:old.clone(),receipt:directory.join("install-result"),source:directory.join("synthetic.download"),restart:false,profile:None,profile_environment:Vec::new(),
+                installed_version:env!("CARGO_PKG_VERSION").into(),installed_hash:original.clone(),version:env!("CARGO_PKG_VERSION").into(),executable_hash:bundle_hash(&new,env!("CARGO_PKG_VERSION")).unwrap()};
+            if scenario=="tamper" {fs::write(new.join("Contents/Resources/LICENSE.txt"),b"synthetic tamper").unwrap();}
+            if scenario=="rollback" {
+                let path=CString::new(new.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe{libc::chflags(path.as_ptr(),libc::UF_IMMUTABLE)},0);
+            }
+            if scenario=="occupied" {fs::create_dir(staging.join("previous.app")).unwrap();}
+            let result=replace_bundle(&plan,&staging).unwrap_or("failed");
+            if scenario=="rollback" {
+                let path=CString::new(new.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe{libc::chflags(path.as_ptr(),0)},0);
+            }
+            assert_eq!(result,if scenario=="install" {"installed"} else {"failed"});
+            assert_eq!(bundle_hash(&old,env!("CARGO_PKG_VERSION")).unwrap(),original);
             verify_bundle(&old,env!("CARGO_PKG_VERSION")).unwrap();
             fs::remove_dir_all(directory).unwrap();
         }
