@@ -43,6 +43,10 @@ foreach ($workflowImage in $workflowImages) {
     Copy-Item -LiteralPath (Join-Path $workflowRoot $workflowImage) -Destination (Join-Path $workflowDistribution $workflowImage) -Force
 }
 $workflowNames += $workflowImages
+# README links to this guide in both the repository and the extracted download.
+$workflowGuide = 'docs/macos.md'
+Copy-Item -LiteralPath (Join-Path $workflowRoot $workflowGuide) -Destination (Join-Path $workflowDistribution $workflowGuide) -Force
+$workflowNames += $workflowGuide
 $workflowManifest = $workflowNames | ForEach-Object { [PSCustomObject]@{ file = $_; sha256 = (Get-FileHash -LiteralPath (Join-Path $workflowDistribution $_) -Algorithm SHA256).Hash.ToLowerInvariant() } }
 $workflowManifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $workflowDistribution 'manifest.json') -Encoding utf8
 $workflowZip = Join-Path $workflowRoot 'dist\Workflow-Windows-x64.zip'
