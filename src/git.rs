@@ -12,6 +12,56 @@ mod merge_target;
 
 const CHANGED: &str = "Git durumu değişti; yenileyip yeniden dene";
 
+fn conflict_stamp(bytes: Option<&[u8]>, mode: Option<u32>) -> Value {
+    let digest = bytes.map(hash);
+    #[cfg(unix)]
+    let digest = digest.map(|digest| hash(json!([digest, mode]).to_string().as_bytes()));
+    #[cfg(not(unix))]
+    let _ = mode;
+    json!(digest)
+}
+
+#[cfg(any(unix, test))]
+fn conflict_mode(stages: &str, stage: &str, current: Option<u32>) -> Result<Option<u32>> {
+    for line in stages.lines() {
+        let Some((fields, _)) = line.split_once('\t') else { continue; };
+        let mut fields = fields.split_whitespace();
+        let mode = fields.next();
+        fields.next();
+        if fields.next() == Some(stage) {
+            return match mode {
+                Some("100644") => Ok(Some(current.unwrap_or(0o644) & !0o111)),
+                Some("100755") => Ok(Some(current.unwrap_or(0o644) | 0o111)),
+                _ => bail!("Yalnızca normal dosya çakışmaları çözülebilir"),
+            };
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+
+    #[test]
+    fn selected_conflict_side_retains_executable_state_and_rejects_links() {
+        let stages = "100644 a 1\trun.sh\n100644 b 2\trun.sh\n100755 c 3\trun.sh\n";
+        assert_eq!(conflict_mode(stages, "2", Some(0o750)).unwrap(), Some(0o640));
+        assert_eq!(conflict_mode(stages, "3", Some(0o640)).unwrap(), Some(0o751));
+        assert_eq!(conflict_mode(stages, "3", None).unwrap(), Some(0o755));
+        assert_eq!(conflict_mode(stages, "4", None).unwrap(), None);
+        assert!(conflict_mode("120000 a 3\tlink\n", "3", None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conflict_preview_is_invalidated_by_chmod_without_a_content_edit() {
+        assert_ne!(conflict_stamp(Some(b"same"), Some(0o644)),
+            conflict_stamp(Some(b"same"), Some(0o755)));
+        assert_eq!(conflict_stamp(None, None), Value::Null);
+    }
+}
+
 pub(crate) fn worktree_root(directory: &Path) -> Result<PathBuf> {
     Ok(dunce::canonicalize(git(
         directory,
@@ -278,8 +328,10 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
         return Ok(json!({"patch":patch}));
     }
     if action == "conflict_details" {
-        let bytes = read_optional(&safe_path(&root, string(args, "path")?)?)?;
-        let digest = bytes.as_deref().map(hash);
+        let path = safe_path(&root, string(args, "path")?)?;
+        let mode = file_mode(&path)?;
+        let bytes = read_optional(&path)?;
+        let digest = conflict_stamp(bytes.as_deref(), mode);
         let text = bytes.as_deref().and_then(|bytes| {
             (bytes.len() <= 5 * 1024 * 1024)
                 .then(|| std::str::from_utf8(bytes).ok())
@@ -402,7 +454,8 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             let name = string(args, "path")?;
             let p = safe_path(&root, name)?;
             let original = read_optional(&p)?;
-            if json!(original.as_deref().map(hash)) != args["fileStamp"] {
+            let original_mode = file_mode(&p)?;
+            if conflict_stamp(original.as_deref(), original_mode) != args["fileStamp"] {
                 bail!("Çakışma dosyası değişti")
             };
             let stages = git(
@@ -412,7 +465,8 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             if stages.is_empty() {
                 bail!("Çözülecek Git çakışması yok")
             }
-            let chosen = match string(args, "choice")? {
+            let choice = string(args, "choice")?;
+            let chosen = match choice {
                 choice @ ("ours" | "theirs") => {
                     let stage = if choice == "ours" { "2" } else { "3" };
                     let exists = stages.lines().any(|line| {
@@ -427,15 +481,23 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
                 "manual" => Some(string(args, "text")?.as_bytes().to_vec()),
                 _ => bail!("Çözüm seç"),
             };
+            #[cfg(unix)]
+            let chosen_mode = match choice {
+                "ours" => conflict_mode(&stages, "2", original_mode)?,
+                "theirs" => conflict_mode(&stages, "3", original_mode)?,
+                _ => original_mode,
+            };
+            #[cfg(not(unix))]
+            let chosen_mode = original_mode;
             if let Some(original) = &original {
                 crate::files::store(core, original)?;
             }
-            crate::files::apply_bytes(&p, chosen.as_deref())?;
+            crate::files::apply_bytes_mode(&p, chosen.as_deref(), chosen_mode)?;
             match git(&root, &["--literal-pathspecs", "add", "--", name]) {
                 Ok(output) => output,
                 Err(error) => {
-                    if read_optional(&p)? == chosen {
-                        crate::files::apply_bytes(&p, original.as_deref())
+                    if read_optional(&p)? == chosen && file_mode(&p)? == chosen_mode {
+                        crate::files::apply_bytes_mode(&p, original.as_deref(), original_mode)
                             .with_context(|| format!("Git hazırlama başarısız: {error}"))?;
                     }
                     return Err(error);

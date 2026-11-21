@@ -1037,6 +1037,9 @@ body.no-left .sidebar {
   gap: 12px;
   margin-bottom: 12px;
 }
+.provider-account-manager > .form-field + button {
+  margin-top: 12px;
+}
 .removed-provider-accounts {
   margin: 12px 0;
   border-top: 1px solid var(--line);

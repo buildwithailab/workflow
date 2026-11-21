@@ -692,7 +692,12 @@ fn set_overlay(core: &Core, attention: Option<bool>) -> bool {
     window.set_overlay_icon(icon).is_ok()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn set_overlay(core: &Core, attention: Option<bool>) -> bool {
+    core.app.get_window("main").is_some_and(|window| window.set_badge_label(attention.map(|waiting| if waiting { "!".into() } else { "✓".into() })).is_ok())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn set_overlay(_core: &Core, _attention: Option<bool>) -> bool {
     true
 }

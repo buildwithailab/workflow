@@ -5,7 +5,9 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+#[cfg(not(target_os = "macos"))]
+use portable_pty::ChildKiller;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -34,9 +36,12 @@ pub struct LiveTerminal {
     provider: String,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     screen: Mutex<vt100::Parser>,
+    #[cfg(not(target_os = "macos"))]
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     #[cfg(windows)]
     job: Mutex<Option<Job>>,
+    #[cfg(target_os = "macos")]
+    group: Mutex<Option<crate::platform::macos::process::Group>>,
 }
 
 struct TerminalInput {
@@ -187,6 +192,12 @@ impl LiveTerminal {
         {
             self.job.lock().unwrap().take();
         }
+        #[cfg(target_os = "macos")]
+        {
+            self.group.lock().unwrap().take();
+            return;
+        }
+        #[cfg(not(target_os = "macos"))]
         let _ = self.killer.lock().unwrap().kill();
     }
     pub fn write(&self, data: &[u8]) -> Result<()> {
@@ -203,7 +214,7 @@ impl LiveTerminal {
 pub fn executable(provider: &str, custom: Option<&str>) -> Option<PathBuf> {
     if let Some(custom) = custom {
         let p = PathBuf::from(custom);
-        return p.is_file().then_some(p);
+        return executable_file(&p).then_some(p);
     }
     let mut folders =
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();
@@ -216,8 +227,8 @@ pub fn executable(provider: &str, custom: Option<&str>) -> Option<PathBuf> {
             .unwrap_or_else(|| home().join("AppData/Roaming"))
             .join("npm"),
     );
-    #[cfg(not(windows))]
-    folders.push(home().join("AppData/Roaming/npm"));
+    #[cfg(target_os = "macos")]
+    folders.extend(crate::platform::macos::cli_directories());
     #[cfg(windows)]
     if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
         folders.extend([
@@ -248,7 +259,18 @@ fn executable_in(folder: &Path, program: &str) -> Option<PathBuf> {
     extensions
         .iter()
         .map(|ext| folder.join(format!("{program}{ext}")))
-        .find(|path| path.is_file())
+        .find(|path| executable_file(path))
+}
+
+pub(crate) fn executable_file(path: &Path) -> bool {
+    if !path.is_file() { return false; }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return path.metadata().is_ok_and(|m| m.permissions().mode() & 0o111 != 0);
+    }
+    #[cfg(not(unix))]
+    true
 }
 
 pub(crate) fn uses_windows_script(exe: &Path) -> bool {
@@ -280,6 +302,8 @@ pub fn command(exe: &Path, args: &[String]) -> CommandBuilder {
     }
     let mut cmd = CommandBuilder::new(exe);
     cmd.args(args);
+    #[cfg(target_os = "macos")]
+    if let Ok(path) = crate::platform::macos::child_path(exe) { cmd.env("PATH", path); }
     cmd
 }
 pub(crate) fn codex_config_string(value: &str, windows_script: bool) -> String {
@@ -550,6 +574,8 @@ pub fn start(core: &Arc<Core>, session_id: &str) -> Result<Value> {
         tt.exited.store(true, Ordering::SeqCst);
         #[cfg(windows)]
         tt.job.lock().unwrap().take();
+        #[cfg(target_os = "macos")]
+        tt.group.lock().unwrap().take();
         let _ = c.update_session(&sid, json!({"state":"stopped","exitCode":status}));
         c.emit("terminal", json!({"id":sid,"runId":rid,"exitCode":status}));
     });
@@ -635,8 +661,24 @@ fn spawn_terminal(
             bail!("Terminal süreç grubu oluşturulamadı: {e}")
         }
     };
-    let writer = pair.master.take_writer()?;
-    let reader = pair.master.try_clone_reader()?;
+    #[cfg(target_os = "macos")]
+    let group = match crate::platform::macos::process::Group::new(pid, true) {
+        Ok(group) => group,
+        Err(error) => { let _ = child.kill(); let _ = child.wait(); return Err(error); }
+    };
+    let io: Result<_> = (|| Ok((pair.master.take_writer()?, pair.master.try_clone_reader()?)))();
+    let (writer, reader) = match io {
+        Ok(io) => io,
+        Err(error) => {
+            #[cfg(windows)]
+            drop(job);
+            #[cfg(target_os = "macos")]
+            drop(group);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
     let t = Arc::new(LiveTerminal {
         run_id,
         pid,
@@ -660,9 +702,12 @@ fn spawn_terminal(
         provider: provider.to_owned(),
         master: Mutex::new(Some(pair.master)),
         screen: Mutex::new(vt100::Parser::new(36, 120, 10000)),
+        #[cfg(not(target_os = "macos"))]
         killer: Mutex::new(child.clone_killer()),
         #[cfg(windows)]
         job: Mutex::new(Some(job)),
+        #[cfg(target_os = "macos")]
+        group: Mutex::new(Some(group)),
     });
     Ok((t, child, reader))
 }
@@ -828,6 +873,8 @@ pub fn login(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             let _ = child.wait();
             #[cfg(windows)]
             finished.job.lock().unwrap().take();
+            #[cfg(target_os = "macos")]
+            finished.group.lock().unwrap().take();
             // Closing the master lets the reader drain the final output and exit.
             let master = finished.master.lock().unwrap().take();
             drop(master);
@@ -934,6 +981,15 @@ fn empty_codex_prompt(screen: &vt100::Screen) -> bool {
 
 fn codex_prompt_ready(screen: &vt100::Screen) -> bool {
     empty_codex_prompt(screen) && codex_composer_unblocked(screen)
+}
+
+// Status observes the same current-screen prompts as Chat, without reading
+// transcripts or granting permission to send input.
+fn terminal_activity(screen: &vt100::Screen, provider: &str) -> (Option<&'static str>, bool) {
+    let prompt = terminal_prompt(screen, provider)
+        .or_else(|| wrapped_question_preview(screen, provider));
+    let ready = prompt.is_none() && native_prompt_ready(screen, provider);
+    (prompt.map(|prompt| prompt.kind), ready)
 }
 
 fn provider_prompt_ready(screen: &vt100::Screen, provider: &str) -> bool {
@@ -2341,6 +2397,14 @@ fn submit_chat_draft(
 
 pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
     match action {
+        "activity" => {
+            let _ = string(args, "runId")?;
+            let terminal = get(core, args)?;
+            let screen = terminal.screen.lock().unwrap();
+            let (prompt, ready) = terminal_activity(screen.screen(), &terminal.provider);
+            Ok(json!({"runId":terminal.run_id,"promptKind":prompt,"ready":ready,
+                "exited":terminal.exited.load(Ordering::SeqCst)}))
+        }
         "start" => start(core, string(args, "id")?),
         "attach" => {
             let t = core.terms.lock().unwrap().get(string(args, "id")?).cloned();
@@ -2509,6 +2573,24 @@ mod tests {
         assert!(provider_composer(parser.screen()).is_some_and(|(actual, _)| actual == draft));
         parser.process(b" \x1b[6;1HEsc to cancel");
         assert!(provider_composer(parser.screen()).is_none());
+    }
+
+    #[test]
+    fn activity_ignores_help_and_history_words_but_keeps_live_requests() {
+        for provider in ["codex", "claude", "copilot"] {
+            let mut parser = vt100::Parser::new(24, 110, 0);
+            let ready = match provider {
+                "codex" => "› Ask Codex to do anything\x1b[5;3H",
+                "claude" => "─────────\r\n❯ \r\n─────────\r\n? for shortcuts",
+                _ => "─────────\r\n❯ \r\n─────────\r\nInteractive · Manual Approval",
+            };
+            parser.process(format!("\x1b[?2004h/permissions - configure permissions\r\nA reply discussing approval and izin.\r\nWorked for 1s\r\n\r\n{ready}").as_bytes());
+            assert_eq!(terminal_activity(parser.screen(), provider), (None, true));
+            parser.process(b"\x1b[2J\x1b[HWould you like to run the following command?\r\n$ printf synthetic\r\n> 1. Yes\r\n  2. No\r\nEnter to confirm - Esc to cancel");
+            assert_eq!(terminal_activity(parser.screen(), provider), (Some("approval"), false));
+            parser.process(b"\x1b[2J\x1b[HQuestion 1/1\r\nChoose a format\r\n> 1. CSV\r\n  2. JSON\r\nEnter to submit answer");
+            assert_eq!(terminal_activity(parser.screen(), provider), (Some("question"), false));
+        }
     }
 
     #[test]

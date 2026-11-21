@@ -7,6 +7,7 @@ license = "MIT"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+desktop-tests = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -27,6 +28,7 @@ regex = "1"
 similar = "2"
 sha2 = "0.10"
 base64 = "0.22"
+png = "0.18"
 tokio = { version = "1", features = ["sync", "time"] }
 tungstenite = "0.30"
 url = "2"
@@ -35,9 +37,21 @@ dunce = "1"
 reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "native-tls", "system-proxy"] }
 
 [target.'cfg(windows)'.dependencies]
-png = "0.18"
 webview2-com = "0.39"
 windows = { version = "0.62", features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem", "NSBitmapImageRep", "NSImageRep", "NSImage", "NSGraphics", "NSResponder", "NSEvent", "NSView", "NSWindowRestoration", "NSApplication", "NSDockTile", "NSWorkspace", "NSRunningApplication", "NSAlert", "libc"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSData", "NSDictionary", "NSArray", "NSError", "NSGeometry", "NSJSONSerialization"] }
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "WKWebView", "WKSnapshotConfiguration", "WKContentWorld", "WKFrameInfo", "block2"] }
+block2 = "0.6"
+p256 = { version = "0.13.2", features = ["ecdsa"] }
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+plist = "1"
+quick-xml = "0.42"
+unicode-normalization = "0.1"
 
 [profile.release]
 strip = true

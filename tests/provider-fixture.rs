@@ -10,7 +10,7 @@ fn main() -> io::Result<()> {
     }
     let login = env::args().nth(1).as_deref() == Some("--login-fixture");
     let provider = env::args().nth(2).unwrap_or_else(|| "codex".into());
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     if env::current_dir()?.join("chat-terminal-fixture").is_file() {
         return chat_terminal(&provider);
     }
@@ -146,8 +146,10 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn chat_terminal(provider: &str) -> io::Result<()> {
+    #[cfg(windows)]
+    {
     use std::ffi::c_void;
     #[link(name = "kernel32")]
     extern "system" {
@@ -161,6 +163,11 @@ fn chat_terminal(provider: &str) -> io::Result<()> {
         GetConsoleMode(stdin, &mut mode) == 0 || SetConsoleMode(stdin, (mode & !7) | 0x200) == 0
     } {
         return Err(io::Error::last_os_error());
+    }
+    }
+    #[cfg(unix)]
+    if !std::process::Command::new("/bin/stty").args(["raw", "-echo"]).status()?.success() {
+        return Err(io::Error::other("fixture raw input unavailable"));
     }
     if env::current_dir()?.join("notification-terminal-fixture").is_file() {
         return notification_terminal();
@@ -236,8 +243,9 @@ fn chat_terminal(provider: &str) -> io::Result<()> {
                 );
                 io::stdout().flush()?;
             } else if let Some(first) = lines.next() {
-                print!("\x1b[2J\x1b[H› {first}");
-                for line in lines {
+                let mut first_lines = first.lines();
+                print!("\x1b[2J\x1b[H› {}", first_lines.next().unwrap_or(""));
+                for line in first_lines.chain(lines) {
                     print!("\r\n  {line}");
                 }
                 io::stdout().flush()?;
@@ -440,7 +448,7 @@ fn chat_terminal(provider: &str) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn notification_terminal() -> io::Result<()> {
     let signal = |kind: &str| print!("\x1b]7501;state={kind}:app=codex\x1b\\");
     let ready = || print!("\x1b[?2004h\x1b[2J\x1b[HDone.\r\n› Ask Codex to do anything\x1b[2;3H");

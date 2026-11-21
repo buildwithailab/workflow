@@ -265,7 +265,11 @@ pub(crate) fn warnings(root: &Path) -> Result<WarningScan> {
                 if let Some(relative) = relative.to_str() {
                     if let Ok(path) = safe_path(&root, relative) {
                         remaining.push_back(path);
+                    } else {
+                        truncated = true;
                     }
+                } else {
+                    truncated = true;
                 }
             } else if kind.is_file() {
                 let Some(name) = relative.to_str() else {
@@ -273,7 +277,7 @@ pub(crate) fn warnings(root: &Path) -> Result<WarningScan> {
                     continue;
                 };
                 if sensitive_name(relative) {
-                    files.push(name.replace('\\', "/"));
+                    files.push(crate::core::relative_name(relative)?);
                 } else if let Ok(path) = safe_path(&root, name) {
                     match read_limited(&path, SCAN_BYTES + 1) {
                         Ok(mut bytes) => {
@@ -282,11 +286,13 @@ pub(crate) fn warnings(root: &Path) -> Result<WarningScan> {
                                 truncated = true;
                             }
                             if contains_credentials(&bytes) {
-                                files.push(name.replace('\\', "/"));
+                                files.push(crate::core::relative_name(relative)?);
                             }
                         }
                         Err(_) => truncated = true,
                     }
+                } else {
+                    truncated = true;
                 }
             }
         }
@@ -353,6 +359,25 @@ mod tests {
             for field in ["DB_PASSWORD", "dbPassword", "service-passwd", "DB_PWD"] {
                 fs::write(root.join("settings.txt"), format!("{field} = '{value}'\n")).unwrap();
                 assert!(read_shared(root, root, "settings.txt").is_err(), "{field}");
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn warning_scan_keeps_unix_names_and_reports_unreadable_name_coverage() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        with_project(|root| {
+            fs::write(root.join("credentials\\local.json"), b"synthetic").unwrap();
+            let scan = warnings(root).unwrap();
+            assert!(!scan.truncated);
+            let invalid = root.join(OsString::from_vec(vec![b'd', 0xff]));
+            assert!(crate::core::relative_name(&invalid).is_err());
+            #[cfg(not(target_os = "macos"))]
+            {
+                fs::create_dir(&invalid).unwrap();
+                fs::write(invalid.join("unread.txt"), b"synthetic").unwrap();
+                assert!(warnings(root).unwrap().truncated);
             }
         });
     }

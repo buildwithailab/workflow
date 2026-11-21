@@ -489,6 +489,7 @@ function attachmentReferences(id, paths) {
 }
 
 function discardScreenshot(id, attachment) {
+  if (attachment?.attachments) return Promise.all(attachment.attachments.map(item => discardScreenshot(id, item)));
   if (attachment?.attachmentId) return api("chat", "discard_screenshot", { id, attachmentId: attachment.attachmentId });
 }
 
@@ -503,7 +504,7 @@ async function collectChatAttachments(id, read) {
   view.attaching = (view.attaching || 0) + 1;
   if (shownChatId === id) paintChatComposer(session(id), view);
   try {
-    const attachments = await read(stillBound);
+    const attachments = (await read(stillBound)).flatMap(item => item?.attachments || [item]);
     if (!stillBound()) {
       await Promise.all(attachments.map(attachment => discardScreenshot(id, attachment)));
       return;

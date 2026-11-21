@@ -1,0 +1,15 @@
+{
+  "build": {
+    "beforeBuildCommand": { "script": "sh scripts/icons-macos.sh", "cwd": "." },
+    "beforeDevCommand": { "script": "sh scripts/icons-macos.sh", "cwd": ".", "wait": true }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "icon": ["target/macos-icons/Workflow-Mac.icns", "icons/icon-macos.png", "icons/icon-macos@2x.png"],
+    "macOS": {
+      "minimumSystemVersion": "14.0",
+      "signingIdentity": "-"
+    }
+  }
+}

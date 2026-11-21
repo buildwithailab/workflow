@@ -211,7 +211,9 @@ async fn cdp(core: &Arc<Core>, p: &Page, method: &str, params: Value) -> Result<
         .context("Tarayıcı görünümü kapalı")?;
     #[cfg(windows)]
     return webview_cdp(&w, method, params).await;
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    return crate::platform::macos::webview::protocol(&w, method, params).await;
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (w, method, params);
         bail!("Bu platformda otomasyon için Chrome modunu kullan")
@@ -258,6 +260,10 @@ pub(crate) async fn webview_cdp(w: &tauri::Webview, method: &str, params: Value)
         .await
         .context("Tarayıcı yanıtı gecikti")?
         .context("Tarayıcı kapandı")?
+}
+#[cfg(target_os = "macos")]
+pub(crate) async fn webview_cdp(w: &tauri::Webview, method: &str, params: Value) -> Result<Value> {
+    crate::platform::macos::webview::protocol(w, method, params).await
 }
 async fn eval(core: &Arc<Core>, p: &Page, script: &str) -> Result<Value> {
     let r = cdp(
@@ -355,6 +361,23 @@ async fn native_page(core: &Arc<Core>, sid: &str, address: url::Url) -> Result<P
     let directory = core.directory.join("browser-profiles").join(sid);
     fs::create_dir_all(&directory)?;
     let builder=tauri::webview::WebviewBuilder::new(&label,WebviewUrl::External(address)).data_directory(directory).initialization_script("if(/json|text\\/plain/.test(document.contentType)){addEventListener('DOMContentLoaded',()=>{document.documentElement.style.background='#f8fafc';document.documentElement.style.color='#17202a';document.body.style.color='#17202a';});}");
+    #[cfg(target_os = "macos")]
+    let builder = {
+        let c = core.clone();
+        let page_id = p.id.clone();
+        builder.data_store_identifier(crate::platform::macos::data_store(&core.directory, &format!("browser:{sid}")))
+            .on_page_load(move |_, payload| {
+                if let Some(page) = c.browsers.lock().unwrap().pages.get_mut(&page_id) {
+                    page.revision += 1;
+                    page.pick_epoch += 1;
+                    page.picking = false;
+                    page.picked = None;
+                    page.node = None;
+                    page.url = payload.url().to_string();
+                    changed(&c,page);
+                }
+            })
+    };
     let (tx, rx) = tokio::sync::oneshot::channel();
     core.app.run_on_main_thread(move || {
         let r = window
@@ -372,8 +395,11 @@ async fn native_page(core: &Arc<Core>, sid: &str, address: url::Url) -> Result<P
     })?;
     rx.await??;
     core.browsers.lock().unwrap().pages.insert(pid, p.clone());
-    install_events(core, &p)?;
-    cdp(core, &p, "Page.enable", json!({})).await?;
+    #[cfg(windows)]
+    {
+        install_events(core, &p)?;
+        cdp(core, &p, "Page.enable", json!({})).await?;
+    }
     Ok(p)
 }
 fn http_json(port: u16, path: &str) -> Result<Value> {
@@ -416,6 +442,9 @@ fn http_json(port: u16, path: &str) -> Result<Value> {
     Ok(serde_json::from_slice(&body)?)
 }
 fn chrome_exe() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    return [PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"), home().join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome")].into_iter().find(|p| crate::terminal::executable_file(p));
+    #[cfg(not(target_os = "macos"))]
     [
         PathBuf::from("C:/Program Files/Google/Chrome/Application/chrome.exe"),
         PathBuf::from("C:/Program Files (x86)/Google/Chrome/Application/chrome.exe"),
@@ -625,11 +654,11 @@ pub async fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Va
         "close"=>{if let Some(w)=core.app.get_webview(&p.label){w.close()?}else{cdp(core,&p,"Page.close",json!({})).await?;}let mut b=core.browsers.lock().unwrap();b.pages.remove(&p.id);if b.visible.as_deref()==Some(&p.id){b.visible=None;}
         if b.active.get(&p.session)==Some(&p.id){let next=b.pages.values().find(|x|x.session==p.session).map(|x|x.id.clone());if let Some(next)=next{b.active.insert(p.session.clone(),next);}else{b.active.remove(&p.session);}}Ok(json!(true))},
         "reload"=>cdp(core,&p,"Page.reload",json!({})).await,
-        "back"|"forward"=>{let h=cdp(core,&p,"Page.getNavigationHistory",json!({})).await?;let idx=h["currentIndex"].as_i64().unwrap_or(0)+if action=="back"{-1}else{1};if idx>=0{if let Some(w)=h["entries"].as_array().and_then(|a|a.get(idx as usize)){cdp(core,&p,"Page.navigateToHistoryEntry",json!({"entryId":w["id"]})).await?;}}Ok(json!(true))},
+        "back"|"forward"=>{#[cfg(target_os = "macos")] if p.remote.is_none(){let w=core.app.get_webview(&p.label).context("Tarayıcı kapalı")?;return crate::platform::macos::webview::navigate(&w,action).await;}let h=cdp(core,&p,"Page.getNavigationHistory",json!({})).await?;let idx=h["currentIndex"].as_i64().unwrap_or(0)+if action=="back"{-1}else{1};if idx>=0{if let Some(w)=h["entries"].as_array().and_then(|a|a.get(idx as usize)){cdp(core,&p,"Page.navigateToHistoryEntry",json!({"entryId":w["id"]})).await?;}}Ok(json!(true))},
         "pick"=>{
             if p.picking { cancel_picker(core, &mut p).await?; }
             else {
-                if p.mode=="chrome" { eval(core,&p,PICK_SCRIPT).await?; }
+                if p.mode=="chrome" || cfg!(target_os = "macos") { eval(core,&p,PICK_SCRIPT).await?; }
                 else {
                     eval(core,&p,PICK_ESCAPE_SCRIPT).await?;
                     cdp(core,&p,"DOM.enable",json!({})).await?;
@@ -653,7 +682,7 @@ pub async fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Va
             p=get(core,args)?;
             let observed_epoch=p.pick_epoch; let observed_node=p.node;
             let state=eval(core,&p,"({url:location.href,title:document.title,pick:window.__workflowPick||null,picking:window.__workflowPicking===true,cancelPick:window.__workflowPickEscape===true})").await?;let address=state["url"].as_str().unwrap_or(&p.url).to_string();if address!=p.url{p.revision+=1;p.picked=None;}p.url=address;p.title=state["title"].as_str().unwrap_or("").into();
-            if p.mode=="chrome" {p.picking=state["picking"]==true;}
+            if p.mode=="chrome" || cfg!(target_os = "macos") {p.picking=state["picking"]==true;}
             else if p.picking && state["cancelPick"]==true {cancel_picker(core,&mut p).await?;}
             if let Some(node)=p.node.take(){
                 cdp(core,&p,"Overlay.setInspectMode",json!({"mode":"none","highlightConfig":{}})).await?;
@@ -789,8 +818,8 @@ pub async fn agent_action(
     result
 }
 async fn cancel_picker(core: &Arc<Core>, p: &mut Page) -> Result<()> {
-    if p.mode == "chrome" {
-        eval(core,p,"window.__workflowCancelPick?.();window.__workflowPicking=false;window.__workflowPick=null").await?;
+    if p.mode == "chrome" || cfg!(target_os = "macos") {
+        eval(core,p,"(()=>{window.__workflowCancelPick?.();window.__workflowPicking=false;window.__workflowPick=null;return true})()").await?;
     } else {
         if p.picking || p.node.is_some() {
             cdp(

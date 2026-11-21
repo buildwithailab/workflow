@@ -54,30 +54,79 @@ pub fn baseline(core: &Core, id: &str) -> Result<Value> {
         crate::workspace_archive::slot(&core.directory, &core.session(id)?)?.join("baseline.json"),
     )?)?)
 }
+fn baseline_modes(core: &Core, sid: &str) -> Result<HashMap<String, u32>> {
+    let file = crate::workspace_archive::slot(&core.directory, &core.session(sid)?)?
+        .join("baseline-modes.json");
+    let Some(bytes) = read_optional(&file)? else { return Ok(HashMap::new()); };
+    let modes: HashMap<String, u32> = serde_json::from_slice(&bytes)?;
+    if modes.values().any(|mode| *mode > 0o777) { bail!("Geçersiz dosya izinleri") }
+    Ok(modes)
+}
+
+fn recorded_mode(record: &Value, side: &str) -> Result<Option<u32>> {
+    let value = &record[format!("{side}Mode")];
+    if value.is_null() { return Ok(None); }
+    value.as_u64().filter(|mode| *mode <= 0o777).map(|mode| Some(mode as u32))
+        .context("Geçersiz dosya izinleri")
+}
+
+fn matches_record(path: &Path, record: &Value, side: &str) -> Result<bool> {
+    if json!(file_hash(path)?) != record[side] { return Ok(false); }
+    // Old journals do not contain permission metadata and retain hash-only checks.
+    #[cfg(unix)]
+    if record.get(format!("{side}Mode")).is_some() {
+        return Ok(file_mode(path)? == recorded_mode(record, side)?);
+    }
+    Ok(true)
+}
+
+fn file_stamp(path: &Path) -> Result<Value> {
+    stamp(file_hash(path)?.as_deref(), file_mode(path)?)
+}
+fn stamp(digest: Option<&str>, mode: Option<u32>) -> Result<Value> {
+    #[cfg(unix)]
+    if let (Some(digest), Some(mode)) = (digest, mode) {
+        return Ok(json!(format!("{digest}:{mode:o}")));
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    Ok(json!(digest))
+}
 fn checkout(root: &Path) -> Option<String> {
     git(root, &["symbolic-ref", "--quiet", "HEAD"])
         .or_else(|_| git(root, &["rev-parse", "--verify", "HEAD"]))
         .ok()
 }
 
-fn capture_baseline(
+fn capture_snapshot(
     source: &Path,
     mut save: impl FnMut(&[u8]) -> Result<String>,
-) -> Result<HashMap<String, String>> {
-    scan_with(source, |relative, _| {
-        let bytes = fs::read(safe_path(source, relative)?)?;
+) -> Result<(HashMap<String, String>, HashMap<String, u32>)> {
+    let mut modes = HashMap::new();
+    let files = scan_with(source, |relative, _| {
+        let path = safe_path(source, relative)?;
+        if let Some(mode) = file_mode(&path)? { modes.insert(relative.to_owned(), mode); }
+        let bytes = fs::read(path)?;
         save(&bytes)
-    })
+    })?;
+    Ok((files, modes))
 }
 
-fn verify_baseline(
+fn verify_snapshot(
     source: &Path,
     before: &HashMap<String, String>,
     direct: bool,
     baseline_ref: &Option<String>,
+    modes: &HashMap<String, u32>,
 ) -> Result<()> {
     // Always re-read all included source files, including additions and deletions.
-    if scan(source)? != *before || (direct && checkout(source) != *baseline_ref) {
+    let mut current_modes = HashMap::new();
+    let current = scan_with(source, |relative, path| {
+        if let Some(mode) = file_mode(path)? { current_modes.insert(relative.to_owned(), mode); }
+        Ok(hash(&fs::read(path)?))
+    })?;
+    if current != *before || (!modes.is_empty() && current_modes != *modes)
+        || (direct && checkout(source) != *baseline_ref) {
         bail!("Kaynak proje işlem sırasında değişti; yeni oturum başlatılamadı")
     }
     Ok(())
@@ -87,7 +136,7 @@ pub fn create_workspace(core: &Core, project: &Value, sid: &str, direct: bool) -
     let source = dunce::canonicalize(string(project, "directory")?)?;
     core.check_project_directory(&source)?;
     let baseline_ref = direct.then(|| checkout(&source)).flatten();
-    let before = capture_baseline(&source, |bytes| store(core, bytes))?;
+    let (before, modes) = capture_snapshot(&source, |bytes| store(core, bytes))?;
     let slot = core.directory.join("workspaces").join(sid);
     fs::create_dir_all(&slot)?;
     let worktree = slot.join("files");
@@ -129,7 +178,7 @@ pub fn create_workspace(core: &Core, project: &Value, sid: &str, direct: bool) -
             for (rel, digest) in &before {
                 // Copy the captured bytes, not a later revision of the source.
                 let bytes = blob(core, &json!(digest))?.context("Başlangıç yedeği bulunamadı")?;
-                atomic(&safe_path(&root, rel)?, &bytes)?;
+                atomic_with_mode(&safe_path(&root, rel)?, &bytes, modes.get(rel).copied())?;
             }
             for rel in scan(&root)?.keys() {
                 if !before.contains_key(rel) {
@@ -137,7 +186,10 @@ pub fn create_workspace(core: &Core, project: &Value, sid: &str, direct: bool) -
                 }
             }
         }
-        verify_baseline(&source, &before, direct, &baseline_ref)?;
+        verify_snapshot(&source, &before, direct, &baseline_ref, &modes)?;
+        if !modes.is_empty() {
+            atomic(&slot.join("baseline-modes.json"), &serde_json::to_vec(&modes)?)?;
+        }
         atomic(&slot.join("baseline.json"), &serde_json::to_vec(&before)?)
     })();
     if prepared.is_err() {
@@ -223,6 +275,7 @@ fn comparison(core: &Core, args: &Value) -> Result<(PathBuf, Value, HashMap<Stri
 }
 pub fn list_changes(core: &Core, args: &Value) -> Result<Value> {
     let (root, b, current) = comparison(core, args)?;
+    let modes = baseline_modes(core, string(args, "sessionId")?)?;
     let mut names = b
         .as_object()
         .unwrap()
@@ -232,14 +285,20 @@ pub fn list_changes(core: &Core, args: &Value) -> Result<Value> {
         .collect::<Vec<_>>();
     names.sort();
     names.dedup();
-    let mut changes: Vec<_> = names.into_iter().filter_map(|name| {
+    let mut changes = Vec::new();
+    for name in names {
         let old = b[&name].as_str();
         let new = current.get(&name).map(String::as_str);
-        (old != new).then(|| json!({
+        let before_mode = modes.get(&name).copied();
+        let after_mode = file_mode(&safe_path(&root, &name)?)?;
+        if old == new && !(cfg!(unix) && before_mode.is_some() && before_mode != after_mode) {
+            continue;
+        }
+        changes.push(json!({
             "path":name, "status":if old.is_none(){"A"}else if new.is_none(){"D"}else{"M"},
-            "before":old, "after":new,
-        }))
-    }).collect();
+            "before":old, "after":new, "beforeMode":before_mode, "afterMode":after_mode,
+        }));
+    }
     if args["reviewStats"] == true {
         // Keep totals optional and bound the extra work on large changesets.
         let mut remaining_bytes = 2 * 1024 * 1024;
@@ -326,7 +385,7 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             for l in fs::read_dir(folder)? {
                 let l = l?;
                 let ft = l.file_type()?;
-                let name = l.file_name().to_string_lossy().to_string();
+                let name = l.file_name().to_str().context("Dosya adı UTF-8 olarak işlenemiyor")?.to_owned();
                 if name == ".git" || ft.is_symlink() {
                     continue;
                 }
@@ -354,9 +413,13 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             let (root, b, _) = comparison(core, args)?;
             let path = string(args, "path")?;
             let before = blob(core, &b[path])?;
-            let after = read_optional(&safe_path(&root, path)?)?;
+            let p = safe_path(&root, path)?;
+            let mode = file_mode(&p)?;
+            let after = read_optional(&p)?;
             let mut d = diff(before.as_deref(), after.as_deref());
-            d["stamp"] = json!(after.as_ref().map(|b| hash(b)));
+            d["stamp"] = stamp(after.as_deref().map(hash).as_deref(), mode)?;
+            d["beforeMode"] = json!(baseline_modes(core, string(args, "sessionId")?)?.get(path));
+            d["afterMode"] = json!(mode);
             Ok(d)
         }
         "restore" => {
@@ -371,7 +434,8 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             let p = safe_path(&root, name)?;
             let current = read_optional(&p)?;
             let actual = current.as_ref().map(|b| hash(b));
-            if json!(actual) != args["stamp"] {
+            let before_mode = file_mode(&p)?;
+            if file_stamp(&p)? != args["stamp"] {
                 bail!("Dosya önizlemeden sonra değişti; geri alınmadı")
             };
             let original = blob(core, &b[name])?;
@@ -394,21 +458,24 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             } else {
                 original
             };
+            let after_mode = if desired.is_none() { None }
+                else if args["indices"].is_array() { before_mode }
+                else { baseline_modes(core, string(args, "sessionId")?)?.get(name).copied().or(before_mode) };
             let backup = current
                 .as_deref()
                 .map(|bytes| store(core, bytes))
                 .transpose()?;
             let token = id();
-            let record = json!({"id":token,"sessionId":args["sessionId"],"root":root,"path":name,"before":backup,"after":desired.as_deref().map(hash)});
+            let record = json!({"id":token,"sessionId":args["sessionId"],"root":root,"path":name,"before":backup,"after":desired.as_deref().map(hash),"beforeMode":before_mode,"afterMode":after_mode});
             let journal = core.directory.join("undo").join(format!("{token}.json"));
             // The before/after hashes also let undo recognize an interrupted restore.
             atomic(&journal, &serde_json::to_vec(&record)?)?;
             let restored = (|| {
                 require_restore_checkout(core, args, &root)?;
-                if file_hash(&p)? != actual {
+                if file_hash(&p)? != actual || file_mode(&p)? != before_mode {
                     bail!("Dosya önizlemeden sonra değişti; geri alınmadı")
                 }
-                apply_bytes(&p, desired.as_deref())
+                apply_bytes_mode(&p, desired.as_deref(), after_mode)
             })();
             if let Err(error) = restored {
                 let _ = fs::remove_file(journal);
@@ -434,10 +501,10 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             };
             require_restore_checkout(core, args, &root)?;
             let p = safe_path(&root, string(&r, "path")?)?;
-            let current = json!(file_hash(&p)?);
-            if current == r["after"] && current != r["before"] {
-                apply_bytes(&p, blob(core, &r["before"])?.as_deref())?;
-            } else if current != r["before"] {
+            let before = matches_record(&p, &r, "before")?;
+            if matches_record(&p, &r, "after")? && !before {
+                apply_bytes_mode(&p, blob(core, &r["before"])?.as_deref(), recorded_mode(&r, "before")?)?;
+            } else if !before {
                 bail!("Dosya geri alma sonrasında değişti; korundu")
             }
             fs::remove_file(journal)?;
@@ -449,14 +516,20 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             let project = core.project(string(&session, "projectId")?)?;
             let main = PathBuf::from(string(&project, "directory")?);
             let changes = list_changes(core, args)?;
+            let modes = baseline_modes(core, string(args, "sessionId")?)?;
             let mut out = vec![];
             for mut item in changes.as_array().unwrap().clone() {
                 let name = item["path"].as_str().unwrap();
                 let actual = file_hash(&safe_path(&main, name)?)?;
+                let actual_mode = file_mode(&safe_path(&main, name)?)?;
                 let desired = current.get(name);
-                item["conflict"] =
-                    json!(actual.as_deref() != b[name].as_str() && actual.as_ref() != desired);
+                let same_baseline = actual.as_deref() == b[name].as_str()
+                    && (!cfg!(unix) || !modes.contains_key(name) || actual_mode == modes.get(name).copied());
+                let same_desired = actual.as_ref() == desired
+                    && (!cfg!(unix) || json!(actual_mode) == item["afterMode"]);
+                item["conflict"] = json!(!same_baseline && !same_desired);
                 item["main"] = json!(actual);
+                item["mainMode"] = json!(actual_mode);
                 out.push(item);
             }
             let _ = root;
@@ -476,8 +549,11 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
     }
 }
 pub fn apply_bytes(p: &Path, bytes: Option<&[u8]>) -> Result<()> {
+    apply_bytes_mode(p, bytes, None)
+}
+pub(crate) fn apply_bytes_mode(p: &Path, bytes: Option<&[u8]>, mode: Option<u32>) -> Result<()> {
     if let Some(bytes) = bytes {
-        atomic(p, bytes)
+        atomic_with_mode(p, bytes, mode)
     } else {
         match fs::remove_file(p) {
             Ok(_) => Ok(()),
@@ -511,6 +587,7 @@ fn transfer(core: &Core, args: &Value, undo: bool) -> Result<Value> {
         )?)?
     } else {
         let b = baseline(core, sid)?;
+        let modes = baseline_modes(core, sid)?;
         let mut steps = vec![];
         let mut destinations = std::collections::HashSet::new();
         for file in args["files"]
@@ -524,10 +601,20 @@ fn transfer(core: &Core, args: &Value, undo: bool) -> Result<Value> {
             let to = read_optional(&src)?;
             let from_hash = from.as_ref().map(|b| hash(b));
             let to_hash = to.as_ref().map(|b| hash(b));
+            let from_mode = file_mode(&dst)?;
+            let to_mode = file_mode(&src)?;
             if json!(from_hash) != file["main"] || json!(to_hash) != file["after"] {
                 bail!("Dosya aktarım önizlemesinden sonra değişti: {name}")
             }
-            let conflict = from_hash.as_deref() != b[name].as_str() && from_hash != to_hash;
+            #[cfg(unix)]
+            if (file.get("mainMode").is_some() && json!(from_mode) != file["mainMode"])
+                || (file.get("afterMode").is_some() && json!(to_mode) != file["afterMode"]) {
+                bail!("Dosya izinleri aktarım önizlemesinden sonra değişti: {name}")
+            }
+            let same_baseline = from_hash.as_deref() == b[name].as_str()
+                && (!cfg!(unix) || !modes.contains_key(name) || from_mode == modes.get(name).copied());
+            let same_desired = from_hash == to_hash && from_mode == to_mode;
+            let conflict = !same_baseline && !same_desired;
             if file["resolution"] == "main" {
                 continue;
             }
@@ -542,9 +629,12 @@ fn transfer(core: &Core, args: &Value, undo: bool) -> Result<Value> {
             } else {
                 to
             };
+            let after_mode = if to.is_none() { None }
+                else if file["resolution"] == "manual" { from_mode.or(to_mode) }
+                else { to_mode };
             let before = from.map(|b| store(core, &b)).transpose()?;
             let after = to.map(|b| store(core, &b)).transpose()?;
-            steps.push(json!({"path":name,"before":before,"after":after}));
+            steps.push(json!({"path":name,"before":before,"after":after,"beforeMode":from_mode,"afterMode":after_mode}));
         }
         json!({"id":id(),"sessionId":sid,"root":main,"createdAt":now(),"state":"prepared","steps":steps})
     };
@@ -563,11 +653,11 @@ fn transfer(core: &Core, args: &Value, undo: bool) -> Result<Value> {
         ("before", "after")
     };
     for step in &steps {
-        let current = json!(file_hash(&safe_path(&main, string(step, "path")?)?)?);
-        if current == step[to] && recovering {
+        let path = safe_path(&main, string(step, "path")?)?;
+        if matches_record(&path, step, to)? && recovering {
             continue;
         }
-        if current != step[from] {
+        if !matches_record(&path, step, from)? {
             bail!(
                 "Ana projede dosya değişti; aktarım durduruldu: {}",
                 step["path"]
@@ -587,14 +677,13 @@ fn transfer(core: &Core, args: &Value, undo: bool) -> Result<Value> {
     let result = (|| -> Result<()> {
         for step in &steps {
             let p = safe_path(&main, string(step, "path")?)?;
-            let current = json!(file_hash(&p)?);
-            if current == step[to] && recovering {
+            if matches_record(&p, step, to)? && recovering {
                 continue;
             }
-            if current != step[from] {
+            if !matches_record(&p, step, from)? {
                 bail!("Ana proje aktarım sırasında değişti: {}", step["path"])
             }
-            apply_bytes(&p, blob(core, &step[to])?.as_deref())?;
+            apply_bytes_mode(&p, blob(core, &step[to])?.as_deref(), recorded_mode(step, to)?)?;
             done.push(step);
         }
         record["state"] = json!(if undo { "undone" } else { "applied" });
@@ -605,10 +694,10 @@ fn transfer(core: &Core, args: &Value, undo: bool) -> Result<Value> {
         for old in done.into_iter().rev() {
             let rollback = (|| -> Result<()> {
                 let p = safe_path(&main, string(old, "path")?)?;
-                if json!(file_hash(&p)?) != old[to] {
+                if !matches_record(&p, old, to)? {
                     bail!("Ana proje geri alma sırasında değişti")
                 }
-                apply_bytes(&p, blob(core, &old[from])?.as_deref())
+                apply_bytes_mode(&p, blob(core, &old[from])?.as_deref(), recorded_mode(old, from)?)
             })();
             restored &= rollback.is_ok();
         }
@@ -630,6 +719,76 @@ fn transfer(core: &Core, args: &Value, undo: bool) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn capture_baseline(source: &Path, save: impl FnMut(&[u8]) -> Result<String>)
+        -> Result<HashMap<String, String>> {
+        Ok(capture_snapshot(source, save)?.0)
+    }
+    fn verify_baseline(source: &Path, files: &HashMap<String, String>, direct: bool,
+        reference: &Option<String>) -> Result<()> {
+        verify_snapshot(source, files, direct, reference, &HashMap::new())
+    }
+
+    #[test]
+    fn invalid_permission_metadata_fails_closed_and_legacy_records_remain_readable() {
+        assert_eq!(recorded_mode(&json!({"before":null}), "before").unwrap(), None);
+        assert_eq!(recorded_mode(&json!({"beforeMode":493}), "before").unwrap(), Some(0o755));
+        for invalid in [json!(4095), json!(-1), json!("755"), json!({})] {
+            assert!(recorded_mode(&json!({"beforeMode":invalid}), "before").is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_snapshot_copies_restore_and_undo_preserve_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = SnapshotDirectory::new();
+        let root = &directory.0;
+        let source = root.join("run.sh");
+        fs::write(&source, b"synthetic executable\n").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o750)).unwrap();
+        let mut objects = HashMap::new();
+        let (files, modes) = capture_snapshot(root, |bytes| {
+            let digest = hash(bytes);
+            objects.insert(digest.clone(), bytes.to_vec());
+            Ok(digest)
+        }).unwrap();
+        verify_snapshot(root, &files, false, &None, &modes).unwrap();
+        let target = root.join("copied.sh");
+        let original = &objects[&files["run.sh"]];
+        apply_bytes_mode(&target, Some(original), modes.get("run.sh").copied()).unwrap();
+        assert_eq!(file_mode(&target).unwrap(), Some(0o750));
+        atomic(&target, b"edited executable\n").unwrap();
+        assert_eq!(file_mode(&target).unwrap(), Some(0o750));
+        let record = json!({"before":hash(original),"beforeMode":0o750,
+            "after":hash(b"edited executable\n"),"afterMode":0o640});
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(matches_record(&target, &record, "after").unwrap());
+        apply_bytes_mode(&target, Some(original), recorded_mode(&record, "before").unwrap()).unwrap();
+        assert!(matches_record(&target, &record, "before").unwrap());
+        apply_bytes_mode(&target, None, None).unwrap();
+        apply_bytes_mode(&target, Some(original), recorded_mode(&record, "before").unwrap()).unwrap();
+        assert_eq!(file_mode(&target).unwrap(), Some(0o750));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chmod_after_capture_or_preview_is_rejected_without_changing_content() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = SnapshotDirectory::new();
+        let file = directory.0.join("run.sh");
+        fs::write(&file, b"unchanged\n").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+        let (files, modes) = capture_snapshot(&directory.0, |bytes| Ok(hash(bytes))).unwrap();
+        let stamp = file_stamp(&file).unwrap();
+        let record = json!({"before":files["run.sh"], "beforeMode":0o755});
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(verify_snapshot(&directory.0, &files, false, &None, &modes).is_err());
+        assert_ne!(stamp, file_stamp(&file).unwrap());
+        assert!(!matches_record(&file, &record, "before").unwrap());
+        assert!(matches_record(&file, &json!({"before":files["run.sh"]}), "before").unwrap());
+        assert_eq!(fs::read(&file).unwrap(), b"unchanged\n");
+    }
 
     struct SnapshotDirectory(PathBuf);
     impl SnapshotDirectory {

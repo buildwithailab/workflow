@@ -67,15 +67,20 @@ function diffStatsLabel(stats) {
 
 function renderDiff(target, result, onSelect, compact = false) {
   target.replaceChildren();
+  const notes = [...(result.notes ?? [])];
+  const mode = value => Number.isInteger(value) && value >= 0 && value <= 0o777;
+  if (mode(result.beforeMode) && mode(result.afterMode) && result.beforeMode !== result.afterMode) {
+    const format = value => "100" + value.toString(8).padStart(3, "0");
+    notes.push("old mode " + format(result.beforeMode), "new mode " + format(result.afterMode));
+  }
+  if (notes.length) target.append(el("pre", "review-notes", notes.join("\n")));
   if (result.binary) {
     target.append(el("p", "empty", tr("İkili dosya değişikliği")));
     return;
   }
   const lines = result.lines ?? [];
-  if (result.notes?.length)
-    target.append(el("pre", "review-notes", result.notes.join("\n")));
   if (!lines.length) {
-    if (!result.notes?.length)
+    if (!notes.length)
       target.append(el("p", "empty", tr("Gösterilecek satır farkı yok.")));
     return;
   }

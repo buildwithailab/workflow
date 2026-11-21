@@ -1,0 +1,38 @@
+[
+  {
+    "packages": ["webview2-com@0.39.1", "webview2-com-sys@0.39.1", "webview2-com-macros@0.8.1"],
+    "repository": "https://github.com/wravery/webview2-rs",
+    "file": "webview2-com-MIT.txt",
+    "source": "https://raw.githubusercontent.com/wravery/webview2-rs/edc2caf886175ccaebe86078c9cfe1ae2a187328/LICENSE"
+  },
+  {
+    "packages": ["block2@0.6.2", "dispatch2@0.3.1", "objc2@0.6.5", "objc2-app-kit@0.3.2", "objc2-core-foundation@0.3.2", "objc2-core-graphics@0.3.2", "objc2-encode@4.1.0", "objc2-exception-helper@0.1.1", "objc2-foundation@0.3.2", "objc2-io-surface@0.3.2", "objc2-quartz-core@0.3.2", "objc2-web-kit@0.3.2"],
+    "repository": "https://github.com/madsmtm/objc2",
+    "file": "objc2-MIT.txt",
+    "source": "https://raw.githubusercontent.com/madsmtm/objc2/8a5abacd90d5403fc0463459a35826f892b9142e/LICENSE-MIT.txt"
+  },
+  {
+    "packages": ["alloc-stdlib@0.3.0"],
+    "repository": "https://github.com/dropbox/rust-alloc-no-stdlib",
+    "file": "alloc-stdlib-BSD.txt",
+    "source": "https://raw.githubusercontent.com/dropbox/rust-alloc-no-stdlib/0a81fd6928ea3b33c8cd484aa4575d50ffb98012/LICENSE"
+  },
+  {
+    "packages": ["mac-notification-sys@0.6.15"],
+    "repository": "https://github.com/h4llow3En/mac-notification-sys",
+    "file": "mac-notification-sys-MIT.txt",
+    "source": "https://raw.githubusercontent.com/h4llow3En/mac-notification-sys/deb559683962d314a7693478476bf8d052efa84e/LICENSE-MIT"
+  },
+  {
+    "packages": ["selectors@0.38.0"],
+    "repository": "https://github.com/servo/stylo",
+    "file": "selectors-MPL.txt",
+    "source": "https://www.mozilla.org/media/MPL/2.0/index.txt"
+  },
+  {
+    "packages": ["tauri-plugin@2.7.2"],
+    "repository": "https://github.com/tauri-apps/tauri",
+    "file": "tauri-plugin-MIT.txt",
+    "source": "https://raw.githubusercontent.com/tauri-apps/tauri/59b63ab500da9859f12d8888c3298bc29bba0b92/LICENSE-MIT"
+  }
+]

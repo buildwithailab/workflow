@@ -10,6 +10,15 @@
 *.log
 /node_modules/
 
+# macOS metadata and local application/distribution products
+.DS_Store
+._*
+*.app/
+*.dSYM/
+*.xcarchive/
+*.dmg
+*.pkg
+
 # Local settings, provider profiles and runtime data
 .env*
 .npmrc

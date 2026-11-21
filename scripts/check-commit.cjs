@@ -1,12 +1,18 @@
 "use strict";
 // Fail closed. Reports contain only file paths, line numbers and rule names.
 const fs = require("node:fs"), path = require("node:path"), cp = require("node:child_process");
+const { createHash } = require("node:crypto");
 
 const blockedDirectories = /^(?:target|dist|node_modules|test-results|test-input|test-output|test-data|playwright-report|blob-report|coverage|__pycache__|accounts|profiles|sessions|transcripts|leases|secrets|\.secrets|ui-profile|browser-profiles|.+-profile|test-.+-home|\.aws|\.azure|\.kube|\.ssh|\.codex|\.claude|\.copilot|\.workflow|\.agentloom|local\.workflow\.desktop|local\.agentloom\.desktop)$/i;
 const blockedNames = /^(?:\.env.*|.*\.env|\.npmrc|\.netrc|(?:\.)?credentials(?:\..*)?\.json|auth(?:-status)?\.json|secrets(?:\..*)?\.json|workspace\.json|ready\.json|id_rsa.*|id_ed25519.*|Cookies|Login Data|Local State|Web Data|History)$/i;
 const blockedExtensions = /\.(?:exe|dll|pdb|obj|lib|zip|7z|rar|tar|gz|log|ansi|pem|key|pfx|p12|der|keystore|jks|kdbx|db(?:-wal|-shm)?|sqlite[^/]*|dmp|har|pyc)$/i;
 const assetPath = /^(?:icons\/[^/]+\.(?:png|ico)|docs\/images\/[^/]+\.(?:png|jpe?g|gif|webp))$/i;
 const maxSize = 12 * 1024 * 1024;
+// These two reviewed PNGs are authorized only at their exact Git paths and mode 100644.
+const reviewedIcons = new Map([
+  ["icons/icon-macos.png", { size: 172348, sha256: "9111ffca938b02f1756ac7873e36efedd2a5d07d8f2fcae9966ab1cfa4b5f22d" }],
+  ["icons/icon-macos@2x.png", { size: 611893, sha256: "dc0bb6c0bc6fbf3f947acf9fd43c9e98ff0f93e8e401d2cfcd06ce1200de721f" }],
+]);
 const rules = [
   ["private-key", /-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----/g],
   ["provider-token", /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{30,}|sk-(?:proj-|ant-[A-Za-z0-9]+-)?[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|AIza[A-Za-z0-9_-]{35}|(?:AKIA|ASIA)[A-Z0-9]{16})\b/g],
@@ -21,8 +27,10 @@ const rules = [
 
 function pathRule(name) {
   const parts = name.replace(/\\/g, "/").split("/");
+  if (parts.some(part => /^(?:\.DS_Store|\._.*|\.AppleDouble|.+\.(?:app|dSYM|xcarchive))$/i.test(part))) return "platform-metadata-or-build-product";
   if (parts.some(part => blockedDirectories.test(part))) return "runtime-or-generated-data";
   const file = parts.at(-1);
+  if (/\.(?:dmg|pkg)$/i.test(file)) return "platform-distribution-product";
   if (blockedNames.test(file) || blockedExtensions.test(file) || /\.local\.json$/i.test(file)) return "secret-or-local-file";
   if (/(?:^|\/)(?:\.cargo\/(?:config(?:\.toml)?|credentials[^/]*)|\.docker\/config\.json|gen\/schemas\/)/i.test(parts.join("/"))) return "local-or-generated-config";
   if (/\.(?:jsonl|ndjson|json|csv|txt|sql|bin)$/i.test(file) && /(?:^|\/)(?:fixtures|captures|screenshots|recordings|dumps)(?:\/|$)/i.test(name)) return "recorded-test-data";
@@ -40,20 +48,29 @@ function scanText(name, text) {
   return findings;
 }
 
-function scanFile(name, bytes, changedBinary = false) {
+function scanFile(name, bytes, changedBinary = false, mode) {
   const blocked = pathRule(name);
   if (blocked) return [{ file: name, rule: blocked }];
   if (bytes.length > maxSize) return [{ file: name, rule: "too-large-to-audit" }];
+  const findings = [];
+  const icon = reviewedIcons.get(name);
+  let reviewed = false;
+  if (icon) {
+    if (mode !== "100644") findings.push({ file: name, rule: "reviewed-icon-mode-mismatch" });
+    if (bytes.length !== icon.size || createHash("sha256").update(bytes).digest("hex") !== icon.sha256)
+      findings.push({ file: name, rule: "reviewed-icon-content-mismatch" });
+    reviewed = findings.length === 0;
+  }
   let text;
   try {
     if (bytes[0] === 0xff && bytes[1] === 0xfe) text = bytes.subarray(2).toString("utf16le");
     else text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch { text = null; }
-  if (text !== null && !text.includes("\0")) return scanText(name, text);
-  const findings = scanText(name, bytes.toString("latin1"));
+  if (text !== null && !text.includes("\0")) return findings.concat(scanText(name, text));
+  findings.push(...scanText(name, bytes.toString("latin1")));
   findings.push(...scanText(name, bytes.toString("utf16le")), ...scanText(name, bytes.subarray(1).toString("utf16le")));
   if (!assetPath.test(name)) findings.push({ file: name, rule: "unreviewable-binary" });
-  else if (changedBinary) findings.push({ file: name, rule: "changed-binary-needs-explicit-review" });
+  else if (changedBinary && !reviewed) findings.push({ file: name, rule: "changed-binary-needs-explicit-review" });
   return findings;
 }
 
@@ -85,7 +102,7 @@ function auditIndex(root) {
     if (blocked) { findings.push({ file: name, rule: blocked }); continue; }
     const size = Number(git(root, ["cat-file", "-s", oid]).toString("utf8").trim());
     if (!Number.isSafeInteger(size) || size > maxSize) { findings.push({ file: name, rule: "too-large-to-audit" }); continue; }
-    findings.push(...scanFile(name, git(root, ["cat-file", "blob", oid]), changed.has(name)));
+    findings.push(...scanFile(name, git(root, ["cat-file", "blob", oid]), changed.has(name), mode));
   }
   return { files: records.length, findings, excluded: [], media: [] };
 }
@@ -103,9 +120,9 @@ function auditWorktree(root) {
       else if (item.isFile()) {
         files++;
         if (assetPath.test(name)) media.push(name);
-        const size = fs.statSync(absolute).size;
-        if (size > maxSize) findings.push({ file: name, rule: "too-large-to-audit" });
-        else findings.push(...scanFile(name, fs.readFileSync(absolute)));
+        const info = fs.statSync(absolute);
+        if (info.size > maxSize) findings.push({ file: name, rule: "too-large-to-audit" });
+        else findings.push(...scanFile(name, fs.readFileSync(absolute), false, info.mode & 0o111 ? "100755" : "100644"));
       } else findings.push({ file: name, rule: "unreviewable-file" });
     }
   }

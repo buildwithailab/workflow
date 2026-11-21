@@ -32,15 +32,60 @@ pub(crate) fn link_needs_reapproval(link: &Value, source: &Value, target: &Value
     .any(|(pinned, current)| !pinned.is_null() && pinned != current)
 }
 pub fn atomic(file: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_with_mode(file, bytes, None)
+}
+
+// Only ordinary Unix permission bits travel with project content. Never copy
+// ownership, setuid/setgid or sticky bits from a workspace or backup object.
+pub(crate) fn file_mode(file: &Path) -> Result<Option<u32>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return match fs::symlink_metadata(file) {
+            Ok(metadata) if metadata.is_file() => Ok(Some(metadata.permissions().mode() & 0o777)),
+            Ok(_) => bail!("Yalnızca normal dosyaların izinleri kullanılabilir"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Ok(None)
+    }
+}
+
+fn create_atomic_temp(file: &Path, mode: Option<u32>) -> Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    if mode.is_some() {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Restrict access at creation, before the first project byte is written.
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    Ok(options.open(file)?)
+}
+
+pub(crate) fn atomic_with_mode(file: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> {
+    if mode.is_some_and(|mode| mode > 0o777) {
+        bail!("Geçersiz dosya izinleri")
+    }
+    #[cfg(unix)]
+    let mode = mode.or(file_mode(file)?);
     fs::create_dir_all(file.parent().context("Klasör yok")?)?;
     let tmp = file.with_extension(format!("{}.tmp", id()));
-    let mut f = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&tmp)?;
+    let mut f = create_atomic_temp(&tmp, mode)?;
     use std::io::Write;
     let result = (|| {
         f.write_all(bytes)?;
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(fs::Permissions::from_mode(mode))?;
+        }
         f.sync_all()?;
         drop(f);
         fs::rename(&tmp, file)
@@ -110,6 +155,11 @@ pub fn scan(root: &Path) -> Result<HashMap<String, String>> {
     scan_with(root, |_, path| Ok(hash(&fs::read(path)?)))
 }
 
+pub(crate) fn relative_name(path: &Path) -> Result<String> {
+    let text = path.to_str().context("Dosya adı UTF-8 olarak işlenemiyor")?;
+    if cfg!(windows) { Ok(text.replace('\\', "/")) } else { Ok(text.to_owned()) }
+}
+
 // Share enumeration, ignore rules and limits while letting snapshot creation
 // hash and persist the same bytes without a second source-file read.
 pub(crate) fn scan_with(
@@ -154,11 +204,7 @@ pub(crate) fn scan_with(
                 e.path().display()
             )
         }
-        let relative = e
-            .path()
-            .strip_prefix(root)?
-            .to_string_lossy()
-            .replace('\\', "/");
+        let relative = relative_name(e.path().strip_prefix(root)?)?;
         if out.len() > 100_000 {
             bail!("Çalışma alanı dosya sınırını aşıyor")
         };
@@ -177,9 +223,9 @@ pub struct Core {
     pub(crate) model_catalog: crate::models::CatalogCache,
     pub(crate) notifications: Mutex<crate::notifications::Notifications>,
     pub browsers: Mutex<BrowserState>,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     pub previews: crate::preview::Previews,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     pub updates: crate::updates::Updates,
     pub operations: Mutex<()>,
     pub(crate) repository_operations: crate::repository_operations::RepositoryOperations,
@@ -190,6 +236,11 @@ pub struct Core {
 }
 impl Core {
     pub fn new(directory: PathBuf, app: AppHandle) -> Result<Arc<Self>> {
+        #[cfg(target_os = "macos")]
+        {
+            use tauri::Manager;
+            crate::platform::macos::private_data_directory(&directory,Some(&app.path().app_data_dir()?))?;
+        }
         fs::create_dir_all(&directory)?;
         let instance = fs::OpenOptions::new()
             .create(true)
@@ -212,7 +263,7 @@ impl Core {
         };
         crate::workspace_archive::recover(&directory, &db);
         Ok(Arc::new(Self {
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             updates: crate::updates::Updates::load(&directory),
             directory,
             db: Mutex::new(db),
@@ -222,7 +273,7 @@ impl Core {
             model_catalog: crate::models::CatalogCache::default(),
             notifications: Mutex::new(crate::notifications::Notifications::default()),
             browsers: Mutex::new(BrowserState::default()),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             previews: crate::preview::Previews::default(),
             operations: Mutex::new(()),
             repository_operations: crate::repository_operations::RepositoryOperations::default(),
@@ -346,7 +397,7 @@ impl Core {
     }
     pub fn shutdown(&self) {
         crate::notification_popup::shutdown(self);
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         self.previews.shutdown();
         for t in self.terms.lock().unwrap().values() {
             t.stop();
@@ -368,6 +419,10 @@ pub fn external_path(path: &Path) -> &Path {
     dunce::simplified(path)
 }
 pub fn run(root: &Path, program: &str, args: &[String]) -> Result<std::process::Output> {
+    #[cfg(target_os = "macos")]
+    let git_executable = if program=="git" {Some(crate::platform::macos::git_executable().context("Git bulunamadı; Git isteğe bağlıdır.")?)}else{None};
+    #[cfg(target_os = "macos")]
+    let program = git_executable.as_ref().map(|path|path.to_str().context("Git yolu geçersiz")).transpose()?.unwrap_or(program);
     let mut c = std::process::Command::new(program);
     c.args(args)
         .current_dir(external_path(root))
@@ -409,6 +464,29 @@ pub fn git_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_scan_keeps_literal_backslashes_and_rejects_non_utf8_names() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        let root = std::env::temp_dir().join(id());
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::write(root.join("a\\b.txt"), b"literal filename").unwrap();
+        fs::write(root.join("a/b.txt"), b"nested filename").unwrap();
+        let files = scan(&root).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files["a\\b.txt"], hash(b"literal filename"));
+        assert_eq!(files["a/b.txt"], hash(b"nested filename"));
+        let invalid = OsString::from_vec(vec![0xff, b'.', b't']);
+        assert!(relative_name(Path::new(&invalid)).is_err());
+        // APFS rejects ill-formed UTF-8 names at creation; other Unix filesystems may accept them.
+        #[cfg(not(target_os = "macos"))]
+        {
+            fs::write(root.join(invalid), b"synthetic").unwrap();
+            assert!(scan(&root).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn link_reapproval_requires_a_changed_pinned_conversation() {
@@ -458,5 +536,43 @@ mod tests {
         atomic(&p.join("x"), b"two").unwrap();
         assert_eq!(fs::read(p.join("x")).unwrap(), b"two");
         fs::remove_dir_all(&p).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_atomic_temp_is_restricted_before_first_write() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let directory = std::env::temp_dir().join(id());
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("temporary");
+        let mut file = create_atomic_temp(&path, Some(0o600)).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o077, 0);
+        file.write_all(b"synthetic content").unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o077, 0);
+        drop(file);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_retains_private_permissions_and_new_file_defaults() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = std::env::temp_dir().join(id());
+        fs::create_dir(&directory).unwrap();
+        let private = directory.join("private");
+        fs::write(&private, b"synthetic before").unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+        atomic(&private, b"synthetic after").unwrap();
+        assert_eq!(file_mode(&private).unwrap(), Some(0o600));
+        let control = directory.join("control");
+        fs::write(&control, b"synthetic default").unwrap();
+        let created = directory.join("created");
+        atomic(&created, b"synthetic default").unwrap();
+        assert_eq!(file_mode(&created).unwrap(), file_mode(&control).unwrap());
+        for file in [private, control, created] { fs::remove_file(file).unwrap(); }
+        fs::remove_dir(directory).unwrap();
     }
 }

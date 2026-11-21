@@ -1,17 +1,24 @@
-use crate::{browser, core::*, terminal};
+use crate::{browser, core::*};
+#[cfg(windows)]
+use crate::terminal;
 use anyhow::{bail, Context, Result};
+#[cfg(windows)]
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
-    io::{Read, Write},
+    io::Read,
     net::{Ipv4Addr, TcpListener},
-    os::windows::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::Child,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use std::{io::Write, process::{Command, Stdio}};
+#[cfg(windows)]
 use windows::Win32::{
     Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_NO_DATA},
     NetworkManagement::IpHelper::{
@@ -21,8 +28,15 @@ use windows::Win32::{
     Networking::WinSock::{AF_INET, AF_INET6},
 };
 
+#[cfg(target_os = "macos")]
+use crate::platform::macos::preview::{listeners, shell};
+
 const LOG_LIMIT: usize = 16_384;
 const START_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(windows)]
+type Job = terminal::Job;
+#[cfg(target_os = "macos")]
+type Job = crate::platform::macos::process::Group;
 
 #[derive(Default)]
 pub struct Previews {
@@ -37,7 +51,7 @@ struct Run {
     page: Option<String>,
     open_gate: Arc<tokio::sync::Mutex<()>>,
     log: Vec<u8>,
-    job: Option<terminal::Job>,
+    job: Option<Job>,
 }
 
 impl Run {
@@ -79,6 +93,7 @@ fn address(raw: &str) -> Result<url::Url> {
     Ok(address)
 }
 
+#[cfg(windows)]
 fn table(family: u32) -> Result<Vec<u32>> {
     let mut bytes = 0;
     for _ in 0..4 {
@@ -104,6 +119,7 @@ fn table(family: u32) -> Result<Vec<u32>> {
     bail!("Windows port listesi okunamadı.")
 }
 
+#[cfg(windows)]
 fn rows<T: Copy>(table: &[u32], offset: usize) -> impl Iterator<Item = T> + '_ {
     let count = table.first().copied().unwrap_or(0) as usize;
     let length = std::mem::size_of_val(table).saturating_sub(offset);
@@ -119,6 +135,7 @@ fn rows<T: Copy>(table: &[u32], offset: usize) -> impl Iterator<Item = T> + '_ {
     })
 }
 
+#[cfg(windows)]
 fn listeners(port: u16) -> Result<Vec<u32>> {
     use windows::Win32::NetworkManagement::IpHelper::{
         MIB_TCP6ROW_OWNER_PID, MIB_TCPROW_OWNER_PID,
@@ -159,6 +176,7 @@ fn owns_listener(run: &Run) -> Result<bool> {
     Ok(!pids.is_empty())
 }
 
+#[cfg(windows)]
 fn shell(command: &str, directory: &Path, address: &url::Url) -> Result<(Child, terminal::Job)> {
     let powershell = std::env::var_os("SystemRoot").context("Windows sistem klasörü bulunamadı")?;
     let powershell = Path::new(&powershell).join("System32/WindowsPowerShell/v1.0/powershell.exe");
@@ -438,7 +456,7 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
     let settings = args.get("settings").unwrap_or(&session["preview"]);
     let command = string(settings, "command")?.trim();
     if command.is_empty() || command.len() > 4096 {
-        bail!("Geçerli bir PowerShell komutu gir.")
+        bail!("{}", if cfg!(target_os = "macos") { "Geçerli bir kabuk komutu gir." } else { "Geçerli bir PowerShell komutu gir." })
     }
     let address = address(string(settings, "url")?)?;
     let port = address.port().unwrap();

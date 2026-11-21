@@ -837,6 +837,11 @@ mod tests {
         Fixture::commit(&f.main, "b.txt", "target\n");
         Fixture::commit(&f.source, "a.txt", "source\n");
         fs::write(f.base.join("hooks/pre-merge-commit"), "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(f.base.join("hooks/pre-merge-commit"), fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let source = Fixture::head(&f.source);
         let target = Fixture::head(&f.main);
         assert!(f.merge("main").is_err());
@@ -868,6 +873,11 @@ mod tests {
         let f = Fixture::new();
         Fixture::commit(&f.source, "a.txt", "source change\n");
         fs::write(f.base.join("hooks/post-checkout"), "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(f.base.join("hooks/post-checkout"), fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let target = Fixture::head(&f.main);
         let source = Fixture::head(&f.source);
         assert!(f.merge("main").is_err());

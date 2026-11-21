@@ -17,7 +17,7 @@ const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TURNS: usize = 60;
 const MAX_STEPS: usize = 50;
 const MAX_TEXT_CHARS: usize = 24_000;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) const MAX_SCREENSHOT_BYTES: usize = 40 * 1024 * 1024;
 
 #[derive(Default)]
@@ -693,7 +693,7 @@ pub(crate) fn dispatch(core: &Core, action: &str, args: &Value) -> Result<Value>
         "answer_prompt" => terminal::answer_chat_prompt(core, args),
         "image_reference" => file_reference(&session, string(args, "path")?, true),
         "file_reference" => file_reference(&session, string(args, "path")?, false),
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         "paste_screenshot" => {
             use base64::{engine::general_purpose::STANDARD, Engine};
             let payload = string(args, "png")?;
@@ -702,7 +702,7 @@ pub(crate) fn dispatch(core: &Core, action: &str, args: &Value) -> Result<Value>
             }
             save_screenshot(core, string(&session, "id")?, &STANDARD.decode(payload)?)
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         "discard_screenshot" => {
             let directory = screenshot_directory(core, string(&session, "id")?)?;
             let attachment = uuid::Uuid::parse_str(string(args, "attachmentId")?)?;
@@ -731,12 +731,12 @@ pub(crate) fn dispatch(core: &Core, action: &str, args: &Value) -> Result<Value>
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn valid_screen_dimensions(width: u32, height: u32) -> bool {
     width > 0 && height > 0 && u64::from(width) * u64::from(height) <= 40_000_000
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn validate_png(bytes: &[u8]) -> Result<()> {
     if bytes.len() > MAX_SCREENSHOT_BYTES {
         bail!("Ekran görüntüsü çok büyük.");
@@ -749,13 +749,13 @@ pub(crate) fn validate_png(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn screenshot_directory(core: &Core, session_id: &str) -> Result<PathBuf> {
     let id = uuid::Uuid::parse_str(session_id)?;
     Ok(core.directory.join("attachments").join(id.to_string()))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn save_screenshot(core: &Core, session_id: &str, bytes: &[u8]) -> Result<Value> {
     let session = core.session(session_id)?;
     if session["login"] == true || session["archived"] == true {
@@ -772,7 +772,7 @@ pub(crate) fn save_screenshot(core: &Core, session_id: &str, bytes: &[u8]) -> Re
     Ok(reference)
 }
 
-fn file_reference(session: &Value, path: &str, image_only: bool) -> Result<Value> {
+pub(crate) fn file_reference(session: &Value, path: &str, image_only: bool) -> Result<Value> {
     let path = Path::new(path);
     let is_image = |p: &Path| {
         p.extension()
@@ -804,7 +804,8 @@ fn file_reference(session: &Value, path: &str, image_only: bool) -> Result<Value
         bail!("Dosya yolu kullanılamıyor.");
     };
     let reference = if session["provider"] == "copilot" {
-        format!("@\"{}\"", absolute.replace('\\', "/"))
+        let absolute = if cfg!(windows) { absolute.replace('\\', "/") } else { absolute.to_owned() };
+        format!("@\"{absolute}\"")
     } else {
         format!("\"{absolute}\"")
     };

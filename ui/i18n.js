@@ -2,6 +2,10 @@
 
 // Turkish source text is the default. Translate only messages authored by Workflow.
 const english = {
+  "Kurulum, özeti doğrulanan Mac programını geçici çalışma alanında çalıştırır.": "Setup runs the checksum-verified Mac executable in a temporary workspace.",
+  "Panodan yapıştırılabilir metin alınamadı.": "Could not read pasteable text from the clipboard.",
+  "Geçerli bir kabuk komutu gir.": "Enter a valid shell command.",
+  "Komut bu oturumun çalışma alanında zsh ile çalışır. Adres ve port, komutun açtığı yerel sunucuyla aynı olmalı.": "The command runs with zsh in this session workspace. The address and port must match its local server.",
   "Copilot düşünme seviyesi sonraki başlangıçta uygulanır. Onay seviyesi, çalışan oturum girişe hazırken değiştirilebilir.": "Copilot reasoning effort applies at the next start. Approval level can be changed when the running session is ready for input.",
   "Copilot düşünme seviyesi terminalin bir sonraki başlangıcında uygulanır.": "Copilot reasoning effort applies the next time the terminal starts.",
   "Onay ve düşünme seviyesi terminalin bir sonraki başlangıcında uygulanır.": "Approval and reasoning effort apply the next time the terminal starts.",

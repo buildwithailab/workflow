@@ -1,6 +1,7 @@
 use crate::core::{atomic, hash, Core};
 use crate::update_manifest::{version, Package, Release, SignedManifest, ASSET, FEED, MAX_FEED};
 use anyhow::{bail, Context, Result};
+#[cfg(windows)]
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::{blocking::Client, header::HeaderMap, redirect::Policy, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -8,18 +9,22 @@ use serde_json::{json, Value};
 use std::{
     fs,
     io::Read,
-    os::windows::process::CommandExt,
     path::{Path, PathBuf},
-    process::Command,
     sync::{Arc, Mutex},
     time::Duration,
 };
+#[cfg(windows)]
+use std::{os::windows::process::CommandExt, process::Command};
+#[cfg(windows)]
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
 const REPO: &str = "https://github.com/buildwithailab/workflow";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DAY: i64 = 24 * 60 * 60;
-const SUPPORTED: bool = cfg!(all(target_arch = "x86_64", not(debug_assertions)));
+const SUPPORTED: bool = cfg!(all(not(debug_assertions), any(
+    all(windows, target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+)));
 const BUSY: &str = "Güncelleme işlemi zaten devam ediyor.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -301,7 +306,9 @@ fn parse_release_response(
 }
 
 fn verified_package(bytes: &[u8], package: &Package) -> bool {
-    bytes.len() as u64 == package.size && bytes.starts_with(b"MZ") && hash(bytes) == package.sha256
+    let format = if cfg!(target_os = "macos") { bytes.starts_with(b"PK\x03\x04") }
+        else { bytes.starts_with(b"MZ") };
+    bytes.len() as u64 == package.size && format && hash(bytes) == package.sha256
 }
 
 impl Updates {
@@ -614,6 +621,7 @@ impl Updates {
     }
 }
 
+#[cfg(windows)]
 fn run_installer(update: &Pending, receipt: &Path, restart: bool) -> Result<()> {
     let destination = dunce::canonicalize(std::env::current_exe()?)?;
     if !SUPPORTED
@@ -646,6 +654,14 @@ fn run_installer(update: &Pending, receipt: &Path, restart: bool) -> Result<()> 
         .creation_flags(CREATE_NO_WINDOW.0)
         .spawn()?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_installer(update: &Pending, receipt: &Path, restart: bool) -> Result<()> {
+    if !SUPPORTED { bail!("Unsupported Workflow application"); }
+    crate::platform::macos::update_installer(
+        &update.path, receipt, restart, &update.sha256, &update.version,
+    )
 }
 
 pub fn start(core: &Arc<Core>) {
@@ -758,6 +774,8 @@ mod tests {
 
     #[test]
     fn metadata_urls_use_public_release_assets() {
+        #[cfg(windows)]
+        {
         assert_eq!(
             metadata_url("latest").as_deref(),
             Some("https://github.com/buildwithailab/workflow/releases/latest/download/Workflow-Update-Windows-x64.json")
@@ -770,6 +788,16 @@ mod tests {
             download_url("1.2.3"),
             "https://github.com/buildwithailab/workflow/releases/download/v1.2.3/Workflow-Update-Windows-x64.exe"
         );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(metadata_url("latest").unwrap(),
+                "https://github.com/buildwithailab/workflow/releases/latest/download/Workflow-Update-macOS-arm64.json");
+            assert_eq!(metadata_url("tags/v1.2.3").unwrap(),
+                "https://github.com/buildwithailab/workflow/releases/download/v1.2.3/Workflow-Update-macOS-arm64.json");
+            assert_eq!(download_url("1.2.3"),
+                "https://github.com/buildwithailab/workflow/releases/download/v1.2.3/Workflow-Update-macOS-arm64.app.zip");
+        }
         assert!(metadata_url("tags/v1.2.3-rc").is_none());
         assert!(metadata_url("tags/v1.2.3/../latest").is_none());
     }
@@ -981,13 +1009,18 @@ mod tests {
 
     #[test]
     fn rejects_unverified_or_truncated_executables() {
-        let bytes = b"MZ synthetic executable";
+        let bytes: &[u8] = if cfg!(target_os = "macos") { b"PK\x03\x04 synthetic application archive" }
+            else { b"MZ synthetic executable" };
         let package = Package {
             size: bytes.len() as u64,
             sha256: hash(bytes),
         };
         assert!(verified_package(bytes, &package));
-        assert!(!verified_package(b"MZ altered executable", &package));
+        assert!(!verified_package(b"altered package", &package));
         assert!(!verified_package(&bytes[..bytes.len() - 1], &package));
+        let foreign: &[u8] = if cfg!(target_os = "macos") { b"MZ foreign executable" }
+            else { b"PK\x03\x04 foreign archive" };
+        let foreign_package = Package { size: foreign.len() as u64, sha256: hash(foreign) };
+        assert!(!verified_package(foreign, &foreign_package));
     }
 }

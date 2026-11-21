@@ -3,7 +3,7 @@ const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs"), path = require("node:path"), cp = require("node:child_process");
 const { randomBytes } = require("node:crypto");
-const { pathRule, scanText, scanFile, auditIndex } = require("../scripts/check-commit.cjs");
+const { pathRule, scanText, scanFile, auditIndex, auditWorktree } = require("../scripts/check-commit.cjs");
 const root = path.resolve(__dirname, "..");
 const generated = path.join(root, "target");
 const syntheticToken = () => ["gh", "p", "_", randomBytes(20).toString("hex")].join("");
@@ -31,6 +31,19 @@ test("findings never include the secret value", () => {
   assert(findings.some(f => f.rule === "provider-token" && f.line === 2));
   assert(!JSON.stringify(findings).includes(value));
 });
+
+test("Mac metadata and forced application resources never pass the staged gate", () => {
+  for (const name of [".DS_Store", "nested/._sample.txt", ".AppleDouble/a", "Workflow.app/Contents/Info.plist", "debug/Workflow.dSYM/Contents/Info.plist", "Archive.xcarchive/Info.plist", "Workflow.dmg", "nested/Workflow.pkg"])
+    assert(pathRule(name), name);
+  assert.equal(pathRule("tauri.macos.conf.json"), null);
+  const directory = repository();
+  fs.writeFileSync(path.join(directory, ".gitignore"), "*.app/\n");
+  const resource = "Workflow.app/Contents/Info.plist";
+  fs.mkdirSync(path.dirname(path.join(directory, resource)), { recursive: true });
+  fs.writeFileSync(path.join(directory, resource), "synthetic package metadata\n");
+  git(directory, ["add", "-f", "--", resource]);
+  assert(auditIndex(directory).findings.some(f => f.file === resource && f.rule === "platform-metadata-or-build-product"));
+});
 test("detects private keys, quoted secrets, env assignments and credential URLs", () => {
   const samples = [
     ["-----BEGIN ", "PRIVATE KEY", "-----"].join(""),
@@ -46,6 +59,62 @@ test("unknown binaries and changed public images block the commit", () => {
   const bytes = Buffer.from([0, 137, 80, 78, 71]);
   assert(scanFile("opaque.bin", bytes).some(f => f.rule === "unreviewable-binary"));
   assert(scanFile("docs/images/demo.png", bytes, true).some(f => f.rule === "changed-binary-needs-explicit-review"));
+});
+const macIcons = ["icons/icon-macos.png", "icons/icon-macos@2x.png"];
+function iconRepository() {
+  const directory = repository();
+  fs.mkdirSync(path.join(directory, "icons"));
+  for (const name of macIcons)
+    fs.copyFileSync(path.join(root, name), path.join(directory, name));
+  git(directory, ["add", "--", ...macIcons]);
+  return directory;
+}
+test("only the two exact reviewed paths, byte sequences and regular index modes pass", () => {
+  const directory = iconRepository();
+  assert.deepEqual(auditIndex(directory).findings, []);
+  const [name, retina] = macIcons;
+  const original = fs.readFileSync(path.join(root, name));
+  const different = Buffer.from(original);
+  different[different.length - 1] ^= 1;
+  const cases = [
+    different, original.subarray(0, 32), Buffer.concat([original, Buffer.from([0])]),
+    fs.readFileSync(path.join(root, retina)), Buffer.from("plain text replacement"),
+    Buffer.from("version https://git-lfs.github.com/spec/v1\noid sha256:" + "0".repeat(64) + "\nsize 1\n"),
+  ];
+  for (const bytes of cases) {
+    fs.writeFileSync(path.join(directory, name), bytes);
+    git(directory, ["add", "--", name]);
+    assert(auditIndex(directory).findings.some(f => f.file === name && f.rule === "reviewed-icon-content-mismatch"));
+  }
+  for (const other of ["icons/third.png", "icons/Icon-macos.png", "docs/images/icon-macos.png"])
+    assert(scanFile(other, original, true, "100644").some(f => f.rule === "changed-binary-needs-explicit-review"));
+  fs.copyFileSync(path.join(root, name), path.join(directory, "icons", "third.png"));
+  git(directory, ["add", "--", "icons/third.png"]);
+  assert(auditIndex(directory).findings.some(f => f.file === "icons/third.png" && f.rule === "changed-binary-needs-explicit-review"));
+});
+test("reviewed icon checks use the index blob and preserve secret redaction", () => {
+  const directory = iconRepository(), name = macIcons[0], file = path.join(directory, name);
+  const original = fs.readFileSync(file);
+  const value = syntheticToken();
+  fs.writeFileSync(file, Buffer.concat([original, Buffer.from("\n" + value + "\n")]));
+  assert.deepEqual(auditIndex(directory).findings, []);
+  assert(auditWorktree(directory).findings.some(f => f.rule === "reviewed-icon-content-mismatch"));
+  git(directory, ["add", "--", name]);
+  fs.writeFileSync(file, original);
+  const findings = auditIndex(directory).findings;
+  for (const rule of ["reviewed-icon-content-mismatch", "changed-binary-needs-explicit-review", "provider-token"])
+    assert(findings.some(f => f.file === name && f.rule === rule), rule);
+  assert(!JSON.stringify(findings).includes(value));
+});
+test("reviewed icon approval does not permit an executable or symbolic link index entry", () => {
+  const directory = iconRepository(), name = macIcons[1];
+  git(directory, ["update-index", "--chmod=+x", "--", name]);
+  assert(auditIndex(directory).findings.some(f => f.file === name && f.rule === "reviewed-icon-mode-mismatch"));
+  git(directory, ["update-index", "--chmod=-x", "--", name]);
+  assert.deepEqual(auditIndex(directory).findings, []);
+  const oid = git(directory, ["hash-object", "-w", "--", "safe.txt"]).trim();
+  git(directory, ["update-index", "--cacheinfo", "120000," + oid + "," + name]);
+  assert(auditIndex(directory).findings.some(f => f.file === name && f.rule === "unmerged-link-or-submodule"));
 });
 test("checks staged contents even when the working file has been cleaned", () => {
   const directory = repository(), value = syntheticToken();

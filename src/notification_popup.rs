@@ -73,8 +73,14 @@ pub(crate) fn initialize(core: &Arc<Core>, webview_directory: PathBuf) -> Result
     .data_directory(webview_directory)
     .on_navigation(local_page)
     .on_new_window(|_, _| NewWindowResponse::Deny)
-    .on_permission_request(|_, _| PermissionResponse::Deny)
-    .build()?;
+    .on_permission_request(|_, _| PermissionResponse::Deny);
+    #[cfg(target_os = "macos")]
+    let window = window.data_store_identifier(crate::platform::macos::data_store(&core.directory,"ui"));
+    let window = window.build()?;
+    #[cfg(target_os = "macos")]
+    crate::platform::macos::own_window_state(&window)?;
+    #[cfg(not(windows))]
+    let _ = &window;
     #[cfg(windows)]
     {
         use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::*};

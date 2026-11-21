@@ -1,13 +1,21 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
 use sha2::{Digest, Sha256};
+#[cfg(windows)]
 use windows::Win32::Security::Cryptography::{
     BCryptDestroyKey, BCryptImportKeyPair, BCryptVerifySignature, BCRYPT_ECCPUBLIC_BLOB,
     BCRYPT_ECDSA_P256_ALG_HANDLE, BCRYPT_FLAGS, BCRYPT_KEY_HANDLE,
 };
 
+#[cfg(not(target_os = "macos"))]
 pub(crate) const ASSET: &str = "Workflow-Update-Windows-x64.exe";
+#[cfg(not(target_os = "macos"))]
 pub(crate) const FEED: &str = "Workflow-Update-Windows-x64.json";
+#[cfg(target_os = "macos")]
+pub(crate) const ASSET: &str = "Workflow-Update-macOS-arm64.app.zip";
+#[cfg(target_os = "macos")]
+pub(crate) const FEED: &str = "Workflow-Update-macOS-arm64.json";
 pub(crate) const MAX_ASSET: u64 = 128 * 1024 * 1024;
 pub(crate) const MAX_PAYLOAD: usize = 192 * 1024;
 pub(crate) const MAX_FEED: usize = 272 * 1024;
@@ -64,7 +72,9 @@ pub(crate) fn version(value: &str) -> Option<[u64; 3]> {
     parts.next().is_none().then_some(result)
 }
 
+#[cfg(windows)]
 struct VerificationKey(BCRYPT_KEY_HANDLE);
+#[cfg(windows)]
 impl Drop for VerificationKey {
     fn drop(&mut self) {
         unsafe {
@@ -73,6 +83,7 @@ impl Drop for VerificationKey {
     }
 }
 
+#[cfg(windows)]
 fn verify(payload: &[u8], signature: &[u8], public: &[u8]) -> bool {
     if public.len() != 72 || &public[..8] != b"ECS1\x20\0\0\0" || signature.len() != 64 {
         return false;
@@ -103,6 +114,24 @@ fn verify(payload: &[u8], signature: &[u8], public: &[u8]) -> bool {
         .ok()
         .is_ok()
     }
+}
+
+#[cfg(target_os = "macos")]
+fn verify(payload: &[u8], signature: &[u8], public: &[u8]) -> bool {
+    use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+    // CNG ECCPUBLICBLOB stores a fixed header followed by big-endian X and Y.
+    // Convert only the public point to uncompressed SEC1; the pinned key stays
+    // identical to Windows and the signer still emits raw 32-byte r || s.
+    if public.len() != 72 || &public[..8] != b"ECS1\x20\0\0\0" || signature.len() != 64 {
+        return false;
+    }
+    let mut point = [0u8; 65];
+    point[0] = 4;
+    point[1..].copy_from_slice(&public[8..]);
+    let (Ok(key), Ok(signature)) = (VerifyingKey::from_sec1_bytes(&point), Signature::from_slice(signature)) else {
+        return false;
+    };
+    key.verify(payload, &signature).is_ok()
 }
 
 impl SignedManifest {
@@ -176,10 +205,26 @@ impl Release {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "Requires an unchanged public Windows feed in an ignored temporary file"]
+    fn mac_verifier_accepts_the_existing_windows_raw_signature() {
+        let path = std::env::var_os("WORKFLOW_INTEROP_FEED").expect("Public feed path required");
+        let bytes = std::fs::read(path).unwrap();
+        let signed: SignedManifest = serde_json::from_slice(&bytes).unwrap();
+        let payload = STANDARD.decode(&signed.payload).unwrap();
+        let signature = STANDARD.decode(&signed.signature).unwrap();
+        let public = STANDARD.decode(include_str!("update-public-key.txt").trim()).unwrap();
+        assert!(verify(&payload,&signature,&public));
+        // A valid signature cannot authorize a package for another platform.
+        assert!(SignedManifest::parse(&bytes).is_none());
+    }
+    #[cfg(windows)]
     use windows::Win32::Security::Cryptography::{
         BCryptExportKey, BCryptFinalizeKeyPair, BCryptGenerateKeyPair, BCryptSignHash,
     };
 
+    #[cfg(windows)]
     fn sign(value: serde_json::Value) -> (SignedManifest, Vec<u8>) {
         let mut handle = BCRYPT_KEY_HANDLE::default();
         unsafe {
@@ -225,6 +270,24 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn sign(value: serde_json::Value) -> (SignedManifest, Vec<u8>) {
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+        let key = loop {
+            let mut scalar = [0u8; 32];
+            scalar[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+            scalar[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+            if let Ok(key) = SigningKey::from_slice(&scalar) { break key; }
+        };
+        let point = key.verifying_key().to_encoded_point(false);
+        let mut public = b"ECS1\x20\0\0\0".to_vec();
+        public.extend_from_slice(&point.as_bytes()[1..]);
+        let payload = serde_json::to_vec(&value).unwrap();
+        let signature: Signature = key.sign(&payload);
+        (SignedManifest { algorithm: ALGORITHM.into(), payload: STANDARD.encode(payload),
+            signature: STANDARD.encode(signature.to_bytes()) }, public)
+    }
+
     fn payload() -> serde_json::Value {
         json!({"schema":1,"repository":REPOSITORY,"channel":"stable","version":"1.2.3","asset":ASSET,
             "size":128,"sha256":"1a".repeat(32),"notes":"New release\n- Sample change"})
@@ -260,6 +323,23 @@ mod tests {
         }
         assert!(SignedManifest::parse(&vec![b' '; MAX_FEED + 1]).is_none());
         assert!(SignedManifest::parse(br#"{"version":"1.2.3","immutable":true}"#).is_none());
+    }
+
+    #[test]
+    fn signature_verification_rejects_malformed_points_headers_and_signature_lengths() {
+        let (signed, public) = sign(payload());
+        let bytes = STANDARD.decode(&signed.payload).unwrap();
+        let signature = STANDARD.decode(&signed.signature).unwrap();
+        assert!(verify(&bytes, &signature, &public));
+        assert!(!verify(&bytes, &signature[..63], &public));
+        assert!(!verify(&bytes, &signature, &public[..71]));
+        assert!(!verify(&bytes, &[0; 64], &public));
+        let mut malformed = public.clone();
+        malformed[0] ^= 1;
+        assert!(!verify(&bytes, &signature, &malformed));
+        malformed = public;
+        malformed[8..].fill(0);
+        assert!(!verify(&bytes, &signature, &malformed));
     }
 
     #[test]

@@ -348,6 +348,8 @@ fn claude_probe(exe: &std::path::Path, profile: &Profile, args: &[&str]) -> Resu
         }
     }
     profile.apply(&mut command);
+    #[cfg(target_os = "macos")]
+    command.env("PATH", crate::platform::macos::child_path(exe)?);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -357,7 +359,14 @@ fn claude_probe(exe: &std::path::Path, profile: &Profile, args: &[&str]) -> Resu
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
+    #[cfg(target_os = "macos")]
+    crate::platform::macos::process::configure(&mut command);
     let mut child = command.spawn()?;
+    #[cfg(target_os = "macos")]
+    let group = match crate::platform::macos::process::Group::new(child.id(), false) {
+        Ok(group) => group,
+        Err(error) => { let _ = child.kill(); let _ = child.wait(); return Err(error); }
+    };
     let stdout = child.stdout.take().context("CLI çıkışı yok")?;
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -369,6 +378,8 @@ fn claude_probe(exe: &std::path::Path, profile: &Profile, args: &[&str]) -> Resu
         let _ = tx.send(result);
     });
     let output = rx.recv_timeout(Duration::from_secs(8));
+    #[cfg(target_os = "macos")]
+    group.stop();
     // Only this short-lived read-only probe is stopped; provider terminals are untouched.
     #[cfg(windows)]
     {

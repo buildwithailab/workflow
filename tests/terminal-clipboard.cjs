@@ -45,7 +45,8 @@ async function test() {
   await page.addStyleTag({ content: fs.readFileSync(path.join(root, "ui/style.css"), "utf8").replace(/^@import.*\r?\n/, "") });
   await page.addScriptTag({ path: path.join(root, "ui/vendor/xterm.js") });
   await page.addScriptTag({ content: `
-    window.sent = []; window.errors = []; window.run = "first"; window.delay = 0;
+    window.sent = []; window.errors = []; window.run = "first"; window.delay = 0; window.discarded = 0;
+    const discardScreenshot = async () => { window.discarded++; };
     const $ = selector => document.querySelector(selector);
     const hideBrowser = () => {}, scheduleViewport = () => {};
     const tr = x => x, error = e => window.errors.push(String(e));
@@ -126,6 +127,8 @@ async function test() {
   await page.waitForFunction(() => readStarted);
   await page.evaluate(() => { run = "replacement"; });
   assert.deepEqual(await flush(), [], "pending paste never reaches a replacement provider");
+  assert.equal(await page.evaluate(() => discarded),1,"stale paste runs attachment cleanup");
+  assert.deepEqual(await page.evaluate(() => errors.splice(0)),[],"stale paste cleanup reports no error");
   await page.evaluate(() => { delay = 0; run = null; });
   await page.keyboard.press("Control+v");
   await page.keyboard.press("Control+c");

@@ -24,7 +24,7 @@ fn tools() -> Value {
         {"name":"read_result","description":"Read the status or result of a work request created by this session.","inputSchema":object(json!({"requestId":{"type":"string"}}),vec!["requestId"])},
         {"name":"report_result","description":"Return the outcome of a work request addressed to this session.","inputSchema":object(json!({"requestId":{"type":"string"},"result":{"type":"string"}}),vec!["requestId","result"])}
     ]);
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     let catalog = {
         let mut catalog = catalog;
         catalog.as_array_mut().unwrap().push(json!({
@@ -68,8 +68,16 @@ pub fn start(core: &Arc<Core>) -> Result<()> {
     });
     Ok(())
 }
-fn connection(core: &Arc<Core>, mut stream: TcpStream) -> Result<()> {
+fn prepare_connection(stream: &TcpStream) -> Result<()> {
+    // Accepted sockets can inherit the listener's nonblocking mode. Each
+    // request has its own worker and must wait for the complete bounded line.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    Ok(())
+}
+fn connection(core: &Arc<Core>, mut stream: TcpStream) -> Result<()> {
+    prepare_connection(&stream)?;
     let mut line = String::new();
     BufReader::new(stream.try_clone()?)
         .take(1024 * 1024)
@@ -172,7 +180,7 @@ fn forward_tool(endpoint: &std::net::SocketAddr, lease: &Value, params: &Value) 
     let mut stream = TcpStream::connect_timeout(endpoint, Duration::from_secs(4))
         .context("Workflow araç bağlantısı kurulamadı")?;
     let timeout = match params["name"].as_str() {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         Some("teams_send_message") => crate::teams::MCP_READ_TIMEOUT,
         _ => Duration::from_secs(25),
     };
@@ -312,9 +320,9 @@ async fn call(core: &Arc<Core>, source: &str, method: &str, mut args: Value) -> 
         return browser::agent_action(core, source, action, &args).await;
     }
     match method {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         "teams_send_message" => crate::teams::send_for_session(core, source, &args).await,
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         "teams_open" => crate::teams::show_for_session(core, source),
         "session_catalog" => {
             let db = core.db.lock().unwrap();
@@ -458,6 +466,60 @@ async fn call(core: &Arc<Core>, source: &str, method: &str, mut args: Value) -> 
 mod tests {
     use super::*;
     #[test]
+    fn accepted_connection_waits_for_delayed_and_fragmented_request() {
+        for fragmented in [false, true] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let (accepted, wait_for_accept) = std::sync::mpsc::channel();
+            let client = std::thread::spawn(move || {
+                let mut client = TcpStream::connect_timeout(&address, Duration::from_secs(3)).unwrap();
+                client.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+                wait_for_accept.recv_timeout(Duration::from_secs(3)).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+                if fragmented {
+                    client.write_all(b"{\"synthetic\":").unwrap();
+                    std::thread::sleep(Duration::from_millis(100));
+                    client.write_all(b"true}\n").unwrap();
+                } else {
+                    client.write_all(b"{\"synthetic\":true}\n").unwrap();
+                }
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "accept timed out");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_) => panic!("accept failed"),
+                }
+            };
+            // Force the inherited state so the regression is deterministic on
+            // platforms where accept returns a blocking socket by default.
+            stream.set_nonblocking(true).unwrap();
+            prepare_connection(&stream).unwrap();
+            accepted.send(()).unwrap();
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).unwrap();
+            client.join().unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), json!({"synthetic":true}));
+        }
+    }
+
+    #[test]
+    fn accepted_connection_has_bounded_reads_and_writes() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        prepare_connection(&stream).unwrap();
+        assert_eq!(stream.read_timeout().unwrap(), Some(Duration::from_secs(10)));
+        assert_eq!(stream.write_timeout().unwrap(), Some(Duration::from_secs(10)));
+        drop(client);
+    }
+
+    #[test]
     fn codex_mcp_array_preserves_paths_through_windows_shims() {
         let command = r"C:\My Project\Workflow.exe";
         let lease = r"C:\O'Brien & %USER%\İ.json";
@@ -496,7 +558,7 @@ mod tests {
             .all(|v| v["inputSchema"]["type"] == "object"));
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn teams_requires_a_message_and_accepts_an_optional_link() {
         let catalog = tools();
@@ -511,7 +573,7 @@ mod tests {
         assert_eq!(tool["annotations"]["idempotentHint"], false);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn teams_open_exposes_no_chat_or_message_parameters() {
         let catalog = tools();

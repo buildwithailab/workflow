@@ -1,9 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#[cfg(all(feature = "desktop-tests", not(debug_assertions)))]
+compile_error!("desktop-tests is only available in debug builds");
 mod accounts;
 mod addons;
 mod browser;
 mod chat;
 #[cfg(windows)]
+mod clipboard;
+#[cfg(target_os = "macos")]
+#[path = "platform/macos/clipboard.rs"]
 mod clipboard;
 mod core;
 mod files;
@@ -12,22 +17,23 @@ mod history;
 mod instructions;
 mod mcp;
 mod models;
+mod platform;
 mod notifications;
 mod notification_popup;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod preview;
 mod provider_setup;
 mod repository_operations;
 mod session_folders;
 mod sharing;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod teams;
 mod templates;
 mod terminal;
 mod terminal_notifications;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod updates;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod update_manifest;
 mod usage;
 mod workspace_archive;
@@ -57,9 +63,10 @@ async fn dispatch(
         return Err("Bu sayfa uygulama araçlarına erişemez".into());
     }
     let core = state.inner().clone();
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     if domain == "clipboard" {
         return tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(windows)]
             let owner = if action == "write" {
                 let hwnd = webview
                     .window()
@@ -69,19 +76,21 @@ async fn dispatch(
             } else {
                 None
             };
+            #[cfg(target_os = "macos")]
+            let owner = None;
             clipboard::dispatch(&core, owner, &action, &args)
         })
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string());
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     if domain == "teams" {
         return teams::dispatch(&core, &action, &args)
             .await
             .map_err(|e| e.to_string());
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     if domain == "preview" && action == "open" {
         return preview::open(&core, &args).await.map_err(|e| e.to_string());
     }
@@ -108,9 +117,9 @@ fn route(core: &Arc<Core>, domain: &str, action: &str, args: &Value) -> Result<V
         "addons" => addons::dispatch(core, action, args),
         "models" => models::dispatch(core, action, args),
         "templates" => templates::dispatch(core, action, args),
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         "preview" => preview::dispatch(core, action, args),
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         "updates" => updates::dispatch(core, action, args),
         _ => bail!("Uygulama işlemi bulunamadı"),
     }
@@ -239,18 +248,11 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
                     anyhow::Error::from(error)
                 }
             })?;
-            let clone = crate::core::git(
-                &parent,
-                &[
-                    "-c",
-                    "http.sslBackend=schannel",
-                    "clone",
-                    "--progress",
-                    "--",
-                    address,
-                    &destination.to_string_lossy(),
-                ],
-            );
+            let mut arguments = Vec::new();
+            if cfg!(windows) { arguments.extend(["-c", "http.sslBackend=schannel"]); }
+            let destination_text = destination.to_string_lossy();
+            arguments.extend(["clone", "--progress", "--", address, &destination_text]);
+            let clone = crate::core::git(&parent, &arguments);
             if let Err(error) = clone {
                 // Git can leave an empty, pre-existing destination after a failed clone.
                 // Preserve any files that appeared there while the command was running.
@@ -270,7 +272,7 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
                 .filter_map(|s| s["id"].as_str().map(str::to_string))
                 .collect::<Vec<_>>();
             for sid in sessions {
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "macos"))]
                 if core.previews.running(&sid) {
                     bail!("Önce projenin çalışan önizlemelerini durdur")
                 }
@@ -361,7 +363,7 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
                     bail!(repository_operations::CHANGED);
                 }
                 repository.validate(&roots)?;
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "macos"))]
                 if archive && core.previews.running(sid) {
                     bail!("Önce bu oturumun önizlemesini durdur")
                 }
@@ -699,6 +701,13 @@ fn account_fixture_directory(provider: &str) -> Option<PathBuf> {
 
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
+    #[cfg(all(target_os = "macos", feature = "desktop-tests"))]
+    if args.get(1).is_some_and(|arg| arg == "--clipboard-test-helper")
+        && std::env::var("WORKFLOW_TEST_MODE").ok().as_deref() == Some("1") && profile_override().is_some()
+    {
+        if clipboard::test_helper().is_err() { eprintln!("Pano testi tamamlanamadı; mevcut içerik raporlanmadı"); std::process::exit(1); }
+        return;
+    }
     if args.get(1).is_some_and(|s| s == "--usage-auth-fixture")
         && std::env::var("WORKFLOW_TEST_MODE").ok().as_deref() == Some("1")
     {
@@ -753,15 +762,22 @@ fn main() {
         let core = Core::new(directory, app.handle().clone())?;
         mcp::start(&core)?;
         app.manage(core.clone());
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         app.manage(teams::Teams::default());
         if let Some(config) = &config {
-            tauri::WebviewWindowBuilder::from_config(app, config)?.data_directory(webview_directory.clone()).build()?;
+            let builder = tauri::WebviewWindowBuilder::from_config(app, config)?.data_directory(webview_directory.clone());
+            #[cfg(target_os = "macos")]
+            let builder = builder.data_store_identifier(crate::platform::macos::data_store(&core.directory,"ui"));
+            let _window=builder.build()?;
+            #[cfg(target_os = "macos")]
+            crate::platform::macos::own_window_state(&_window)?;
         }
         notification_popup::initialize(&core, webview_directory)?;
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         updates::start(&core);
         notifications::start(&core)?;
+        #[cfg(all(target_os = "macos", feature = "desktop-tests"))]
+        crate::platform::macos::test_bridge::start(&core)?;
         if std::env::var("WORKFLOW_TEST_MODE").ok().as_deref()==Some("1"){let _=atomic(&core.directory.join("ready.json"),&serde_json::to_vec(&json!({"pid":std::process::id(),"endpoint":*core.endpoint.lock().unwrap()}))?);}
         Ok(())
     }).build(context);
@@ -791,7 +807,9 @@ fn main() {
                     MB_OK | MB_ICONERROR,
                 );
             }
-            #[cfg(not(windows))]
+            #[cfg(target_os = "macos")]
+            crate::platform::macos::startup_error(&e);
+            #[cfg(not(any(windows, target_os = "macos")))]
             eprintln!("Workflow açılamadı: {e}");
             return;
         }
@@ -805,8 +823,13 @@ fn main() {
         {
             if label == "main" {
                 if let Some(core) = app.try_state::<Arc<Core>>() { notification_popup::shutdown(&core); }
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "macos"))]
                 teams::close(app);
+                #[cfg(target_os = "macos")]
+                {
+                    if let Some(core) = app.try_state::<Arc<Core>>() { core.shutdown(); }
+                    app.exit(0);
+                }
             }
         }
         if matches!(
@@ -814,7 +837,7 @@ fn main() {
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
         ) {
             if let Some(core) = app.try_state::<Arc<Core>>() {
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "macos"))]
                 core.updates.install_on_exit();
                 core.shutdown();
             }

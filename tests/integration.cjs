@@ -810,13 +810,37 @@ async function testMinimizedSelectedNotifications() {
   await page.evaluate(async id => { await window.workflow.refresh(); window.workflow.selectSession(id, true); setMode("focus"); }, s.id);
   const run = await api("terminal", "start", { id: s.id });
   await page.evaluate(() => window.workflow.refresh());
+  const nativeSource = `using System; using System.Runtime.InteropServices;
+    public static class NotificationWindowFixture {
+      [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+      [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int n);
+      [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+      [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h,uint m,IntPtr w,IntPtr l);
+      [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h,IntPtr p);
+      [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a,uint b,bool join);
+      [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+      public static bool Activate(IntPtr target) {
+        uint current = GetCurrentThreadId();
+        uint foreground = GetWindowThreadProcessId(GetForegroundWindow(),IntPtr.Zero);
+        uint destination = GetWindowThreadProcessId(target,IntPtr.Zero);
+        if (destination == 0) return false;
+        bool joinedForeground = foreground != 0 && foreground != current && AttachThreadInput(current,foreground,true);
+        bool joinedDestination = destination != current && destination != foreground && AttachThreadInput(current,destination,true);
+        try { ShowWindow(target,9); return SetForegroundWindow(target); }
+        finally {
+          if (joinedDestination) AttachThreadInput(current,destination,false);
+          if (joinedForeground) AttachThreadInput(current,foreground,false);
+        }
+      }
+    }`;
   const nativeWindow = (operation, handle = 0) => cp.execFileSync("powershell", ["-NoProfile", "-Command",
-    'Add-Type -TypeDefinition \'using System; using System.Runtime.InteropServices; public static class NotificationWindowFixture { [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int n); [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h,uint m,IntPtr w,IntPtr l); }\'; '
+    "Add-Type -TypeDefinition '" + nativeSource + "'; "
       + (operation === "handle" ? '(Get-Process -Id ' + child.pid + ').MainWindowHandle.ToInt64()'
+        : operation === "external" ? '(Get-Process -Name msedge | Where-Object { $_.MainWindowTitle.StartsWith(\'' + externalTitle + '\') } | Select-Object -First 1).MainWindowHandle.ToInt64()'
         : operation === "foreground" ? '[NotificationWindowFixture]::GetForegroundWindow().ToInt64()'
         : operation === "minimize" ? '[NotificationWindowFixture]::ShowWindow([IntPtr]' + handle + ',6) | Out-Null'
         : operation === "close" ? '[NotificationWindowFixture]::PostMessageW([IntPtr]' + handle + ',16,[IntPtr]::Zero,[IntPtr]::Zero) | Out-Null'
-        : '[NotificationWindowFixture]::ShowWindow([IntPtr]' + handle + ',9) | Out-Null; [NotificationWindowFixture]::SetForegroundWindow([IntPtr]' + handle + ') | Out-Null')
+        : '[NotificationWindowFixture]::Activate([IntPtr]' + handle + ') | Out-Null')
   ], { windowsHide: true, encoding: "utf8", stdio: "pipe" }).trim();
   const mainHandle = nativeWindow("handle");
   assert(Number(mainHandle) > 0);
@@ -828,10 +852,23 @@ async function testMinimizedSelectedNotifications() {
   for (const [domain, action] of [["app", "state"], ["terminal", "start"], ["files", "list"], ["teams", "send"]]) {
     await assert.rejects(popupPage.evaluate(({ domain, action }) => window.__TAURI__.core.invoke("dispatch", { domain, action, args: {} }), { domain, action }), /erişemez/);
   }
+  const externalTitle = "Workflow notification focus fixture " + randomBytes(6).toString("hex");
   const externalBrowser = await playwright.chromium.launch({ channel: "msedge", headless: false, args: ["--no-first-run", "--no-default-browser-check"] });
   try {
     const external = await externalBrowser.newPage();
-    await external.setContent("<!doctype html><title>Workflow notification focus fixture</title><h1>Notification focus fixture</h1>");
+    await external.setContent("<!doctype html><title>" + externalTitle + "</title><h1>Notification focus fixture</h1>");
+    const externalHandle = await until(() => {
+      const handle = nativeWindow("external");
+      return Number(handle) > 0 && handle;
+    }, "native external notification test window");
+    const followExternal = async () => {
+      await external.bringToFront();
+      // Activating a CDP tab does not guarantee native foreground activation.
+      // Verify the actual separate test window before checking focus stealing.
+      nativeWindow("restore", externalHandle);
+      await until(() => nativeWindow("foreground") === externalHandle,
+        "native external window has foreground focus");
+    };
     const send = text => api("terminal", "write", { id: s.id, runId: run.runId, data: text + "\r" });
     const entries = async () => (await api("notifications", "read")).entries;
     const waitPopup = async kind => {
@@ -851,7 +888,7 @@ async function testMinimizedSelectedNotifications() {
     const stale = await page.evaluate(() => ({ sessionId: focusId, focused: true, contextToken: notificationContextToken, contextRevision: ++notificationContextRevision, language: uiLanguage }));
     await send("short");
     nativeWindow("minimize", mainHandle);
-    await external.bringToFront();
+    await followExternal();
     const externalFocus = nativeWindow("foreground");
     assert.notEqual(externalFocus, mainHandle);
     const completed = await waitPopup("completed");
@@ -871,7 +908,7 @@ async function testMinimizedSelectedNotifications() {
     for (const kind of ["approval", "question"]) {
       await send(kind);
       nativeWindow("minimize", mainHandle);
-      await external.bringToFront();
+      await followExternal();
       const foregroundBefore = nativeWindow("foreground");
       const pending = await waitPopup(kind);
       assert.equal(nativeWindow("foreground"), foregroundBefore);

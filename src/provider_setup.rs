@@ -5,11 +5,14 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::{
-    path::{Path, PathBuf},
-    process::Command,
+    path::PathBuf,
 };
+#[cfg(not(target_os = "macos"))]
+use std::{path::Path, process::Command};
 
+#[cfg(not(target_os = "macos"))]
 const WINGET: &str = "winget install --exact --source winget --id ";
+#[cfg(not(target_os = "macos"))]
 const WINGET_FLAGS: [&str; 3] = [
     "--disable-interactivity",
     "--accept-source-agreements",
@@ -17,7 +20,7 @@ const WINGET_FLAGS: [&str; 3] = [
 ];
 
 fn npm_for_install() -> Option<PathBuf> {
-    if !cfg!(windows) {
+    if !cfg!(any(windows, target_os = "macos")) {
         return None;
     }
     let npm = terminal::executable("npm", None).filter(|path| path.is_absolute())?;
@@ -44,6 +47,7 @@ fn npm_for_install() -> Option<PathBuf> {
         .then_some(npm)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn npm_command(npm: &Path, arguments: &str) -> Option<Command> {
     let powershell = PathBuf::from(std::env::var_os("SystemRoot")?)
         .join("System32/WindowsPowerShell/v1.0/powershell.exe");
@@ -118,13 +122,22 @@ pub(crate) fn npm_prefix() -> Option<PathBuf> {
     (lines.next().is_none() && prefix.is_absolute()).then_some(prefix)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn winget_option(package: &str, available: bool) -> Value {
     json!({"id":"winget","command":format!("{WINGET}{package} {}", WINGET_FLAGS.join(" ")),"available":available})
 }
 
 pub fn options() -> Value {
+    #[cfg(not(target_os = "macos"))]
     let winget = cfg!(windows) && terminal::executable("winget", None).is_some();
     let npm = npm_for_install().is_some();
+    #[cfg(target_os = "macos")]
+    return json!({
+        "codex":[{"id":"npm","command":"npm install --global --prefix ~/.local @openai/codex","available":npm}],
+        "claude":[{"id":"npm","command":"npm install --global --prefix ~/.local @anthropic-ai/claude-code","available":npm}],
+        "copilot":[{"id":"npm","command":"npm install --global --prefix ~/.local @github/copilot","available":npm}]
+    });
+    #[cfg(not(target_os = "macos"))]
     json!({
         "codex": [
             {"id":"npm","command":"npm.cmd install -g @openai/codex","available":npm},
@@ -141,9 +154,22 @@ pub fn options() -> Value {
 pub fn install(core: &Core, args: &Value) -> Result<Value> {
     let provider = string(args, "provider")?;
     let method = string(args, "method")?;
-    if !cfg!(windows) || args["confirmed"] != true {
+    if !cfg!(any(windows, target_os = "macos")) || args["confirmed"] != true {
         bail!("Kurulum komutunu önce onayla.");
     }
+    #[cfg(target_os = "macos")]
+    {
+        if method != "npm" { bail!("Kurulum yöntemi geçersiz."); }
+        let package = match provider {
+            "codex" => "@openai/codex", "claude" => "@anthropic-ai/claude-code", "copilot" => "@github/copilot",
+            _ => bail!("Sağlayıcı desteklenmiyor."),
+        };
+        let _guard = core.operations.lock().unwrap();
+        crate::platform::macos::install_provider(&npm_for_install().context("npm ve Node.js 22+ gerekli.")?,package)?;
+        return Ok(json!(true));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
     let _guard = core.operations.lock().unwrap();
     let output = match (provider, method) {
         ("codex" | "copilot", "npm") => {
@@ -179,4 +205,5 @@ pub fn install(core: &Core, args: &Value) -> Result<Value> {
         bail!("Kurulum tamamlanamadı ({0}).", output.status);
     }
     Ok(json!(true))
+    }
 }

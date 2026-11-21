@@ -2,6 +2,8 @@
 
 Workflow is a Windows desktop workspace for Codex, Claude Code, and GitHub Copilot CLI. Arrange their terminals on a map, draw links that grant specific access, and follow the work from a conversation to a browser check and a code review.
 
+An Apple Silicon macOS candidate is being developed in the same codebase. See the [macOS development and acceptance guide](docs/macos.md) for local builds and the checks required before distribution. Published Windows downloads and updates remain separate from local Mac candidates.
+
 Start with one session and add more as needed. This example uses five.
 
 ![Example workflow for an issue status filter. Implementation reads Requirements and requests work from API Review, Browser QA, and Release Notes. API Review has a separate link to read Implementation files.](docs/images/issue-filter-example.svg)
@@ -157,6 +159,8 @@ cargo test --locked
 ```
 
 The packaging script produces `dist/Workflow-Windows-x64.zip` and a SHA-256 checksum. The integration suite in `tests/integration.cjs` uses Playwright Core and a temporary data profile to exercise Windows terminals, Git, browser actions, previews, and shutdown. Set `WORKFLOW_TEST_EXE` to the executable to test and `WORKFLOW_PLAYWRIGHT` to the Playwright Core module path if installed outside the repository.
+
+For Apple Silicon builds, use the [macOS guide](docs/macos.md). Platform modules share the session, conversation, permission, and Git behavior; a Mac test result does not replace Windows acceptance testing.
 
 ### Publish an update
 

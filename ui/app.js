@@ -1074,8 +1074,9 @@ async function scanProviders() {
 const terminalLocations = new Map();
 
 function shortTerminalPath(directory, projectDirectory) {
-  const separator = directory.includes("\\") ? "\\" : "/";
-  const normalize = value => (value || "").replaceAll("\\", "/").replace(/\/+$/, "");
+  const windows = /^[a-z]:|^\\\\/i.test(directory);
+  const separator = windows ? "\\" : "/";
+  const normalize = value => (windows ? (value || "").replaceAll("\\", "/") : value || "").replace(/\/+$/, "");
   const full = normalize(directory);
   const source = normalize(projectDirectory);
   if (/^[a-z]:$/i.test(full) || !full) return directory;
@@ -1204,6 +1205,7 @@ function renderCards() {
   requestAnimationFrame(fitTerminals);
 }
 function terminalClipboard(term, host, writableRun, onInput, sessionId) {
+  const mac = typeof navigator !== "undefined" && /Mac/.test(navigator.platform);
   let inputQueue = Promise.resolve(), pasting = false, pastedInput;
   let inputGeneration = 0, pendingInput = 0;
   const enqueue = (action, affectsDraft = true) => {
@@ -1254,8 +1256,8 @@ function terminalClipboard(term, host, writableRun, onInput, sessionId) {
         await discardScreenshot(sessionId, attachment);
         return;
       }
-      let text = attachment ? " " + imagePrompt([attachment], session(sessionId)?.provider) + " " : payload;
-      if (!text) throw Error(tr("Windows panosundan yapıştırılabilir metin alınamadı."));
+      let text = attachment ? " " + imagePrompt(attachment.attachments || [attachment], session(sessionId)?.provider) + " " : payload;
+      if (!text) throw Error(tr(mac ? "Panodan yapıştırılabilir metin alınamadı." : "Windows panosundan yapıştırılabilir metin alınamadı."));
       if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(text)) {
         inputGeneration++;
         throw Error(tr("Pano metninde terminal denetim karakterleri var. Metni temizleyip tekrar dene."));
@@ -1291,7 +1293,7 @@ function terminalClipboard(term, host, writableRun, onInput, sessionId) {
     const key = e.key.toLowerCase();
     const modifier = (e.ctrlKey || e.metaKey) && !e.altKey;
     const copyKey = modifier &&
-      ((key === "c" && (e.shiftKey || term.hasSelection())) ||
+      ((key === "c" && (e.metaKey || e.shiftKey || term.hasSelection())) ||
        (key === "insert" && !e.shiftKey));
     const pasteKey = (modifier && key === "v") ||
       (key === "insert" && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey);
@@ -1322,8 +1324,8 @@ function terminalClipboard(term, host, writableRun, onInput, sessionId) {
     menu.append(b);
     return b;
   };
-  const copyButton = item(tr("Kopyala"), "Ctrl+Shift+C", copy);
-  const pasteButton = item(tr("Yapıştır"), "Ctrl+V", paste);
+  const copyButton = item(tr("Kopyala"), mac ? "Cmd+C" : "Ctrl+Shift+C", copy);
+  const pasteButton = item(tr("Yapıştır"), mac ? "Cmd+V" : "Ctrl+V", paste);
   const imageButton = sessionId && item(tr("Dosya ekle…"), "", async () => {
     const run = writableRun();
     if (!run) return;
@@ -1503,6 +1505,7 @@ function createCard(s, index) {
     busy: false,
     activityText: "",
     activityTimer: null,
+    nativeActivity: null,
     agentBadge,
     childAgents: new Set(),
     observedModel: null,
@@ -1630,30 +1633,23 @@ function terminalPacket(p) {
     .decode(decode(p.data))
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
   v.activityText = (v.activityText + text).slice(-6000);
+  v.nativeActivity = null;
   detectActivity(p.id, v);
 }
 function detectActivity(id, v) {
-  clearTimeout(v.activityTimer);
   const text = v.activityText.slice(-2200);
+  const current = v.nativeActivity;
   let s;
-  if (
-    /allow.*(session|tool)|permission|approve|izin|Do you want to proceed/i.test(
-      text.slice(-1200),
-    )
-  )
-    s = { key: "permission", label: tr("İzin bekliyor") };
-  else if (
-    /Working \(|Thinking|esc to interrupt|ctrl.c to interrupt|Running…/i.test(
-      text.slice(-1200),
-    )
-  )
-    s = { key: "working", label: tr("Çalışıyor") };
-  else if (/Worked for|Ready >|Ask Codex|How can I help|❯/i.test(text))
+  if (current?.promptKind === "approval" || current?.promptKind === "question")
+    s = { key: "permission", label: tr(current.promptKind === "question" ? "Yanıt bekliyor" : "İzin bekliyor") };
+  else if (current?.ready)
     s = { key: "completed", label: tr("Tamamlandı") };
+  else if (/Working \(|Thinking|esc to interrupt|ctrl.c to interrupt|Running…/i.test(text.slice(-1200)))
+    s = { key: "working", label: tr("Çalışıyor") };
   else s = { key: "running", label: tr("Açık") };
   const old = activity.get(id);
   activity.set(id, s);
-  if (s.key !== old?.key) {
+  if (s.key !== old?.key || s.label !== old?.label) {
     if (session(id)?.projectId === projectId) {
       renderSessionList();
       renderSessionTabs();
@@ -1661,12 +1657,37 @@ function detectActivity(id, v) {
     const view = views.get(id);
     if (view) view.state.replaceWith((view.state = stateBadge(id)));
   }
+}
+// Sample the shared live-screen parser after xterm has parsed a burst. History
+// words such as /permissions never establish a pending approval on their own.
+function scheduleTerminalActivity(id, v) {
+  if (v.activityTimer != null || !v.runId || !active(id) || views.get(id) !== v) return;
   v.activityTimer = setTimeout(() => {
-    if (active(id) && activity.get(id)?.key === "working" && !v.inputDraft) {
+    v.activityTimer = null;
+    readTerminalActivity(id, v).catch(() => {});
+  }, 80);
+}
+async function readTerminalActivity(id, v) {
+  if (v.activityReading) { v.activityAgain = true; return; }
+  const runId = v.runId, seq = v.seq;
+  if (!runId || !active(id) || views.get(id) !== v) return;
+  v.activityReading = true;
+  try {
+    const current = await api("terminal", "activity", { id, runId });
+    if (v.runId !== runId || current.runId !== runId || current.exited || !active(id) || views.get(id) !== v) return;
+    if (v.seq !== seq) { v.activityAgain = true; return; }
+    v.nativeActivity = current;
+    detectActivity(id, v);
+  } finally {
+    v.activityReading = false;
+    if (v.activityAgain) {
+      v.activityAgain = false;
+      scheduleTerminalActivity(id, v);
     }
-  }, 3000);
+  }
 }
 function observeTerminal(id, v) {
+  scheduleTerminalActivity(id, v);
   const b = v.term.buffer.active;
   const rows = [];
   for (let i = Math.max(0, b.length - 10); i < b.length; i++)
@@ -3091,7 +3112,7 @@ function reviewAddonInstall(addon) {
   for (const file of addon.files) list.append(el("li", "", file));
   box.append(list);
   if (addon.command) {
-    box.append(el("p", "help", tr("Kurulum, özeti doğrulanan Windows programını geçici çalışma alanında çalıştırır.")));
+    box.append(el("p", "help", tr(/Mac/.test(navigator.platform) ? "Kurulum, özeti doğrulanan Mac programını geçici çalışma alanında çalıştırır." : "Kurulum, özeti doğrulanan Windows programını geçici çalışma alanında çalıştırır.")));
     box.append(el("code", "", addon.command));
   } else {
     box.append(el("p", "help", tr("Kurulum yalnızca doğrulanmış beceri belgelerini indirir.")));
@@ -4774,7 +4795,7 @@ function previewSettings(s, message = "", output = "") {
     el(
       "p",
       "form-note",
-      tr("Komut bu oturumun çalışma alanında PowerShell ile çalışır. Adres ve port, komutun açtığı yerel sunucuyla aynı olmalı."),
+      tr(/Mac/.test(navigator.platform) ? "Komut bu oturumun çalışma alanında zsh ile çalışır. Adres ve port, komutun açtığı yerel sunucuyla aynı olmalı." : "Komut bu oturumun çalışma alanında PowerShell ile çalışır. Adres ve port, komutun açtığı yerel sunucuyla aynı olmalı."),
     ),
     field(tr("Önizleme komutu"), command),
     field(tr("Yerel adres"), address),

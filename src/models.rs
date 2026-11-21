@@ -237,6 +237,8 @@ pub fn configured(provider: &str, profile: &Profile) -> Option<String> {
 }
 pub(crate) struct Rpc {
     child: Child,
+    #[cfg(target_os = "macos")]
+    group: crate::platform::macos::process::Group,
     input: ChildStdin,
     rx: mpsc::Receiver<Value>,
     next: u64,
@@ -244,6 +246,8 @@ pub(crate) struct Rpc {
 }
 impl Drop for Rpc {
     fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        self.group.stop();
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -316,12 +320,21 @@ impl Rpc {
             }
         }
         profile.apply(&mut c);
+        #[cfg(target_os = "macos")]
+        c.env("PATH", crate::platform::macos::child_path(exe)?);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             c.creation_flags(0x08000000);
         }
+        #[cfg(target_os = "macos")]
+        crate::platform::macos::process::configure(&mut c);
         let mut child = c.spawn()?;
+        #[cfg(target_os = "macos")]
+        let group = match crate::platform::macos::process::Group::new(child.id(), false) {
+            Ok(group) => group,
+            Err(error) => { let _ = child.kill(); let _ = child.wait(); return Err(error); }
+        };
         let input = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let framing = if provider == "copilot" {
@@ -375,6 +388,8 @@ impl Rpc {
         });
         Ok(Self {
             child,
+            #[cfg(target_os = "macos")]
+            group,
             input,
             rx,
             next: 0,

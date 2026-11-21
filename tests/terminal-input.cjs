@@ -21,10 +21,11 @@ function fixture() {
     paste(text) { pastes.push(text); onData("paste:" + text); },
     scrollPages() {},
   };
-  const state = { text: "clipboard text", read: null, write: null };
-  const hasPendingInput = vm.runInNewContext(handler + "; terminalClipboard(term, host, writableRun, onInput)", {
+  const state = { text: "clipboard text", read: null, write: null, discarded: 0 };
+  const { hasPendingInput } = vm.runInNewContext(handler + "; terminalClipboard(term, host, writableRun, onInput)", {
     term, host, writableRun: () => run,
     confirmTerminalPaste: () => state.confirm?.() ?? true,
+    discardScreenshot: async () => { state.discarded++; },
     onInput: data => { sent.push(data); return state.write?.(); },
     el: node, button: node, tr: value => value, error: e => errors.push(typeof e === "string" ? e : e.message),
     api: async (domain, action, args) => {
@@ -105,6 +106,7 @@ test("pending paste and queued input are discarded when provider run changes", a
   f.key("v", {ctrlKey:true}); f.data("\r");
   await tick(); f.run("run-2"); resolveRead("stale draft"); await tick();
   assert.deepEqual(f.pastes, []); assert.deepEqual(f.sent, []);
+  assert.equal(f.state.discarded,1); assert.deepEqual(f.errors,[]);
   f.data("new input"); await tick(); assert.deepEqual(f.sent, ["new input"]);
 });
 test("stopped and detached terminals never receive paste", async () => {

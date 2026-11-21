@@ -10,11 +10,21 @@ use std::{
 };
 
 const OPENSPEC_VERSION: &str = "2.0.0";
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 const OPENSPEC_ASSET: &str =
     "https://github.com/Fission-AI/OpenSpec/releases/download/v2.0.0/openspec-windows-x64.zip";
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 const OPENSPEC_ARCHIVE_HASH: &str =
     "4f50ca6765d7b7c214519558bf71635cc837f789155a42b21f73bbb6e11cb36b";
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 const OPENSPEC_EXE_HASH: &str = "ba45c5da8a4b0fadfbe6874d5b5fbe41a625f2b9f9b6b15d0490e99237c688ce";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const OPENSPEC_ASSET: &str = "https://github.com/Fission-AI/OpenSpec/releases/download/v2.0.0/openspec-darwin-arm64.tar.gz";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const OPENSPEC_ARCHIVE_HASH: &str = "cf1583baacb84711c18d58ea143928e4ed1701936e67ebda735200109f084af6";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const OPENSPEC_EXE_HASH: &str = "e79f7ecc7525c503b12f83ed587c71e276287fe7e64d8add6f2fa2d7b0896375";
+const OPENSPEC_EXE: &str = if cfg!(target_os = "macos") {"openspec"} else {"openspec.exe"};
 const PONYTAIL_VERSION: &str = "5.3.3";
 const PONYTAIL_COMMIT: &str = "7801d061243d7b753bad0e0b3c057cd250b11755";
 const SKILL_LIMIT: u64 = 2 * 1024 * 1024;
@@ -92,7 +102,7 @@ const ADDONS: &[Addon] = &[
         revision: OPENSPEC_ARCHIVE_HASH,
         source: "https://github.com/Fission-AI/OpenSpec/releases/tag/v2.0.0",
         skills: OPENSPEC_SKILLS,
-        command: Some("openspec.exe init --tools agents --profile core --no-animation"),
+        command: Some(if cfg!(target_os = "macos") {"openspec init --tools agents --profile core --no-animation"} else {"openspec.exe init --tools agents --profile core --no-animation"}),
     },
     Addon {
         id: "ponytail",
@@ -164,7 +174,7 @@ fn installed_root(root: &Path, addon: &Addon) -> Result<PathBuf> {
 pub(crate) fn openspec_directory(core: &Core) -> Result<PathBuf> {
     let addon = catalog("openspec")?;
     let root = installed_root(&safe_path(&core.directory, "addons/openspec")?, addon)?;
-    verified_bytes(&root, "openspec.exe", OPENSPEC_EXE_HASH, EXE_LIMIT)?;
+    verified_bytes(&root, OPENSPEC_EXE, OPENSPEC_EXE_HASH, EXE_LIMIT)?;
     Ok(root)
 }
 
@@ -231,6 +241,7 @@ fn download(
     Ok(bytes)
 }
 
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 fn capture(mut command: std::process::Command, cwd: &Path) -> Result<()> {
     use std::process::Stdio;
     command
@@ -256,6 +267,15 @@ fn prepare_distribution(root: &Path, addon: &Addon) -> Result<()> {
         .timeout(Duration::from_secs(60))
         .build()?;
     if addon.id == "openspec" {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let archive = root.join("openspec.tar.gz");
+            fs::write(&archive,download(&client,OPENSPEC_ASSET,OPENSPEC_ARCHIVE_HASH,64*1024*1024)?)?;
+            crate::platform::macos::prepare_openspec(root,&archive,OPENSPEC_EXE_HASH)?;
+            fs::remove_file(archive)?;
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
         if !cfg!(all(windows, target_arch = "x86_64")) {
             bail!("OpenSpec paketi Windows x64 gerektirir")
         }
@@ -299,6 +319,7 @@ fn prepare_distribution(root: &Path, addon: &Addon) -> Result<()> {
             .env("APPDATA", &config)
             .env("LOCALAPPDATA", &config);
         capture(exe, &template)?;
+        }
     }
     for (name, digest) in addon.skills {
         let relative = skill_file(name);

@@ -106,6 +106,7 @@ async fn window(core: &Core) -> Result<WebviewWindow> {
     if let Some(window) = core.app.get_webview_window(WINDOW) {
         return Ok(window);
     }
+    #[cfg(windows)]
     let main = core
         .app
         .get_webview_window("main")
@@ -113,7 +114,6 @@ async fn window(core: &Core) -> Result<WebviewWindow> {
     let window =
         WebviewWindowBuilder::new(&core.app, WINDOW, WebviewUrl::External(Url::parse(HOME)?))
             .title("Workflow · Microsoft Teams")
-            .owner(&main)?
             .inner_size(1050., 760.)
             .min_inner_size(600., 500.)
             .center()
@@ -121,8 +121,16 @@ async fn window(core: &Core) -> Result<WebviewWindow> {
             .skip_taskbar(true)
             .data_directory(profile(core))
             .on_navigation(|url| url.scheme() == "https" || url.as_str() == "about:blank")
-            .on_new_window(|_, _| NewWindowResponse::Deny)
-            .build()?;
+            .on_new_window(|_, _| NewWindowResponse::Deny);
+    #[cfg(windows)]
+    let window = window.owner(&main)?;
+    #[cfg(target_os = "macos")]
+    let window = window.data_store_identifier(crate::platform::macos::data_store(&core.directory,"teams"))
+        .background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled);
+    let window = window.build()?;
+    #[cfg(target_os = "macos")]
+    crate::platform::macos::own_window_state(&window)?;
+    #[cfg(windows)]
     if let Err(error) = keep_in_webview(&window).await {
         let _ = window.destroy();
         return Err(error);
@@ -139,6 +147,7 @@ async fn window(core: &Core) -> Result<WebviewWindow> {
     Ok(window)
 }
 
+#[cfg(windows)]
 async fn keep_in_webview(window: &WebviewWindow) -> Result<()> {
     use webview2_com::{
         LaunchingExternalUriSchemeEventHandler, Microsoft::Web::WebView2::Win32::ICoreWebView2_18,
@@ -262,6 +271,7 @@ async fn send(window: &WebviewWindow, teams: &Teams, target: Target, text: &str)
         send_in_background(window, target, text, &mut focus_enabled),
     )
     .await;
+    #[cfg(windows)]
     if focus_enabled {
         let _ = tokio::time::timeout(
             Duration::from_secs(2),
@@ -333,6 +343,8 @@ async fn send_in_background(
         }
     }
 
+    #[cfg(windows)]
+    {
     *focus_enabled = true;
     webview_cdp(
         window.as_ref(),
@@ -340,6 +352,9 @@ async fn send_in_background(
         json!({"enabled": true}),
     )
     .await?;
+    }
+    #[cfg(target_os = "macos")]
+    let _ = focus_enabled;
     compose_and_submit(window, json!({"id": target.id, "text": text}))
         .await
         .context(VERIFY_ERROR)
