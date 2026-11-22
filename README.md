@@ -1,8 +1,13 @@
 # Workflow
 
-Workflow is a Windows desktop workspace for Codex, Claude Code, and GitHub Copilot CLI. Arrange their terminals on a map, draw links that grant specific access, and follow the work from a conversation to a browser check and a code review.
+[![Latest release](https://img.shields.io/github/v/release/buildwithailab/workflow?sort=semver&label=release)](https://github.com/buildwithailab/workflow/releases)
+[![Windows x64](https://img.shields.io/badge/Windows-x64-0078D4)](#quick-start)
+[![macOS 14+ on Apple Silicon](https://img.shields.io/badge/macOS-14%2B%20%7C%20Apple%20Silicon-000000)](docs/macos.md)
+[![MIT License](https://img.shields.io/github/license/buildwithailab/workflow)](LICENSE)
 
-An Apple Silicon macOS candidate is being developed in the same codebase. See the [macOS development and acceptance guide](docs/macos.md) for local builds and the checks required before distribution. Published Windows downloads and updates remain separate from local Mac candidates.
+Workflow is a desktop workspace for Codex, Claude Code, and GitHub Copilot CLI. Arrange their terminals on a map, draw links that grant specific access, and follow the work from a conversation to a browser check and a code review.
+
+Windows x64 and Apple Silicon macOS downloads are available on the [Releases page](https://github.com/buildwithailab/workflow/releases). See the [macOS guide](docs/macos.md) for platform requirements, local builds, and update behavior.
 
 Start with one session and add more as needed. This example uses five.
 
@@ -125,6 +130,8 @@ Open the **Add-on library** beside **Projects** and install a package. In **New 
 4. Add a project folder or clone a repository, then start a session. The interface language is available in **Settings**.
 
 **Requirements:** Windows 10 or 11 (x64), Microsoft Edge WebView2 Runtime, and the CLI and account for each provider you use. Git enables Git operations, Google Chrome enables Chrome mode, and GitHub CLI enables draft pull requests. Provider CLIs and add-ons can have additional requirements. Workflow itself ships as a Rust/Tauri executable with bundled frontend assets.
+
+For Apple Silicon macOS, download the macOS `.app.zip` from [Releases](https://github.com/buildwithailab/workflow/releases), move `Workflow.app` to **Applications**, and follow that release's first-launch instructions. See the [macOS guide](docs/macos.md) for requirements and current limitations.
 
 ## Local data and session lifetime
 
