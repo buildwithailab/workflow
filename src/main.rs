@@ -26,6 +26,7 @@ mod preview;
 mod provider_setup;
 mod repository_operations;
 mod session_folders;
+mod session_usage;
 mod sharing;
 #[cfg(any(windows, target_os = "macos"))]
 mod teams;
@@ -111,6 +112,7 @@ fn route(core: &Arc<Core>, domain: &str, action: &str, args: &Value) -> Result<V
     match domain {
         "app" => app_action(core, action, args),
         "data_management" => data_management::dispatch(core, action, args),
+        "session_usage" if action == "read" => session_usage::snapshot(core,string(args,"id")?),
         "terminal" => terminal::dispatch(core, action, args),
         "provider_login" => terminal::login(core, action, args),
         "files" => files::dispatch(core, action, args),
@@ -129,6 +131,41 @@ fn route(core: &Arc<Core>, domain: &str, action: &str, args: &Value) -> Result<V
         _ => bail!("Uygulama işlemi bulunamadı"),
     }
 }
+fn validate_usage_preferences(args:&Value)->Result<()> {
+    if args.get("sessionUsageVisible").is_some_and(|value| !value.is_boolean()) {
+        bail!("Kullanım göstergesi seçimi geçersiz.");
+    }
+    if args.get("usageTokenWarning").is_some_and(|value| !value.is_null()
+        && !value.as_u64().is_some_and(|value|value>0 && value<=9_007_199_254_740_991)) {
+        bail!("Token eşiği pozitif bir tam sayı olmalı.");
+    }
+    if args.get("usageContextWarning").is_some_and(|value| !value.is_null()
+        && !value.as_f64().is_some_and(|value|value.is_finite() && value>0.0 && value<=100.0)) {
+        bail!("Bağlam eşiği 0’dan büyük, en fazla 100 olmalı.");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod usage_preference_tests {
+    use super::*;
+    #[test]
+    fn empty_defaults_and_independent_measured_thresholds_are_valid() {
+        for value in [json!({}),json!({"sessionUsageVisible":false}),json!({"usageTokenWarning":null,"usageContextWarning":null}),
+            json!({"usageTokenWarning":1}),json!({"usageTokenWarning":9_007_199_254_740_991_u64,"usageContextWarning":100}),json!({"usageContextWarning":80.5})] {
+            assert!(validate_usage_preferences(&value).is_ok());
+        }
+    }
+    #[test]
+    fn threshold_types_overflow_and_out_of_range_percentages_are_rejected() {
+        for value in [json!({"sessionUsageVisible":null}),json!({"sessionUsageVisible":"true"}),
+            json!({"usageTokenWarning":0}),json!({"usageTokenWarning":-1}),json!({"usageTokenWarning":1.5}),json!({"usageTokenWarning":"100"}),
+            json!({"usageTokenWarning":9_007_199_254_740_992_u64}),json!({"usageContextWarning":0}),json!({"usageContextWarning":-1}),
+            json!({"usageContextWarning":100.1}),json!({"usageContextWarning":"NaN"})] {
+            assert!(validate_usage_preferences(&value).is_err());
+        }
+    }
+}
 fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
     match action {
         "state" => Ok(core.snapshot()),
@@ -140,12 +177,17 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
         }
         "sharing_warnings" => Ok(serde_json::to_value(sharing::warnings(&core.root(args)?)?)?),
         "preferences" => {
+            validate_usage_preferences(args)?;
             let mut db = core.db.lock().unwrap();
+            let previous=db["preferences"].clone();
             for (k, v) in args.as_object().context("Tercih geçersiz")? {
                 db["preferences"][k] = v.clone()
             }
+            if let Err(error)=core.save_workspace(&db) {
+                db["preferences"]=previous;
+                return Err(error);
+            }
             drop(db);
-            core.save()?;
             if args.get("notificationsEnabled").is_some() {
                 notifications::sync_enabled(core);
             }

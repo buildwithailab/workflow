@@ -3170,3 +3170,27 @@ dialog::backdrop {
 .cleanup-targets { max-height: 200px; overflow: auto; padding-inline-start: 20px; }
 .cleanup-targets li { margin: 8px 0; }
 .cleanup-targets small { display: block; color: var(--muted); overflow-wrap: anywhere; }
+.session-usage-meter { display:inline-flex; align-items:center; gap:6px; padding:2px 5px; border:0; background:transparent; color:var(--muted); border-radius:5px; font-size:11px; font-variant-numeric:tabular-nums; white-space:nowrap; flex:none; }
+.session-usage-meter:hover { color:var(--text); background:var(--raised); }
+.usage-meter-track { width:42px; height:4px; border-radius:3px; background:var(--line); overflow:hidden; }
+.usage-meter-fill { display:block; width:var(--session-context-percent,0%); height:100%; border-radius:inherit; background:var(--accent); }
+.usage-warning-icon, .usage-threshold-notice { color:#dfb45b; }
+.usage-context-warning .usage-meter-fill { background:#dfb45b; }
+.usage-warning .usage-meter-label { color:#dfb45b; }
+.usage-warning-only :is(.usage-meter-track,.usage-meter-value) { display:none; }
+.usage-warning .usage-meter-label { max-width:145px; overflow:hidden; text-overflow:ellipsis; }
+.session-usage-popover { position:fixed; inset:auto; width:290px; max-width:calc(100vw - 20px); max-height:calc(100vh - 20px); overflow:auto; padding:14px; background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:10px; box-shadow:0 12px 32px #0005; font-size:12px; }
+.session-usage-popover::backdrop { background:transparent; }
+.usage-detail-head { display:flex; justify-content:space-between; gap:10px; align-items:center; margin-bottom:10px; }
+.usage-detail-row { display:flex; justify-content:space-between; gap:12px; padding-block:4px; }
+.usage-detail-row span { color:var(--muted); }
+.usage-detail-row bdi { font-variant-numeric:tabular-nums; white-space:nowrap; }
+.usage-detail-divider { border-top:1px solid var(--line); margin:10px 0; }
+.usage-detail-actions { margin-top:10px; padding-top:8px; border-top:1px solid var(--line); display:flex; justify-content:flex-end; }
+.usage-detail-actions button { padding:4px 6px; font-size:11px; }
+.session-usage-popover .help { padding:0; font-size:11px; line-height:1.5; }
+.session-usage-settings { border-top:1px solid var(--line); padding-top:14px; margin-top:8px; display:grid; gap:10px; }
+.session-usage-settings .help { padding:0; }
+.session-usage-settings > button { justify-self:start; }
+.card-footer .session-usage-meter { font-size:10px; gap:4px; }
+@media(max-width:650px) { .session-usage-meter:not(.usage-warning) .usage-meter-label { display:none; } .usage-warning .usage-meter-label { max-width:110px; } }

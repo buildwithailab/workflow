@@ -171,6 +171,15 @@ pub(crate) fn matches_bound_log(path: &Path, session: &Value, thread: &str) -> b
     metadata(path, provider).is_some_and(|entry| matches_binding(&entry, session, thread))
 }
 
+pub(crate) fn matches_open_bound_log(file:&fs::File,path:&Path,session:&Value,thread:&str)->bool {
+    let mut handle=file;
+    let Ok(position)=handle.stream_position() else {return false;};
+    if handle.seek(SeekFrom::Start(0)).is_err() {return false;}
+    let matched=read_metadata(file,path,session["provider"].as_str().unwrap_or_default())
+        .is_some_and(|entry|matches_binding(&entry,session,thread));
+    handle.seek(SeekFrom::Start(position)).is_ok() && matched
+}
+
 fn matches_binding(entry: &Value, session: &Value, thread: &str) -> bool {
     entry["id"] == thread
         && entry["cwd"].as_str().is_some_and(|cwd| {

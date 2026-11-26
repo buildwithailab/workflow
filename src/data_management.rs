@@ -158,6 +158,7 @@ pub(crate) fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<V
         "status" => snapshot(core),
         "cleanup_preview" => Ok(crate::workspace_cleanup::plan(core)?.public()),
         "clear_memory" => {
+            core.session_usage.lock().unwrap().clear();
             *core.chat_log.lock().unwrap() = crate::chat::LogCache::default();
             core.model_catalog.clear_idle();
             core.browsers.lock().unwrap().clear_trace_cache();
@@ -261,6 +262,7 @@ pub(crate) fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<V
             core.model_catalog.clear_idle();
             core.browsers.lock().unwrap().clear_trace_cache();
             core.pending.lock().unwrap().clear();
+            core.session_usage.lock().unwrap().clear();
             crate::notifications::reset_history(core);
             core.emit("workspace",core.snapshot());
             Ok(json!({"backedUp":true,"filesRemoved":delete_files}))

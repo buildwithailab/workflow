@@ -1543,7 +1543,7 @@ function createCard(s, index) {
   pathTail.append(pathValue);
   path.append(pathMode, pathTail);
   account.hidden = true;
-  foot.append(path, account, summary);
+  foot.append(path, account, newSessionUsageButton(s.id), summary);
   card.append(host, foot);
   const term = new Terminal({
       fontFamily: 'Consolas, "Cascadia Code", monospace',
@@ -2086,6 +2086,7 @@ function sessionMenu(id) {
     bind.title = tr("Konuşmayı değiştirmek için önce oturumu durdur");
   }
   return [
+    button(tr(db.preferences?.sessionUsageVisible===false ? "Kullanım göstergesini göster" : "Kullanım göstergesini gizle"),()=>saveSessionUsagePreferences({sessionUsageVisible:db.preferences?.sessionUsageVisible===false})),
     button(tr("Konuşma geçmişini oku"), () => showTranscript(id)),
     bind,
     ...(foldersFor(s.projectId).length ? [button(tr("Klasöre taşı"), () => moveSessionDialog(s))] : []),
@@ -2695,6 +2696,7 @@ $("#app-settings").onclick = () => {
   modal(tr("Ayarlar"), [
     field(tr("Arayüz dili"), language),
     notificationSettings(),
+    sessionUsageSettings(),
     button(tr("Veri yönetimi"),openDataManagement),
     button(tr("Sağlayıcı kurulumu"), () => openProviderSetup()),
     button(tr("Hakkında ve güncellemeler"), openAbout),
@@ -5735,6 +5737,7 @@ async function initialize() {
 }
 initChatControls();
 initVerificationControls();
+initSessionUsage();
 initialize().catch(error);
 setInterval(() => {
   if (document.visibilityState === "visible")

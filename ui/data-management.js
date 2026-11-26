@@ -14,6 +14,7 @@ function resetClientLayout(eraseDrafts=false) {
   for(const view of chatViews.values()) view.open=false;
   if(eraseDrafts) {
     resetVerificationViews();
+    resetSessionUsage();
     chatViews.clear();
     $("#chat-turns").replaceChildren();
     $("#chat-input").value="";

@@ -227,6 +227,7 @@
                   <select id="chat-approval" aria-label="Onay seviyesi" title="Onay seviyesi"></select>
                   <button id="chat-model" type="button" class="chat-picker-button" title="Model seç" aria-label="Model seç" aria-haspopup="true" aria-controls="chat-model-menu" aria-expanded="false"><span>Model seç</span></button>
                   <button id="chat-effort" type="button" class="chat-picker-button" title="Düşünme seviyesi" aria-label="Düşünme seviyesi" aria-haspopup="true" aria-controls="chat-model-menu" aria-expanded="false"><span>Düşünme seviyesi</span></button>
+                  <span id="chat-session-usage" hidden></span>
                   <button id="chat-show-terminal-output" type="button" class="quiet chat-output-toggle" title="Canlı Terminal çıktısını göster" aria-label="Canlı Terminal çıktısını göster" aria-expanded="false" aria-controls="chat-terminal-output" hidden><span class="session-terminal-icon" aria-hidden="true">&gt;_</span></button>
                 </div>
                 <button id="chat-bind" type="button" hidden>Konuşmayı seç</button>
@@ -535,11 +536,13 @@
     <aside id="session-notification" aria-label="Oturum bildirimi" role="status" aria-live="polite" hidden></aside>
     <script src="vendor/xterm.js"></script>
     <script src="vendor/addon-fit.js"></script>
+    <div id="session-usage-popover" class="session-usage-popover" popover role="dialog" aria-label="Bağlam ve token kullanımı"></div>
     <script src="i18n.js"></script>
     <script src="diff.js"></script>
     <script src="chat.js"></script>
     <script src="data-management.js"></script>
     <script src="verification.js"></script>
+    <script src="session-usage.js"></script>
     <script src="notifications.js"></script>
     <script src="app.js"></script>
   </body>

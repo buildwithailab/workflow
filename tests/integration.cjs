@@ -2072,6 +2072,104 @@ async function testModelSettings() {
   console.log("PASS immediate model dialog, scoped/coalesced cache, forced refresh, stale context rejection, terminal approval controls, Claude effort metadata and persistence");
 }
 
+async function testSessionUsage() {
+  const profile=path.join(temporary,'session-usage-profile'),folder=path.join(temporary,'session-usage-project');
+  fs.mkdirSync(folder);
+  await start('',profile);
+  const project=await api('app','add_project',{directory:folder}),sessions=[];
+  const writeLines=(file,events)=>{fs.mkdirSync(path.dirname(file),{recursive:true});fs.writeFileSync(file,events.map(value=>JSON.stringify(value)).join('\n')+'\n');};
+  for(const provider of ['codex','claude','copilot']) {
+    const session=await api('app','create_session',{projectId:project.id,provider,workspaceMode:'direct',tools:false});
+    const thread=require('node:crypto').randomUUID(),timestamp=new Date().toISOString();
+    const file=provider==='codex'?path.join(profile,'test-codex-home','sessions','rollout-'+thread+'.jsonl')
+      :provider==='claude'?path.join(profile,'test-claude-home','projects','synthetic',thread+'.jsonl')
+      :path.join(profile,'test-copilot-home','session-state',thread,'events.jsonl');
+    const records=provider==='codex'?[
+      {type:'session_meta',payload:{id:thread,cwd:folder,timestamp}},
+      {type:'event_msg',payload:{type:'token_count',info:{model_context_window:100,last_token_usage:{input_tokens:35,output_tokens:5,total_tokens:40},total_token_usage:{input_tokens:170,output_tokens:30,cached_input_tokens:50,total_tokens:200}}}}
+    ]:provider==='claude'?[
+      {type:'assistant',sessionId:thread,cwd:folder,timestamp,isSidechain:false,message:{id:'synthetic-message',role:'assistant',model:'synthetic-model',content:[],usage:{input_tokens:10,cache_read_input_tokens:20,cache_creation_input_tokens:10}}},
+      {type:'cost-state',sessionId:thread,modelUsage:{'synthetic-model':{inputTokens:100,cacheReadInputTokens:50,cacheCreationInputTokens:20,outputTokens:30}}}
+    ]:[
+      {type:'session.start',timestamp,data:{sessionId:thread,context:{cwd:folder}}},
+      {type:'session.usage_checkpoint',data:{accountingSnapshot:{modelMetrics:{'synthetic-model':{usage:{inputTokens:170,outputTokens:30,cacheReadTokens:50}}}}}}
+    ];
+    writeLines(file,records);
+    await api('history','bind',{id:session.id,conversationId:thread});
+    sessions.push({...session,conversationId:thread,file,records});
+    const measured=await api('session_usage','read',{id:session.id});
+    assert.equal(measured.available,true);assert.equal(measured.tokens.totalTokens,200);
+    assert.equal(measured.context.usedPercent,provider==='codex'?40:null);
+    assert.equal(measured.context.limitTokens,provider==='codex'?100:null);
+    assert.equal(measured.context.usedTokens,provider==='codex'||provider==='claude'?40:null);
+  }
+  await page.evaluate(async id=>{await window.workflow.refresh();await window.workflow.selectSession(id,true);},sessions[0].id);
+  assert.equal((await api('app','state')).active.length,0,'Reading usage never starts providers');
+  await page.locator('#app-settings').click();
+  assert.equal(await page.locator('#usage-token-warning').inputValue(),'');
+  assert.equal(await page.locator('#usage-context-warning').inputValue(),'');
+  assert(await page.locator('#session-usage-visible').isChecked());
+  await page.locator('#dialog-footer button').first().click();
+  for(const s of sessions) {
+    await page.evaluate(async id=>{await window.workflow.selectSession(id,true);await readSessionUsage(id);},s.id);
+    const terminalMeter=page.locator('.session-card[data-id="'+s.id+'"] .session-usage-meter');
+    await terminalMeter.waitFor({state:'visible'});await terminalMeter.click();
+    await page.locator('#session-usage-popover').waitFor({state:'visible'});
+    assert(await page.locator('#session-usage-popover').getByText('200',{exact:true}).isVisible());
+    assert(!await page.locator('#session-usage-popover').innerText().then(value=>value.includes('≈')));
+    await page.locator('#session-usage-popover .usage-detail-head button').click();
+    await page.locator('#session-chat-view').click();
+    const chatMeter=page.locator('#chat-session-usage .session-usage-meter');
+    await chatMeter.waitFor({state:'visible'});await chatMeter.click();
+    await page.locator('#session-usage-popover').getByRole('button',{name:'Hide indicator',exact:true}).click();
+    await until(async()=>!(await api('app','state')).preferences.sessionUsageVisible,'usage hidden preference');
+    assert(await chatMeter.isHidden());
+    await page.locator('#app-settings').click();
+    await page.locator('#session-usage-visible').check();
+    await page.locator('#usage-token-warning').fill('200');
+    await page.locator('#usage-context-warning').fill('');
+    await page.locator('#save-usage-thresholds').click();
+    await until(async()=>(await api('app','state')).preferences.usageTokenWarning===200,'saved threshold');
+    await page.locator('#dialog-footer button').first().click();
+    assert(!await chatMeter.evaluate(element=>element.classList.contains('usage-warning')),'equal threshold is not exceeded');
+    await api('app','preferences',{usageTokenWarning:199,usageContextWarning:null});
+    await page.evaluate(()=>window.workflow.refresh());
+    await until(()=>chatMeter.evaluate(element=>element.classList.contains('usage-warning')),'token warning '+s.provider);
+    assert.equal(await chatMeter.locator('.usage-meter-value').innerText(),'200','token alert never shows an unrelated percent');
+    await api('app','preferences',{sessionUsageVisible:false});await page.evaluate(()=>window.workflow.refresh());
+    assert(await chatMeter.isVisible(),'configured warning survives hiding the meter');
+    await api('app','preferences',{sessionUsageVisible:true,usageTokenWarning:null,usageContextWarning:39});
+    await page.evaluate(()=>window.workflow.refresh());
+    assert.equal(await chatMeter.evaluate(element=>element.classList.contains('usage-warning')),s.provider==='codex','missing context never produces an estimated warning');
+    await api('app','preferences',{usageContextWarning:null});await page.evaluate(()=>window.workflow.refresh());
+    await page.locator('#session-terminal-view').click();
+    const run=await api('terminal','start',{id:s.id});
+    await until(async()=>Buffer.from((await api('terminal','attach',{id:s.id,screenOnly:true})).data,'base64').toString().includes('Ready'),'usage fixture ready');
+    assert.equal((await api('session_usage','read',{id:s.id})).tokens.totalTokens,200);
+    await page.locator('#session-chat-view').click();await page.locator('#session-terminal-view').click();
+    const current=await api('app','state');assert.equal(current.active.length,1);assert.equal(current.active[0].runId,run.runId);
+    assert.equal(current.sessions.find(value=>value.id===s.id).conversationId,s.conversationId);
+    await api('terminal','write',{id:s.id,runId:run.runId,data:'synthetic-usage-check\r'});
+    await until(async()=>Buffer.from((await api('terminal','attach',{id:s.id,screenOnly:true})).data,'base64').toString().includes('Received: synthetic-usage-check'),'provider input continuity');
+    await api('terminal','stop',{id:s.id,runId:run.runId});
+    await until(async()=>(await api('app','state')).active.length===0,'usage provider stop');
+    fs.renameSync(s.file,s.file+'.held');
+    assert.equal((await api('session_usage','read',{id:s.id})).available,false,'missing journal clears measurements');
+    fs.renameSync(s.file+'.held',s.file);await api('data_management','clear_memory');
+    assert.equal((await api('session_usage','read',{id:s.id})).tokens.totalTokens,200);
+    console.log('PASS '+s.provider+' session usage, absent capacity, thresholds, hide/show, live continuity and missing-journal guard');
+  }
+  await api('app','preferences',{usageTokenWarning:12345,usageContextWarning:75.5,sessionUsageVisible:false});
+  for(const invalid of [{usageTokenWarning:-1},{usageTokenWarning:0},{usageTokenWarning:1.5},{usageContextWarning:101},{sessionUsageVisible:'true'}])
+    await assert.rejects(api('app','preferences',invalid));
+  await stop();await start('',profile);
+  const restored=await api('app','state');assert.equal(restored.active.length,0);assert.equal(restored.preferences.usageTokenWarning,12345);
+  assert.equal(restored.preferences.usageContextWarning,75.5);assert.equal(restored.preferences.sessionUsageVisible,false);
+  assert(!fs.existsSync(path.join(folder,'.git')),'usage never initializes project Git');
+  await stop();
+  console.log('PASS session usage settings persist, empty defaults, strict OR warnings, unknown values and no automatic providers; controlled fixtures only');
+}
+
 async function testDataManagement() {
   const profile=path.join(temporary,"data-management-profile"), folder=path.join(temporary,"data-management-source");
   fs.mkdirSync(folder);
@@ -2389,6 +2487,10 @@ async function test() {
     );
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  if (process.env.WORKFLOW_TEST_SESSION_USAGE_ONLY === "1") {
+    await testSessionUsage();
+    return;
+  }
   if (process.env.WORKFLOW_TEST_DATA_MANAGEMENT_ONLY === "1") {
     await testDataManagement();
     return;

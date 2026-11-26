@@ -104,6 +104,7 @@ function renderChatView() {
   if (next) $("#empty").hidden = true;
   shownChatId = next;
   renderVerificationView();
+  if(typeof scheduleSessionUsage==="function") scheduleSessionUsage();
   scheduleNotificationContext();
   if (switched) {
     clearTimeout(chatPollTimer);

@@ -1446,6 +1446,13 @@ fn chat_thread_matches(terminal: &LiveTerminal, session: &Value) -> bool {
     terminal.chat_thread.lock().unwrap().as_deref() == session["conversationId"].as_str()
 }
 
+pub(crate) fn usage_binding_matches(core:&Core,session:&Value)->bool {
+    let terminal=core.terms.lock().unwrap().get(session["id"].as_str().unwrap_or_default()).cloned();
+    let Some(terminal)=terminal else {return true;};
+    terminal.exited.load(Ordering::SeqCst) || (session["runId"]==terminal.run_id && session["provider"]==terminal.provider
+        && !terminal.input.lock().unwrap().thread_uncertain && chat_thread_matches(&terminal,session))
+}
+
 #[derive(serde::Serialize)]
 pub(crate) struct TerminalPrompt {
     kind: &'static str,
