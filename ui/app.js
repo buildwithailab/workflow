@@ -57,6 +57,7 @@ let db = {
   dialogSubmit = null,
   dialogCloseGuard = null;
 const views = new Map(),
+  sessionCards = new Map(),
   activity = new Map(),
   starting = new Set(),
   gitSelected = new Set();
@@ -438,6 +439,8 @@ function selectSession(id, center = false, tab = null) {
   selectScope(s.projectId, s.folderId);
   focusId = id;
   render();
+  const failed = views.get(id);
+  if (failed?.attachFailed) attach(failed,s).catch(error);
   if (tab) openPanel(tab).catch(error);
   else refreshPanel();
   remember();
@@ -1101,7 +1104,7 @@ function paintTerminalLocation(s, v) {
 }
 
 async function refreshTerminalLocations(force = false) {
-  const visible = visibleSessions();
+  const visible = visibleSessions().filter(s => views.has(s.id));
   const directories = new Map(visible.map(s => [s.directory, s]));
   await Promise.allSettled([...directories].map(async ([directory, s]) => {
     let entry = terminalLocations.get(directory);
@@ -1124,22 +1127,108 @@ async function refreshTerminalLocations(force = false) {
   }));
 }
 
+const MAX_TERMINAL_VIEWS = 8;
+let terminalRenderTimer;
+function terminalCardBox(s, index) {
+  return { x: s.position?.x ?? 40 + (index % 2) * 780,
+    y: s.position?.y ?? 50 + Math.floor(index / 2) * 580,
+    width: s.size?.width || 720, height: s.size?.height || 500 };
+}
+
+function terminalMountPlan(sessions, selected, kind, position, viewport, rectangles, chatOpen = false) {
+  const chosen = sessions.find(s => s.id === selected) || sessions[0];
+  if (!chosen) return new Set();
+  if (kind === "focus" || chatOpen) return new Set([chosen.id]);
+  const ranked = sessions.map((s, index) => {
+    const box = terminalCardBox(s, index);
+    const rect = kind === "map" ? { x: position.x + box.x * position.z, y: position.y + box.y * position.z,
+      width: box.width * position.z, height: box.height * position.z } : rectangles.get(s.id);
+    if (!rect) return { id: s.id, distance: index + 1, visible: index < MAX_TERMINAL_VIEWS };
+    const visible = rect.x + rect.width >= -150 && rect.x <= viewport.width + 150
+      && rect.y + rect.height >= -150 && rect.y <= viewport.height + 150;
+    return { id: s.id, visible, distance: Math.hypot(rect.x + rect.width / 2 - viewport.width / 2,
+      rect.y + rect.height / 2 - viewport.height / 2) };
+  }).filter(row => row.visible && row.id !== chosen.id).sort((a, b) => a.distance - b.distance);
+  return new Set([chosen.id, ...ranked.slice(0, MAX_TERMINAL_VIEWS - 1).map(row => row.id)]);
+}
+
+function disposeTerminalView(id, keepCard = false) {
+  const v = views.get(id);
+  if (!v) return;
+  if (v.subscription && v.runId) api("terminal", "detach", { id, runId: v.runId, subscription: v.subscription }).catch(() => {});
+  v.attachGeneration = (v.attachGeneration || 0) + 1;
+  v.queue.length = 0;
+  v.queuedBytes = 0;
+  clearTimeout(v.activityTimer);
+  clearTimeout(v.resizeTimer);
+  v.observer.disconnect();
+  v.term.dispose();
+  if (!keepCard) v.card.remove();
+  views.delete(id);
+}
+
+function createDeferredCard(s) {
+  const card = el("article", "session-card deferred-terminal");
+  card.dataset.id = s.id;
+  const head = el("header", "card-header");
+  head.append(el("span", "provider-icon " + s.provider, icons[s.provider]),
+    el("strong", "deferred-name", s.name));
+  const state = el("span", "deferred-state");
+  state.append(stateBadge(s.id));
+  head.append(state);
+  const content = el("div", "deferred-terminal-content");
+  content.append(el("p", "help", tr("Terminal görünümü gerektiğinde yüklenir.")),
+    button(tr("Oturumu göster"), () => selectSession(s.id, true)));
+  card.append(head, content);
+  return card;
+}
+
+function scheduleTerminalRendering() {
+  clearTimeout(terminalRenderTimer);
+  terminalRenderTimer = setTimeout(renderCards, 70);
+}
+
 function renderCards() {
-  const ids = new Set(visibleSessions().map((s) => s.id));
-  for (const [id, v] of views) {
-    if (!db.sessions.some((s) => s.id === id && !s.archived)) {
-      v.observer.disconnect();
-      v.term.dispose();
-      v.card.remove();
-      views.delete(id);
-    } else v.card.hidden = !ids.has(id);
+  const sessions = visibleSessions();
+  const ids = new Set(sessions.map(s => s.id));
+  const viewport = $("#viewport").getBoundingClientRect();
+  const rectangles = new Map((mode === "grid" ? [...sessionCards] : []).map(([id, card]) => {
+    const r = card.getBoundingClientRect();
+    return [id, { x: r.x - viewport.x, y: r.y - viewport.y, width: r.width, height: r.height }];
+  }));
+  const mounted = terminalMountPlan(sessions, focusId, mode, camera, viewport, rectangles, !!chatViews.get(focusId)?.open);
+  for (const [id, card] of sessionCards) {
+    if (!ids.has(id)) {
+      disposeTerminalView(id);
+      card.remove();
+      sessionCards.delete(id);
+    }
   }
-  visibleSessions().forEach((s, index) => {
+  let addedShell = false;
+  sessions.forEach((s, index) => {
     let v = views.get(s.id);
+    let previous = sessionCards.get(s.id);
+    if (!mounted.has(s.id)) {
+      if (v || !previous) {
+        const deferred = createDeferredCard(s);
+        if (previous) previous.replaceWith(deferred); else $("#cards").append(deferred);
+        disposeTerminalView(s.id, true);
+        sessionCards.set(s.id, deferred);
+        previous = deferred;
+        addedShell = true;
+      }
+      previous.classList.toggle("focused", s.id === focusId);
+      previous.querySelector(".deferred-name").textContent = s.name;
+      previous.querySelector(".deferred-state").replaceChildren(stateBadge(s.id));
+      const box = terminalCardBox(s, index);
+      Object.assign(previous.style, { left: box.x + "px", top: box.y + "px", width: box.width + "px", height: box.height + "px" });
+      return;
+    }
     if (!v) {
       v = createCard(s, index);
       views.set(s.id, v);
-      $("#cards").append(v.card);
+      sessionCards.set(s.id, v.card);
+      if (previous) previous.replaceWith(v.card); else $("#cards").append(v.card);
       attach(v, s).catch(error);
     }
     v.card.hidden = false;
@@ -1203,6 +1292,7 @@ function renderCards() {
   drawEdges();
   refreshTerminalLocations().catch(() => {});
   requestAnimationFrame(fitTerminals);
+  if (addedShell && mode === "grid") scheduleTerminalRendering();
 }
 function terminalClipboard(term, host, writableRun, onInput, sessionId) {
   const mac = typeof navigator !== "undefined" && /Mac/.test(navigator.platform);
@@ -1460,7 +1550,7 @@ function createCard(s, index) {
       fontSize: 13,
       lineHeight: 1.15,
       cursorBlink: true,
-      scrollback: 20000,
+      scrollback: 2000,
       allowProposedApi: false,
       theme: {
         background: "#0c1015",
@@ -1500,6 +1590,11 @@ function createCard(s, index) {
     ready: false,
     replaying: true,
     queue: [],
+    queuedBytes: 0,
+    outputBusy: false,
+    needsSnapshot: false,
+    attachGeneration: 0,
+    subscription: null,
     hasOutput: false,
     inputDraft: "",
     busy: false,
@@ -1592,45 +1687,173 @@ function createCard(s, index) {
   title.ondblclick = () => selectSession(s.id, true);
   return v;
 }
-async function attach(v, s) {
+const TERMINAL_QUEUE_LIMIT = 768 * 1024;
+const TERMINAL_WRITE_CHUNK = 16 * 1024;
+const terminalAttachRequests = new Map();
+
+function terminalViewCurrent(v, generation) {
+  return views.get(v.card.dataset.id) === v && v.attachGeneration === generation;
+}
+
+async function writeTerminalBytes(v, bytes, generation) {
+  // Await parsing so a fast CLI cannot fill xterm's internal write queue.
+  for (let offset = 0; offset < bytes.length; offset += TERMINAL_WRITE_CHUNK) {
+    if (!terminalViewCurrent(v, generation)) return;
+    v.outputDone = new Promise(resolve => v.term.write(bytes.subarray(offset, offset + TERMINAL_WRITE_CHUNK), resolve));
+    await v.outputDone;
+  }
+}
+
+function queueTerminalPacket(v, p) {
+  if (v.needsSnapshot) return;
+  // Count both payload bytes and per-packet overhead, including empty packets.
+  const size = (p.data?.length || 0) + 128;
+  if (v.queuedBytes + size > TERMINAL_QUEUE_LIMIT) {
+    v.queue.length = 0;
+    v.queuedBytes = 0;
+    v.needsSnapshot = true;
+  } else {
+    v.queue.push(p);
+    v.queuedBytes += size;
+  }
+}
+
+function drainTerminalPackets(v) {
+  if (!v.ready || v.outputBusy || views.get(v.card.dataset.id) !== v) return;
+  if (v.needsSnapshot) {
+    // The native parser continues independently. Recover its current screen,
+    // rather than replaying or retaining an arbitrarily large output burst.
+    attach(v, session(v.card.dataset.id), true).catch(error);
+    return;
+  }
+  while (v.queue.length && v.ready && !v.outputBusy) {
+    const packet = v.queue.shift();
+    v.queuedBytes -= (packet.data?.length || 0) + 128;
+    terminalPacket(packet);
+  }
+}
+
+async function attach(v, s, screenOnly = false) {
+  if (!s) return;
+  const generation = ++v.attachGeneration;
   v.ready = false;
   v.replaying = true;
-  const snapshot = await api("terminal", "attach", { id: s.id });
+  v.queue.length = 0;
+  v.queuedBytes = 0;
+  v.needsSnapshot = false;
+  let snapshot;
+  try {
+    // Serialize subscriptions for this session, including replaced views. A
+    // delayed old request must never replace the selected renderer's stream.
+    const previous = terminalAttachRequests.get(s.id) || Promise.resolve();
+    const request = previous.catch(() => {}).then(() => terminalViewCurrent(v, generation)
+      ? api("terminal", "attach", { id: s.id, screenOnly, subscribe: true }) : null);
+    terminalAttachRequests.set(s.id, request);
+    try { snapshot = await request; }
+    finally { if (terminalAttachRequests.get(s.id) === request) terminalAttachRequests.delete(s.id); }
+    await v.outputDone;
+    if (!snapshot || !terminalViewCurrent(v, generation)) {
+      if (snapshot?.subscription) api("terminal", "detach", { id:s.id, runId:snapshot.runId, subscription:snapshot.subscription }).catch(() => {});
+      return;
+    }
+  } catch (e) {
+    if (terminalViewCurrent(v, generation)) {
+      v.queue.length = 0;
+      v.queuedBytes = 0;
+      v.needsSnapshot = false;
+      v.outputBusy = false;
+      v.attachFailed = true;
+      v.overlay.hidden = false;
+      v.overlayText.textContent = tr("Terminal görüntüsü yüklenemedi. Oturumu yeniden seç.");
+    }
+    throw e;
+  }
+  v.outputBusy = false;
+  v.attachFailed = false;
   v.runId = snapshot.runId || null;
+  v.subscription = snapshot.subscription || null;
+  v.frame = snapshot.frame;
   v.seq = snapshot.seq || 0;
   v.term.reset();
+  if (snapshot.cols && snapshot.rows) v.term.resize(snapshot.cols, snapshot.rows);
   const bytes = decode(snapshot.data || "");
   v.hasOutput = bytes.length > 0;
-  await new Promise((resolve) => v.term.write(bytes, resolve));
+  await writeTerminalBytes(v, bytes, generation);
+  if (!terminalViewCurrent(v, generation)) return;
+  v.host.title = snapshot.truncated ? tr("Son terminal çıktısı gösteriliyor. Tam geçmiş diskte korunuyor.") : "";
   v.ready = true;
   v.replaying = false;
-  for (const p of v.queue.splice(0)) terminalPacket(p);
+  acknowledgeTerminalOutput(v, snapshot);
+  drainTerminalPackets(v);
   v.overlay.hidden = v.hasOutput || active(s.id);
   fitOne(v);
 }
 function decode(b64) {
   return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
 }
+async function acknowledgeTerminalOutput(v, packet) {
+  if (!v.subscription || !v.runId || packet.subscription !== v.subscription) return;
+  const id = v.card.dataset.id;
+  const current = () => views.get(id) === v && v.subscription === packet.subscription && v.frame === packet.frame;
+  for (let attempt=0; attempt<2; attempt++) {
+    if (!current() || !active(id)) return;
+    try {
+      const accepted = await api("terminal", "ack", { id, runId: v.runId,
+        subscription: v.subscription, seq: packet.seq, frame: packet.frame });
+      if (accepted || !current()) return;
+    } catch {}
+    if (!attempt) await new Promise(resolve => setTimeout(resolve,150));
+  }
+  if (current() && active(id)) {
+    v.attachFailed = true;
+    v.ready = false;
+    v.replaying = true;
+    error(tr("Terminal görüntüsü yüklenemedi. Oturumu yeniden seç."));
+  }
+}
 function terminalPacket(p) {
   const v = views.get(p.id);
   if (!v) return;
-  if (!v.ready) {
-    v.queue.push(p);
+  if (!v.ready || v.outputBusy) {
+    // Once bound, packets from a superseded run cannot consume queue space.
+    if (v.ready && p.runId !== v.runId) return;
+    queueTerminalPacket(v, p);
     return;
   }
   if (p.runId !== v.runId) return;
   if (p.exitCode !== undefined) {
     activity.delete(p.id);
-    sync().catch(error);
+    sync().then(() => {
+      if (views.get(p.id) === v) return attach(v, session(p.id));
+    }).catch(error);
     return;
   }
-  if (p.seq <= v.seq) return;
+  if (v.subscription && p.subscription !== v.subscription) return;
+  if (v.subscription && p.frame <= v.frame) return;
+  if (p.seq < v.seq || (p.seq === v.seq && !p.reset)) return;
   v.seq = p.seq;
+  v.frame = p.frame;
   v.hasOutput = true;
   v.overlay.hidden = true;
-  v.term.write(decode(p.data));
+  if (p.reset) {
+    v.term.reset();
+    if (p.cols && p.rows) v.term.resize(p.cols,p.rows);
+    v.host.title = tr("Son terminal çıktısı gösteriliyor. Tam geçmiş diskte korunuyor.");
+  }
+  const bytes = decode(p.data || "");
+  const generation = v.attachGeneration;
+  v.outputBusy = true;
+  writeTerminalBytes(v, bytes, generation).then(() => {
+    if (terminalViewCurrent(v,generation)) acknowledgeTerminalOutput(v,p);
+  }).catch(e => {
+    if (terminalViewCurrent(v,generation)) { v.attachFailed=true; v.ready=false; v.replaying=true; error(e); }
+  }).finally(() => {
+    if (!terminalViewCurrent(v, generation)) return;
+    v.outputBusy = false;
+    drainTerminalPackets(v);
+  });
   const text = new TextDecoder()
-    .decode(decode(p.data))
+    .decode(bytes)
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
   v.activityText = (v.activityText + text).slice(-6000);
   v.nativeActivity = null;
@@ -1899,30 +2122,41 @@ function showSessionInfo(s) {
   modal(tr("Oturum bilgileri") + " · " + s.name, details);
 }
 async function showTranscript(id, fromHistory = false) {
-  const result = await api("history", "messages", { id });
   const box = el("div");
   if (fromHistory) box.append(button(tr("Oturum geçmişine dön"), archiveList, "history-back"));
   if (session(id)?.archivedFromDirectory) {
     box.append(button(tr("Arşiv klasörünü aç"), () => api("app", "reveal", { sessionId: id }), "history-back"));
   }
-  for (const m of result.messages) {
-    const row = el("article", "transcript-message " + m.role);
-    row.append(
-      el("strong", "", m.role === "user" ? tr("Sen") : names[result.provider]),
-      el("pre", "", m.text),
-    );
-    box.append(row);
-  }
-  if (!result.messages.length) {
-    box.append(
-      el(
-        "p",
-        "help",
-        tr("Yapılandırılmış mesaj kaydı henüz bulunamadı. Kartta kaydedilmiş terminal çıktısı görüntülenir."),
-      ),
-    );
-  }
+  const navigation = el("div","row history-pagination"), content = el("div");
+  const pages = [null];
+  let index=0, reading=false, next=null;
+  const newer = button(tr("Daha yeni"),() => load(index-1));
+  const older = button(tr("Daha eski"),() => { if(next!=null) { pages[index+1]=next; return load(index+1); } });
+  const count = el("span","help");
+  navigation.append(newer,count,older);
+  box.append(navigation,content);
   modal(session(id).name + tr(" · Geçmiş"), box);
+  async function load(pageIndex) {
+    if(reading || pageIndex<0) return;
+    reading=true; newer.disabled=older.disabled=true;
+    try {
+      const result = await api("history","messages",{id,...(pages[pageIndex]!=null?{beforeByte:pages[pageIndex]}:{})});
+      if(!box.isConnected || !$("#dialog").open) return;
+      index=pageIndex; next=result.nextBeforeByte;
+      count.textContent=tr("Sayfa {page}",{page:index+1});
+      content.replaceChildren(...result.messages.map(m => {
+        const row=el("article","transcript-message "+m.role);
+        row.append(el("strong","",m.role==="user"?tr("Sen"):names[result.provider]),el("pre","",m.text));
+        return row;
+      }));
+      if(!result.messages.length) content.append(el("p","help",tr(next!=null
+        ? "Bu bölümde görüntülenecek mesaj yok. Daha eski kayıtları açabilirsin."
+        : "Yapılandırılmış mesaj kaydı henüz bulunamadı. Kartta kaydedilmiş terminal çıktısı görüntülenir.")));
+      if(result.truncatedMessages || result.skippedOversize) content.prepend(el("p","help",tr("Büyük kayıtlar bu görünümde kısaltıldı veya atlandı. Özgün geçmiş diskte korunuyor.")));
+    } catch(e) { error(e); }
+    finally { reading=false; newer.disabled=index===0; older.disabled=next==null; }
+  }
+  await load(0);
 }
 async function bindHistory(id) {
   const found = await api("history", "list", { id });
@@ -2127,6 +2361,7 @@ function applyCamera() {
   linkTooltip.hidden = true;
   $("#zoom").textContent = Math.round(camera.z * 100) + "%";
   scheduleNotificationContext();
+  scheduleTerminalRendering();
 }
 function saveCard(id, patch) {
   Object.assign(session(id), patch);
@@ -2140,6 +2375,7 @@ function setMode(value) {
   for (const n of ["map", "grid", "focus"])
     $("#view-" + n).classList.toggle("selected", n === mode);
   applyCamera();
+  renderCards();
   drawEdges();
   fitTerminals();
   scheduleNotificationContext();
@@ -2159,17 +2395,15 @@ function zoom(amount, x, y) {
   remember();
 }
 function fitMap() {
-  const cards = visibleSessions()
-    .map((s) => views.get(s.id)?.card)
-    .filter(Boolean);
+  const cards = visibleSessions().map(terminalCardBox);
   if (!cards.length) return;
-  const left = Math.min(...cards.map((c) => parseFloat(c.style.left))),
-    top = Math.min(...cards.map((c) => parseFloat(c.style.top))),
+  const left = Math.min(...cards.map((c) => c.x)),
+    top = Math.min(...cards.map((c) => c.y)),
     right = Math.max(
-      ...cards.map((c) => parseFloat(c.style.left) + c.offsetWidth),
+      ...cards.map((c) => c.x + c.width),
     ),
     bottom = Math.max(
-      ...cards.map((c) => parseFloat(c.style.top) + c.offsetHeight),
+      ...cards.map((c) => c.y + c.height),
     );
   const r = $("#viewport").getBoundingClientRect();
   camera.z = Math.max(
@@ -2270,13 +2504,13 @@ function drawEdges() {
   linkTooltip.hidden = true;
   group.replaceChildren();
   labels.replaceChildren();
-  for (const { card } of views.values()) card.classList.remove("linked-focus");
+  for (const card of sessionCards.values()) card.classList.remove("linked-focus");
   if (mode !== "map") return;
   const highlight = panel === "summary" && focusId;
   const directions = new Set(db.links.map(({ source, target }) => source + ":" + target));
   for (const link of db.links) {
-    const a = views.get(link.source)?.card,
-      b = views.get(link.target)?.card;
+    const a = sessionCards.get(link.source),
+      b = sessionCards.get(link.target);
     if (!a || !b || a.hidden || b.hidden) continue;
     const route = edgeRoute(a, b, directions.has(link.target + ":" + link.source));
     const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
@@ -2339,6 +2573,7 @@ $("#viewport").addEventListener("pointerdown", (e) => {
   $("#viewport").setPointerCapture(e.pointerId);
   gesture = { kind: "pan", x: e.clientX, y: e.clientY, camera: { ...camera } };
 });
+$("#viewport").addEventListener("scroll", scheduleTerminalRendering, { passive: true });
 function drawConnectionPreview() {
   document.getElementById("connection-preview")?.remove();
   if (!connecting) return;
@@ -2460,6 +2695,7 @@ $("#app-settings").onclick = () => {
   modal(tr("Ayarlar"), [
     field(tr("Arayüz dili"), language),
     notificationSettings(),
+    button(tr("Veri yönetimi"),openDataManagement),
     button(tr("Sağlayıcı kurulumu"), () => openProviderSetup()),
     button(tr("Hakkında ve güncellemeler"), openAbout),
   ]);
@@ -2870,6 +3106,7 @@ async function openProviderLogin(provider, accountId = defaultAccount) {
   let since = 0;
   const term = new Terminal({
     cursorBlink: true,
+    scrollback: 2000,
     theme: { background: "#0c1015", foreground: "#dbe4ee" },
   });
   const fit = new FitAddon.FitAddon();
@@ -2896,7 +3133,15 @@ async function openProviderLogin(provider, accountId = defaultAccount) {
       const result = await call("poll", { since });
       if (closed) return;
       since = result.seq;
-      if (result.data) term.write(decode(result.data));
+      if (result.reset) {
+        term.reset();
+        if (result.cols && result.rows) term.resize(result.cols,result.rows);
+      }
+      const data=result.data?decode(result.data):new Uint8Array();
+      for(let offset=0;offset<data.length && !closed;offset+=16*1024) {
+        await new Promise(resolve=>term.write(data.subarray(offset,offset+16*1024),resolve));
+      }
+      if (closed) return;
       if (result.exited) {
         ended = true;
         status.textContent = tr("Hesap durumu kontrol ediliyor…");
@@ -5489,6 +5734,7 @@ async function initialize() {
   checkTeams();
 }
 initChatControls();
+initVerificationControls();
 initialize().catch(error);
 setInterval(() => {
   if (document.visibilityState === "visible")

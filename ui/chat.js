@@ -19,11 +19,15 @@ async function readChatInteraction() {
   const view = chatView(id);
   if (view.readingInteraction) return;
   const bindingRevision = view.bindingRevision;
+  const readRevision = view.readRevision || 0;
+  const promptRevision = view.promptRevision || 0;
   view.readingInteraction = true;
   try {
     // Native questions must never wait for transcript discovery or filesystem IO.
-    const update = await api("chat", "interaction", { id, terminalOutput: true });
-    if (!session(id) || view.bindingRevision !== bindingRevision || view.conversation !== update.conversationId
+    const update = await api("chat", "interaction", { id, terminalOutput: view.terminalPreviewOpen === true });
+    if (!session(id) || shownChatId !== id || (view.readRevision || 0) !== readRevision
+      || view.bindingRevision !== bindingRevision || (view.promptRevision || 0) !== promptRevision
+      || view.conversation !== update.conversationId
       || (session(id).conversationId || null) !== update.conversationId) return;
     view.mismatch = update.mismatch;
     view.ticket = update.ticket;
@@ -32,7 +36,8 @@ async function readChatInteraction() {
     view.terminalOutput = update.terminalOutput;
     view.terminalRunId = update.terminalRunId;
   } catch {
-    if (view.bindingRevision === bindingRevision) {
+    if (shownChatId === id && (view.readRevision || 0) === readRevision
+      && view.bindingRevision === bindingRevision && (view.promptRevision || 0) === promptRevision) {
       view.ticket = null;
       view.terminalPrompt = null;
       view.terminalOutput = null;
@@ -55,7 +60,7 @@ function selectedChatSession() {
 
 function chatView(id) {
   if (!chatViews.has(id))
-    chatViews.set(id, { draft: "", images: [], open: false, turns: [], ticket: null, revision: null, bindingRevision: 0 });
+    chatViews.set(id, { draft: "", images: [], open: false, turns: [], ticket: null, revision: null, bindingRevision: 0, terminalPreviewOpen: false });
   return chatViews.get(id);
 }
 
@@ -70,6 +75,7 @@ function setChatView(open) {
   if (!selected) return;
   chatView(selected.id).open = open;
   renderChatView();
+  scheduleTerminalRendering();
   if (open) openChatChanges().catch(error);
   else requestAnimationFrame(fitTerminals);
 }
@@ -97,6 +103,7 @@ function renderChatView() {
   $("#viewport").classList.toggle("show-chat", !!next);
   if (next) $("#empty").hidden = true;
   shownChatId = next;
+  renderVerificationView();
   scheduleNotificationContext();
   if (switched) {
     clearTimeout(chatPollTimer);
@@ -107,7 +114,16 @@ function renderChatView() {
   for (const [id, view] of chatViews) {
     const owner = session(id);
     if (!owner || owner.archived) chatViews.delete(id);
-    else if (id !== next) syncChatBinding(owner, view);
+    else if (id !== next) {
+      syncChatBinding(owner, view);
+      view.readRevision = (view.readRevision || 0) + 1;
+      // Preserve drafts, attachments and answers; release inactive transcripts.
+      if (view.turns.length || view.revision || view.terminalOutput) {
+        view.turns = [];
+        view.revision = null;
+        view.terminalOutput = null;
+      }
+    }
   }
   if (!next) return;
   const view = chatView(next);
@@ -142,8 +158,10 @@ function syncChatBinding(selected, view) {
   view.terminalPrompt = null;
   view.terminalOutput = null;
   view.terminalRunId = null;
-  view.terminalPreviewOpen = null;
+  view.terminalPreviewOpen = false;
+  view.promptRevision = (view.promptRevision || 0) + 1;
   view.questionReply = null;
+  view.answeredQuestionKey = null;
   return true;
 }
 
@@ -153,10 +171,12 @@ async function readChat() {
   const view = chatView(id);
   if (view.reading) return;
   const bindingRevision = view.bindingRevision;
+  const readRevision = view.readRevision || 0;
   view.reading = true;
   try {
     const update = await api("chat", "read", { id, revision: view.revision, terminalOutput: !!view.terminalPreviewOpen });
-    if (!session(id) || view.bindingRevision !== bindingRevision || view.conversation !== update.conversationId
+    if (!session(id) || shownChatId !== id || (view.readRevision || 0) !== readRevision
+      || view.bindingRevision !== bindingRevision || view.conversation !== update.conversationId
       || (session(id).conversationId || null) !== update.conversationId) return;
     const last = view.turns.at(-1);
     const wasWorking = last?.state === "working" || !!view.pending;
@@ -179,7 +199,7 @@ async function readChat() {
       if (shownChatId === id) paintChatTurns(view);
     }
   } catch {
-    if (view.bindingRevision === bindingRevision) view.loadError = true;
+    if (shownChatId === id && (view.readRevision || 0) === readRevision && view.bindingRevision === bindingRevision) view.loadError = true;
   } finally {
     view.reading = false;
     if (shownChatId === id) {
@@ -233,7 +253,8 @@ function paintChatComposer(selected, chat) {
   $("#chat-terminal-prompt").hidden = !prompt;
   const heading = prompt ? tr(prompt.kind === "approval" ? "Onayın bekleniyor" : "Yanıtın bekleniyor") : "";
   if (title.textContent !== heading) title.textContent = heading;
-  if (promptText.textContent !== (prompt?.text || "")) promptText.textContent = prompt?.text || "";
+  const promptBody = prompt?.kind === "approval" && prompt.menu ? prompt.menu.question || prompt.text : prompt?.text || "";
+  if (promptText.textContent !== promptBody) promptText.textContent = promptBody;
   const choiceArea = $("#chat-terminal-choices");
   const menu = prompt?.menu;
   const choiceKey = menu ? `${id}:${runId}:${menu.key}` : "";
@@ -252,6 +273,7 @@ function paintChatComposer(selected, chat) {
       for (const [index, label] of menu.choices.entries()) {
         const button = el("button", "", `${index + 1} · ${label}`);
         button.type = "button";
+        if (menu.descriptions?.[index]) button.title = menu.descriptions[index];
         button.onclick = () => answerTerminalChoice(id, choiceKey, { choice: index + 1 }).catch(error);
         choiceArea.append(button);
       }
@@ -266,11 +288,14 @@ function paintChatComposer(selected, chat) {
       || !!chat.applyingModel || !!chat.applyingApproval || !!chat.attaching);
   }
   const peek = running && !ready && !prompt && !chat.mismatch;
-  const expanded = peek && chat.terminalPreviewOpen !== false;
-  $("#chat-terminal-peek").hidden = !peek;
+  const expanded = peek && chat.terminalPreviewOpen === true;
+  $("#chat-terminal-peek").hidden = !expanded;
   const toggle = $("#chat-show-terminal-output");
+  toggle.hidden = !peek;
   toggle.setAttribute("aria-expanded", String(expanded));
-  toggle.textContent = tr(expanded ? "Canlı Terminal çıktısını gizle" : "Canlı Terminal çıktısını göster");
+  const outputLabel = tr(expanded ? "Canlı Terminal çıktısını gizle" : "Canlı Terminal çıktısını göster");
+  toggle.title = outputLabel;
+  toggle.setAttribute("aria-label", outputLabel);
   const output = $("#chat-terminal-output");
   output.hidden = !expanded;
   const liveText = expanded && currentRun ? chat.terminalOutput || "" : "";
@@ -281,6 +306,7 @@ function paintChatComposer(selected, chat) {
 
 async function answerTerminalChoice(id, key, response) {
   const chat = chatView(id);
+  const bindingRevision = chat.bindingRevision;
   const terminal = views.get(id);
   const runId = db.active.find(item => item.id === id)?.runId;
   const menu = chat.terminalPrompt?.menu;
@@ -288,15 +314,19 @@ async function answerTerminalChoice(id, key, response) {
     || terminal?.hasPendingInput() || chat.terminalRunId !== runId
     || key !== `${id}:${runId}:${menu.key}`) return false;
   chat.answeringPrompt = true;
+  chat.promptRevision = (chat.promptRevision || 0) + 1;
   paintChatComposer(session(id), chat);
   try {
     await api("chat", "answer_prompt", {
       id, runId, key: menu.key, inputRevision: menu.inputRevision,
       selected: menu.selected, ...response,
     });
-    if (chat.terminalPrompt?.menu?.key === menu.key) delete chat.terminalPrompt.menu;
+    if (chat.bindingRevision !== bindingRevision || chatViews.get(id) !== chat
+      || db.active.find(item => item.id === id)?.runId !== runId) return false;
+    if (chat.terminalPrompt?.menu?.key === menu.key) chat.terminalPrompt = null;
     return true;
   } finally {
+    chat.promptRevision = (chat.promptRevision || 0) + 1;
     chat.answeringPrompt = false;
     if (shownChatId === id) {
       paintChatComposer(session(id), chat);
@@ -340,6 +370,9 @@ function createChatQuestion(view, key, question, choices, respond, custom = true
     try {
       if (await respond(response) !== true) return;
       if (view.questionReply?.key === key) view.questionReply = null;
+      if (card.classList.contains("chat-reply-question")) view.answeredQuestionKey = key;
+      card.remove();
+      if (shownChatId && chatViews.get(shownChatId) === view) paintChatTurns(view);
     } catch (err) {
       error(err);
     } finally {
@@ -757,13 +790,15 @@ function paintChatTurns(view, initial = false) {
     if (entry.answer) {
       const answer = el("div", "chat-answer");
       const provider = session(shownChatId)?.provider;
-      const question = !view.pending && entry === view.turns.at(-1) && entry.state === "completed"
+      const questionKey = `${shownChatId}:${view.conversation}:${entry.position}:${entry.answer}`;
+      const question = !view.pending && view.answeredQuestionKey !== questionKey
+        && entry === view.turns.at(-1) && entry.state === "completed"
         ? chatReplyQuestion(entry.answer) : null;
       answer.append(el("strong", "chat-answer-name", `${icons[provider]} ${names[provider]}`));
       if (!question || question.before) answer.append(renderChatText(question ? question.before : entry.answer));
       if (question) {
         const id = shownChatId;
-        const key = `${id}:${view.conversation}:${entry.position}:${entry.answer}`;
+        const key = questionKey;
         const card = createChatQuestion(view, key, question.question, question.choices, response => {
           const selected = selectedChatSession();
           const latest = view.turns.at(-1);
@@ -894,11 +929,16 @@ async function sendChat(selected, view, text, composer) {
   const id = selected.id;
   const bindingRevision = view.bindingRevision;
   const pending = { text, position: view.turns.at(-1)?.position ?? -1 };
+  const latestQuestion = view.turns.at(-1);
+  const answeredQuestionKey = !view.pending && latestQuestion?.state === "completed" && typeof latestQuestion.answer === "string"
+    && chatReplyQuestion(latestQuestion.answer)
+    ? `${id}:${view.conversation}:${latestQuestion.position}:${latestQuestion.answer}` : null;
   view.sending = true;
   paintChatComposer(selected, view);
   try {
     await api("chat", "send", { id, ...view.ticket, text });
     if (view.bindingRevision !== bindingRevision) return false;
+    if (answeredQuestionKey) view.answeredQuestionKey = answeredQuestionKey;
     view.pending = pending;
     reconcileChatPrompt(view);
     if (composer && view.draft === composer.draft) {
@@ -936,7 +976,7 @@ function initChatControls() {
     const id = shownChatId;
     if (!id) return;
     const view = chatView(id);
-    view.terminalPreviewOpen = view.terminalPreviewOpen === false;
+    view.terminalPreviewOpen = !view.terminalPreviewOpen;
     paintChatComposer(session(id), view);
     if (view.terminalPreviewOpen) readChatInteraction().catch(error);
   };

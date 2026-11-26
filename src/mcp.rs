@@ -13,12 +13,15 @@ use std::{
 fn tools() -> Value {
     let object = |properties: Value, required: Vec<&str>| json!({"type":"object","properties":properties,"required":required});
     let catalog = json!([
+        {"name":"verification_request","description":"Read instructions for a user-initiated verification operation. Never initiate or approve verification yourself.","inputSchema":object(json!({"operation":{"type":"string"}}),vec!["operation"])},
+        {"name":"verification_propose","description":"Submit the requested checklist without executing it. Only the user may approve Start.","inputSchema":object(json!({"operation":{"type":"string"},"items":{"type":"array","minItems":1,"maxItems":20,"items":{"type":"object","properties":{"title":{"type":"string","maxLength":180},"check":{"type":"string","maxLength":2000}},"required":["title","check"],"additionalProperties":false}}}),vec!["operation","items"])},
+        {"name":"verification_report","description":"Report all approved items honestly with actual evidence. These are model reports, not independently measured proof.","inputSchema":object(json!({"operation":{"type":"string"},"results":{"type":"array","minItems":1,"maxItems":20,"items":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string","enum":["passed","failed","blocked"]},"evidence":{"type":"string","maxLength":4000}},"required":["id","status","evidence"],"additionalProperties":false}}}),vec!["operation","results"])},
         {"name":"browser_open","description":"Open an HTTP/HTTPS page in this session's embedded browser or installed Chrome. Set newTab true for another tab.","inputSchema":object(json!({"url":{"type":"string"},"mode":{"type":"string","enum":["embedded","chrome"]},"newTab":{"type":"boolean"},"pageId":{"type":"string"}}),vec!["url"])},
         {"name":"browser_read","description":"Read a tab's visible text, structured elements and optional screenshot. Use documentId and element ref for actions. Returns tabs if no tab is open.","inputSchema":object(json!({"pageId":{"type":"string"},"screenshot":{"type":"boolean"}}),vec![])},
         {"name":"browser_action","description":"Interact with the session browser. Actions: click, double_click, right_click, hover, drag, fill, type, select, check, key, scroll, wait. For ref actions include documentId from the latest browser_read. Coordinates refer to the latest screenshot viewport.","inputSchema":object(json!({"pageId":{"type":"string"},"action":{"type":"string"},"documentId":{"type":"string"},"ref":{"type":"string"},"x":{"type":"number"},"y":{"type":"number"},"toX":{"type":"number"},"toY":{"type":"number"},"text":{"type":"string"},"checked":{"type":"boolean"},"key":{"type":"string"},"deltaX":{"type":"number"},"deltaY":{"type":"number"},"ms":{"type":"integer"}}),vec!["action"])},
         {"name":"browser_assert","description":"Verify browser text or URL and record a passed/failed test step. Checks: text_contains, text_absent, url_contains. Supply a short human-readable label without credentials or personal data. Failure captures a screenshot when possible.","inputSchema":object(json!({"pageId":{"type":"string"},"check":{"type":"string","enum":["text_contains","text_absent","url_contains"]},"expected":{"type":"string"},"label":{"type":"string"},"timeoutMs":{"type":"integer","minimum":0,"maximum":8000}}),vec!["check","expected"])},
         {"name":"session_catalog","description":"List only sessions explicitly connected to this session, with permissions.","inputSchema":object(json!({}),vec![])},
-        {"name":"read_context","description":"Read a connected session conversation, without starting a provider or sending terminal input.","inputSchema":object(json!({"target":{"type":"string"}}),vec!["target"])},
+        {"name":"read_context","description":"Read a bounded recent page of a connected conversation. Use nextBeforeByte as beforeByte for older messages. Never starts a provider or sends input.","inputSchema":object(json!({"target":{"type":"string"},"beforeByte":{"type":"integer","minimum":0}}),vec!["target"])},
         {"name":"read_files","description":"Read shareable files from a connected session with file permission. If paths is omitted, list shareable changed files. Workflow excludes ignored files and likely credentials.","inputSchema":object(json!({"target":{"type":"string"},"paths":{"type":"array","items":{"type":"string"}}}),vec!["target"])},
         {"name":"request_work","description":"Request work from a connected existing session with delegation permission. The user accepts it in Workflow; connecting sessions never starts jobs by itself. No new agent is spawned.","inputSchema":object(json!({"target":{"type":"string"},"instruction":{"type":"string"}}),vec!["target","instruction"])},
         {"name":"read_result","description":"Read the status or result of a work request created by this session.","inputSchema":object(json!({"requestId":{"type":"string"}}),vec!["requestId"])},
@@ -105,6 +108,7 @@ fn connection(core: &Arc<Core>, mut stream: TcpStream) -> Result<()> {
     let response = tauri::async_runtime::block_on(call(
         core,
         sid,
+        run,
         string(&request, "method")?,
         request["params"].clone(),
     ));
@@ -298,7 +302,10 @@ fn link(core: &Core, source: &str, target: &str, permission: &str) -> Result<()>
     }
     Ok(())
 }
-async fn call(core: &Arc<Core>, source: &str, method: &str, mut args: Value) -> Result<Value> {
+async fn call(core: &Arc<Core>, source: &str, run: &str, method: &str, mut args: Value) -> Result<Value> {
+    if matches!(method, "verification_request" | "verification_propose" | "verification_report") {
+        return crate::verification::tool(core, source, run, method, &args);
+    }
     if method.starts_with("browser_") {
         if core.session(source)?["browserAccess"] == false {
             bail!("Bu oturumun tarayıcı erişimi kapalı")
@@ -349,7 +356,12 @@ async fn call(core: &Arc<Core>, source: &str, method: &str, mut args: Value) -> 
         "read_context" => {
             let target = string(&args, "target")?;
             link(core, source, target, "read")?;
-            history::messages(core, target)
+            let before = match args.get("beforeByte") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(value.as_u64().context("Geçmiş sayfası geçersiz")?),
+            };
+            if before.is_some() { history::messages_page(core,target,before) }
+            else { history::messages(core,target) }
         }
         "read_files" => {
             let target = string(&args, "target")?;

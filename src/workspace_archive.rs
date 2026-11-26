@@ -123,6 +123,95 @@ impl<'a> GitWorktree<'a> {
     }
 }
 
+// Cleanup separately scans the whole slot, rejecting populated submodules and
+// nested Git repositories before asking Git to unregister this exact worktree.
+pub(crate) fn cleanup_preflight(data: &Path, project: &Path, root: &Path) -> Result<PathBuf> {
+    let tree = GitWorktree::new(project, root)?;
+    let common = |path: &Path| -> Result<PathBuf> {
+        Ok(dunce::canonicalize(
+            path.join(git(path, &["rev-parse", "--git-common-dir"])?),
+        )?)
+    };
+    let source_common = common(project)?;
+    if source_common.starts_with(dunce::canonicalize(data)?)
+        || common(root)? != source_common
+        || tree.admin.parent() != Some(source_common.join("worktrees").as_path())
+        || crate::git::worktree_root(root)? != dunce::canonicalize(root)?
+    {
+        bail!("Git çalışma alanının ana depo kaydı veya kilit durumu temizlemeye izin vermiyor.");
+    }
+    for marker in ["gitdir", "commondir"] {
+        let metadata = fs::symlink_metadata(tree.admin.join(marker))?;
+        if !metadata.is_file() || is_link(&metadata) || metadata.len() > 16 * 1024 {
+            bail!("Git yönetim kaydı doğrulanamadı.");
+        }
+    }
+    tree.check_registered(root)?;
+    if cleanup_registration_count(project, root)? != 1 {
+        bail!("Git çalışma alanı ana deponun çalışma alanları listesinde doğrulanamadı.");
+    }
+    match fs::symlink_metadata(tree.admin.join("locked")) {
+        Ok(_) => bail!("Git çalışma alanı kilitli. Klasör korundu."),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error.into()),
+    }
+    Ok(tree.admin)
+}
+
+pub(crate) fn cleanup_registration_count(project: &Path, root: &Path) -> Result<usize> {
+    let location = |path: &Path| -> Result<PathBuf> {
+        match dunce::canonicalize(path) {
+            Ok(value) => Ok(value),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(dunce::canonicalize(
+                path.parent().context("Çalışma alanı üst klasörü yok.")?,
+            )?
+            .join(path.file_name().context("Çalışma alanı adı yok.")?)),
+            Err(error) => Err(error.into()),
+        }
+    };
+    let canonical = location(root)?;
+    let entries = crate::core::git_bytes(project, &["worktree", "list", "--porcelain", "-z"])?;
+    let mut matches = 0;
+    for field in entries.split(|b| *b == 0) {
+        if let Some(raw) = field.strip_prefix(b"worktree ") {
+            #[cfg(unix)]
+            let path = {
+                use std::os::unix::ffi::OsStrExt;
+                Path::new(std::ffi::OsStr::from_bytes(raw))
+            };
+            #[cfg(not(unix))]
+            let path = Path::new(std::str::from_utf8(raw)?);
+            // An approved slot always has the shape <UUID>/files. Do not
+            // touch unrelated registered worktrees, including offline drives.
+            if path.file_name() == root.file_name()
+                && path.parent().and_then(Path::file_name)
+                    == root.parent().and_then(Path::file_name)
+                && location(path).is_ok_and(|registered| registered == canonical)
+            {
+                matches += 1;
+            }
+        }
+    }
+    Ok(matches)
+}
+
+pub(crate) fn cleanup_remove(data: &Path, project: &Path, root: &Path, admin: &Path) -> Result<()> {
+    if cleanup_preflight(data, project, root)? != admin {
+        bail!("Git çalışma alanının kaydı değişti. Önizlemeyi yenileyin.");
+    }
+    git(
+        project,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            "--",
+            &external_path(root).to_string_lossy(),
+        ],
+    )?;
+    Ok(())
+}
+
 fn worktree<'a>(
     session: &Value,
     project: &'a Value,

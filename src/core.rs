@@ -35,6 +35,35 @@ pub fn atomic(file: &Path, bytes: &[u8]) -> Result<()> {
     atomic_with_mode(file, bytes, None)
 }
 
+pub(crate) fn atomic_json<T: serde::Serialize>(file: &Path, value: &T) -> Result<()> {
+    #[cfg(unix)]
+    let mode=Some(file_mode(file)?.unwrap_or(0o600));
+    #[cfg(not(unix))]
+    let mode=None;
+    fs::create_dir_all(file.parent().context("Klasör yok")?)?;
+    let temporary=file.with_extension(format!("{}.tmp",id()));
+    let mut output=create_atomic_temp(&temporary,mode)?;
+    let result=(|| -> Result<()> {
+        {
+            use std::io::Write;
+            let mut buffered=std::io::BufWriter::with_capacity(64*1024,&mut output);
+            serde_json::to_writer_pretty(&mut buffered,value)?;
+            buffered.flush()?;
+        }
+        #[cfg(unix)]
+        if let Some(mode)=mode {
+            use std::os::unix::fs::PermissionsExt;
+            output.set_permissions(fs::Permissions::from_mode(mode))?;
+        }
+        output.sync_all()?;
+        drop(output);
+        fs::rename(&temporary,file)?;
+        Ok(())
+    })();
+    if result.is_err() { let _=fs::remove_file(&temporary); }
+    result
+}
+
 // Only ordinary Unix permission bits travel with project content. Never copy
 // ownership, setuid/setgid or sticky bits from a workspace or backup object.
 pub(crate) fn file_mode(file: &Path) -> Result<Option<u32>> {
@@ -232,6 +261,7 @@ pub struct Core {
     pub app: AppHandle,
     pub endpoint: Mutex<String>,
     pub pending: Mutex<HashMap<String, Value>>,
+    pub(crate) browser_opening: std::sync::atomic::AtomicUsize,
     pub _instance: fs::File,
 }
 impl Core {
@@ -256,11 +286,12 @@ impl Core {
             Some(saved) => Some(saved),
             None => read_optional(&file.with_extension("previous"))?,
         };
-        let db = if let Some(saved) = saved {
+        let mut db = if let Some(saved) = saved {
             serde_json::from_slice(&saved).context("Çalışma alanı okunamadı; dosya korundu")?
         } else {
             json!({"version":1,"projects":[],"sessions":[],"links":[],"jobs":[],"preferences":{},"providers":{}})
         };
+        crate::verification::recover(&mut db);
         crate::workspace_archive::recover(&directory, &db);
         Ok(Arc::new(Self {
             #[cfg(any(windows, target_os = "macos"))]
@@ -280,6 +311,7 @@ impl Core {
             app,
             endpoint: Mutex::new(String::new()),
             pending: Mutex::new(HashMap::new()),
+            browser_opening: std::sync::atomic::AtomicUsize::new(0),
             _instance: instance,
         }))
     }
@@ -287,16 +319,17 @@ impl Core {
         self.save_workspace(&self.db.lock().unwrap())
     }
     pub(crate) fn save_workspace(&self, db: &Value) -> Result<()> {
-        atomic(
-            &self.directory.join("workspace.json"),
-            &serde_json::to_vec_pretty(db)?,
-        )
+        atomic_json(&self.directory.join("workspace.json"),db)
     }
     pub fn emit(&self, event: &str, value: Value) {
         let _ = self.app.emit_to("main", event, value);
     }
     pub fn snapshot(&self) -> Value {
-        let mut v = self.db.lock().unwrap().clone();
+        // Verification plans/results are fetched for the selected session only.
+        // Do not resend every archived session's detailed report on each update.
+        let mut v = Value::Object(self.db.lock().unwrap().as_object().unwrap().iter()
+            .filter(|(key, _)| key.as_str() != "verifications")
+            .map(|(key, value)| (key.clone(), value.clone())).collect());
         let mut links = v["links"].take();
         if let (Some(sessions), Some(links)) = (v["sessions"].as_array(), links.as_array_mut()) {
             let sessions: HashMap<_, _> = sessions
@@ -464,6 +497,26 @@ pub fn git_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn streamed_workspace_json_replaces_atomically_and_failed_serialization_keeps_original() {
+        struct Fail;
+        impl serde::Serialize for Fail {
+            fn serialize<S:serde::Serializer>(&self,_serializer:S)->std::result::Result<S::Ok,S::Error> {
+                Err(serde::ser::Error::custom("synthetic serialization failure"))
+            }
+        }
+        let directory=std::env::temp_dir().join(format!("workflow-json-{}",id()));
+        fs::create_dir(&directory).unwrap();
+        let path=directory.join("workspace.json");
+        let value=json!({"sessions":(0..600).map(|i|json!({"id":i,"archived":i%2==0})).collect::<Vec<_>>()});
+        atomic_json(&path,&value).unwrap();
+        let before=fs::read(&path).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&before).unwrap(),value);
+        assert!(atomic_json(&path,&Fail).is_err());
+        assert_eq!(fs::read(&path).unwrap(),before);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(),1);
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[cfg(unix)]
     #[test]

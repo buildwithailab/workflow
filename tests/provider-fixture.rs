@@ -76,6 +76,13 @@ fn main() -> io::Result<()> {
             }
         }
     }
+    if env::current_dir()?.join("terminal-memory-fixture").is_file() {
+        // Generated pressure only: never store captured user/provider output.
+        let row = "synthetic terminal output ".repeat(12);
+        for _ in 0..4096 {
+            println!("{row}");
+        }
+    }
     if updating {
         print!("\r\nCheck execution permissions\r\nUpdate available\r\n1. Update now\r\n2. Skip\r\n3. Skip until next version\r\nenter continue · esc skip");
     } else {
@@ -171,6 +178,9 @@ fn chat_terminal(provider: &str) -> io::Result<()> {
     }
     if env::current_dir()?.join("notification-terminal-fixture").is_file() {
         return notification_terminal();
+    }
+    if env::current_dir()?.join("verification-terminal-fixture").is_file() {
+        return verification_terminal(provider);
     }
     let native = provider != "codex";
     let ready = "\x1b[?2004h\x1b[2J\x1b[H› Ask Codex to do anything\x1b[1;3H";
@@ -449,6 +459,85 @@ fn chat_terminal(provider: &str) -> io::Result<()> {
 }
 
 #[cfg(any(windows, unix))]
+fn verification_terminal(provider: &str) -> io::Result<()> {
+    let show = |draft: &str| {
+        if provider == "codex" {
+            let text = if draft.is_empty() { "Ask Codex to do anything" } else { draft };
+            print!("\x1b[?2004h\x1b[2J\x1b[H› {text}");
+            if draft.is_empty() { print!("\x1b[1;3H"); }
+        } else {
+            let footer = if provider == "claude" { "? for shortcuts" } else { "Interactive · Manual Approval" };
+            print!("\x1b[?2004h\x1b[2J\x1b[H─────────\r\n❯ {draft}\r\n─────────\r\n{footer}");
+        }
+        io::stdout().flush()
+    };
+    let directory = PathBuf::from(env::var_os("WORKFLOW_TEST_INPUT_DIR").unwrap());
+    fs::create_dir_all(&directory)?;
+    let mut input = io::stdin().lock();
+    let mut packet = [0; 1024];
+    let mut bytes = Vec::new();
+    let mut sequence = 0;
+    let mut awaiting_tool_approval = false;
+    let native_mcp = provider == "codex" && env::current_dir()?.join("codex-mcp-permission-fixture").is_file();
+    let mut approval_selection: usize = 1;
+    let mut approval_operation = String::new();
+    let mut approval_keys = Vec::new();
+    let show_mcp = |selected:usize, operation:&str| -> io::Result<()> {
+        print!("\x1b[?2004h\x1b[2J\x1b[HField 1/1\r\nAllow the workflow MCP server to run tool \"verification_request\"?\r\n\r\noperation: {operation}\r\n\r\n");
+        for (index,(label,description)) in [("Allow","Run the tool and continue."),
+            ("Allow for this session","Run the tool and remember this choice for this session."),
+            ("Always allow","Run the tool and remember this choice for future requests."),
+            ("Cancel","Cancel this tool call")].iter().enumerate() {
+            print!("{} {}. {label}  {description}\r\n",if selected==index+1 {"›"}else{" "},index+1);
+        }
+        print!("enter to submit | esc to cancel");
+        io::stdout().flush()
+    };
+    show("")?;
+    loop {
+        let size = input.read(&mut packet)?;
+        if size == 0 { return Ok(()); }
+        bytes.extend_from_slice(&packet[..size]);
+        let submitted = bytes.last() == Some(&b'\r');
+        if awaiting_tool_approval {
+            approval_keys.extend_from_slice(&packet[..size]);
+            if submitted {
+                fs::write(directory.join(format!("{provider}-tool-approval.bin")), &approval_keys)?;
+                bytes.clear();
+                awaiting_tool_approval = false;
+                show("")?;
+            } else if native_mcp {
+                if bytes.ends_with(b"\x1b[B") { approval_selection=(approval_selection+1).min(4); }
+                if bytes.ends_with(b"\x1b[A") { approval_selection=approval_selection.saturating_sub(1).max(1); }
+                bytes.clear();
+                show_mcp(approval_selection,&approval_operation)?;
+            }
+            continue;
+        }
+        let draft = String::from_utf8_lossy(&bytes).replace("\x1b[200~", "").replace("\x1b[201~", "");
+        if submitted {
+            sequence += 1;
+            fs::write(directory.join(format!("{provider}-verification-{sequence}.bin")), &bytes)?;
+            bytes.clear();
+            if sequence == 1 && env::current_dir()?.join("verification-tool-approval-fixture").is_file()
+                && !directory.join(format!("{provider}-tool-approval.bin")).is_file()
+            {
+                if native_mcp {
+                    approval_operation = draft.split_once("operation ").and_then(|(_,tail)|tail.split_whitespace().next()).unwrap_or("sample").to_owned();
+                    show_mcp(approval_selection,&approval_operation)?;
+                } else {
+                    print!("\x1b[?2004h\x1b[2J\x1b[HWorkflow tool: verification_propose\r\n› 1. Allow once\r\n  2. Deny\r\nConfirm selection\x1b[2;5H");
+                    io::stdout().flush()?;
+                }
+                awaiting_tool_approval = true;
+            } else { show("")?; }
+        } else {
+            show(&draft)?;
+        }
+        if bytes.len() > 64 * 1024 { return Err(io::Error::other("fixture input too large")); }
+    }
+}
+
 fn notification_terminal() -> io::Result<()> {
     let signal = |kind: &str| print!("\x1b]7501;state={kind}:app=codex\x1b\\");
     let ready = || print!("\x1b[?2004h\x1b[2J\x1b[HDone.\r\n› Ask Codex to do anything\x1b[2;3H");

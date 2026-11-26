@@ -11,6 +11,7 @@ mod clipboard;
 #[path = "platform/macos/clipboard.rs"]
 mod clipboard;
 mod core;
+mod data_management;
 mod files;
 mod git;
 mod history;
@@ -36,7 +37,9 @@ mod updates;
 #[cfg(any(windows, target_os = "macos"))]
 mod update_manifest;
 mod usage;
+mod verification;
 mod workspace_archive;
+mod workspace_cleanup;
 use crate::core::*;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -107,12 +110,14 @@ async fn dispatch(
 fn route(core: &Arc<Core>, domain: &str, action: &str, args: &Value) -> Result<Value> {
     match domain {
         "app" => app_action(core, action, args),
+        "data_management" => data_management::dispatch(core, action, args),
         "terminal" => terminal::dispatch(core, action, args),
         "provider_login" => terminal::login(core, action, args),
         "files" => files::dispatch(core, action, args),
         "git" => git::dispatch(core, action, args),
         "history" => history::dispatch(core, action, args),
         "chat" => chat::dispatch(core, action, args),
+        "verification" => verification::dispatch(core, action, args),
         "notifications" => notifications::dispatch(core, action, args),
         "addons" => addons::dispatch(core, action, args),
         "models" => models::dispatch(core, action, args),
@@ -181,6 +186,7 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             Ok(json!(true))
         }
         "add_project" => {
+            let _operation=core.operations.lock().unwrap();
             let directory = dunce::canonicalize(string(args, "directory")?)?;
             if !directory.is_dir() {
                 bail!("Proje klasörü seç")
@@ -382,6 +388,7 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             core.update_session(sid, patch)
         }
         "link" => {
+            let _operation=core.operations.lock().unwrap();
             let source = string(args, "source")?;
             let target = string(args, "target")?;
             if source == target {

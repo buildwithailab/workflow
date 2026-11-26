@@ -161,6 +161,16 @@ pub(crate) fn sync_enabled(core: &Core) {
     }
 }
 
+pub(crate) fn reset_history(core: &Core) {
+    let mut state = core.notifications.lock().unwrap();
+    state.entries.clear();
+    state.generation += 1;
+    state.revision += 1;
+    state.enabled_since = chrono::Utc::now().timestamp_millis();
+    state.desktop_current = None;
+    core.emit("notifications-updated",state.snapshot());
+}
+
 pub(crate) fn dispatch(core: &Core, action: &str, args: &Value) -> Result<Value> {
     let is_foreground = foreground(core);
     let mut state = core.notifications.lock().unwrap();

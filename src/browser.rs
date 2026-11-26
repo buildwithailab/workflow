@@ -69,6 +69,22 @@ pub struct BrowserState {
     pub chrome: HashMap<String, String>,
     visible: Option<String>,
     traces: HashMap<String, TraceHistory>,
+    trace_order: VecDeque<String>,
+}
+const TRACE_CACHE_SESSIONS: usize = 16;
+const TRACE_IMAGE_BUDGET: usize = 16 * 1024 * 1024;
+const TRACE_FILE_LIMIT: u64 = 4 * 1024 * 1024;
+
+struct OpenReservation(Arc<Core>);
+impl OpenReservation {
+    fn new(core:&Arc<Core>) -> Self {
+        let _operation=core.operations.lock().unwrap();
+        core.browser_opening.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+        Self(core.clone())
+    }
+}
+impl Drop for OpenReservation {
+    fn drop(&mut self) { self.0.browser_opening.fetch_sub(1,std::sync::atomic::Ordering::SeqCst); }
 }
 #[derive(Default, Deserialize, Serialize)]
 struct TraceHistory {
@@ -128,21 +144,27 @@ fn trace_history<'a>(
     browser: &'a mut BrowserState,
 ) -> Result<&'a mut TraceHistory> {
     use std::collections::hash_map::Entry;
+    browser.touch_trace(sid);
     Ok(match browser.traces.entry(sid.to_owned()) {
         Entry::Occupied(entry) => entry.into_mut(),
         Entry::Vacant(entry) => {
             let path = trace_path(core, sid);
-            let bytes = match fs::read(&path) {
+            let file = match fs::File::open(&path) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    fs::read(path.with_extension("previous"))
+                    fs::File::open(path.with_extension("previous"))
                 }
                 result => result,
             };
-            let history = match bytes {
-                Ok(bytes) => serde_json::from_slice(&bytes).context("Tarayıcı kaydı okunamadı")?,
+            let history:TraceHistory = match file {
+                Ok(file) => {
+                    use std::io::Read;
+                    if file.metadata()?.len()>TRACE_FILE_LIMIT { bail!("Tarayıcı kaydı boyut sınırını aşıyor; dosya korundu"); }
+                    serde_json::from_reader(std::io::BufReader::with_capacity(64*1024,file.take(TRACE_FILE_LIMIT+1))).context("Tarayıcı kaydı okunamadı")?
+                },
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => TraceHistory::default(),
                 Err(e) => return Err(e.into()),
             };
+            if history.steps.len()>100 { bail!("Tarayıcı kaydı adım sınırını aşıyor; dosya korundu"); }
             entry.insert(history)
         }
     })
@@ -151,6 +173,29 @@ fn save_trace(core: &Core, sid: &str, history: &TraceHistory) -> Result<()> {
     atomic(&trace_path(core, sid), &serde_json::to_vec(history)?)
 }
 impl BrowserState {
+    pub(crate) fn clear_trace_cache(&mut self) { self.traces.clear(); self.trace_order.clear(); }
+    fn touch_trace(&mut self,sid:&str) {
+        self.trace_order.retain(|id|id!=sid);
+        if !self.traces.contains_key(sid) {
+            while self.traces.len()>=TRACE_CACHE_SESSIONS {
+                let old=self.trace_order.pop_front().or_else(||self.traces.keys().next().cloned());
+                if let Some(old)=old { self.traces.remove(&old); } else { break; }
+            }
+        }
+        self.trace_order.push_back(sid.into());
+    }
+    fn limit_trace_images(&mut self) {
+        let mut bytes:usize=self.traces.values().flat_map(|history|&history.steps).filter_map(|step|step.image.as_ref()).map(String::len).sum();
+        for id in &self.trace_order {
+            if bytes<=TRACE_IMAGE_BUDGET { break; }
+            if let Some(history)=self.traces.get_mut(id) {
+                for step in &mut history.steps {
+                    if bytes<=TRACE_IMAGE_BUDGET { break; }
+                    if let Some(image)=step.image.take() { bytes-=image.len(); }
+                }
+            }
+        }
+    }
     pub fn close(&mut self) {
         for p in self.pages.values() {
             if let Some(r) = &p.remote {
@@ -158,6 +203,12 @@ impl BrowserState {
             }
         }
     }
+}
+fn update_existing_page(core:&Core,p:&Page) -> Result<()> {
+    let mut browser=core.browsers.lock().unwrap();
+    let current=browser.pages.get_mut(&p.id).context("Tarayıcı sekmesi kapandı")?;
+    *current=p.clone();
+    Ok(())
 }
 pub fn url(value: &str) -> Result<url::Url> {
     let raw = value.trim();
@@ -560,6 +611,8 @@ async fn chrome_page(core: &Arc<Core>, sid: &str, address: url::Url) -> Result<P
     .await?
 }
 pub async fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
+    let _reservation=OpenReservation::new(core);
+    if let Some(sid)=args["sessionId"].as_str() { core.session(sid)?; }
     if matches!(
         action,
         "trace" | "trace_summary" | "trace_image" | "trace_clear"
@@ -607,11 +660,7 @@ pub async fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Va
                     p.url = address.to_string();
                     p.picked = None;
                     p.revision += 1;
-                    core.browsers
-                        .lock()
-                        .unwrap()
-                        .pages
-                        .insert(p.id.clone(), p.clone());
+                    update_existing_page(core,&p)?;
                     p
                 }
                 _ => {
@@ -627,11 +676,11 @@ pub async fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Va
         } else {
             native_page(core, sid, address).await?
         };
-        core.browsers
-            .lock()
-            .unwrap()
-            .active
-            .insert(sid.into(), p.id.clone());
+        {
+            let mut browser=core.browsers.lock().unwrap();
+            if !browser.pages.contains_key(&p.id) { bail!("Tarayıcı sekmesi kapandı"); }
+            browser.active.insert(sid.into(),p.id.clone());
+        }
         changed(core, &p);
         return Ok(p.public());
     }
@@ -667,14 +716,14 @@ pub async fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Va
                 }
                 p.picking=true; p.node=None; p.pick_epoch+=1;
             }
-            core.browsers.lock().unwrap().pages.insert(p.id.clone(),p.clone()); changed(core,&p); Ok(p.public())
+            update_existing_page(core,&p)?; changed(core,&p); Ok(p.public())
         },
-        "cancel_pick"=>{cancel_picker(core,&mut p).await?;core.browsers.lock().unwrap().pages.insert(p.id.clone(),p.clone());changed(core,&p);Ok(p.public())},
+        "cancel_pick"=>{cancel_picker(core,&mut p).await?;update_existing_page(core,&p)?;changed(core,&p);Ok(p.public())},
         "clear_pick"=>{
             if args["pickId"].as_str()!=p.picked.as_ref().and_then(|v|v["id"].as_str()){bail!("Seçim değişti")};
             cancel_picker(core,&mut p).await?;
             let _=eval(core,&p,"window.__workflowPick=null").await;
-            p.picked=None; core.browsers.lock().unwrap().pages.insert(p.id.clone(),p.clone());changed(core,&p);Ok(p.public())
+            p.picked=None; update_existing_page(core,&p)?;changed(core,&p);Ok(p.public())
         },
         "poll"=>{
             // UI and agent polling must not consume the same pending selection twice.
@@ -690,7 +739,7 @@ pub async fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Va
                 let _=eval(core,&p,"window.__workflowCancelEscape?.();window.__workflowPickEscape=false").await;
                 let resolved=cdp(core,&p,"DOM.resolveNode",json!({"backendNodeId":node})).await?;let object=string(&resolved["object"],"objectId")?;let capture=format!("function(){{return ({EXTRACT_SCRIPT})(this)}}");let r=cdp(core,&p,"Runtime.callFunctionOn",json!({"objectId":object,"functionDeclaration":capture,"returnByValue":true})).await?;let _=cdp(core,&p,"Runtime.releaseObject",json!({"objectId":object})).await;if !r["result"]["value"].is_null(){p.picked=Some(save_pick(core,&p,r["result"]["value"].clone()).await?);}}
             else if !state["pick"].is_null(){let _=eval(core,&p,"window.__workflowPick=null").await;p.picked=Some(save_pick(core,&p,state["pick"].clone()).await?);p.picking=false;}
-            {let mut b=core.browsers.lock().unwrap();if let Some(current)=b.pages.get(&p.id){if current.revision>p.revision{p.revision=current.revision;p.picked=None;}
+            {let mut b=core.browsers.lock().unwrap();let current=b.pages.get(&p.id).context("Tarayıcı sekmesi kapandı")?;{if current.revision>p.revision{p.revision=current.revision;p.picked=None;}
                 if current.pick_epoch!=observed_epoch {p.pick_epoch=current.pick_epoch;p.picking=current.picking;p.picked=current.picked.clone();p.node=current.node;}
                 else if current.node!=observed_node {p.node=current.node;p.picking=current.picking;}}b.pages.insert(p.id.clone(),p.clone());}Ok(p.public())},
         "response"=>eval(core,&p,"(()=>{const text=document.querySelector('pre')?.textContent||document.body?.innerText||'';let data=null;try{data=JSON.parse(text)}catch{}return {text,json:data};})()").await,
@@ -739,6 +788,8 @@ pub async fn agent_action(
     action: &str,
     args: &Value,
 ) -> Result<Value> {
+    let _reservation=OpenReservation::new(core);
+    core.session(sid)?;
     if action == "read" {
         return dispatch(core, action, args).await;
     }
@@ -809,7 +860,9 @@ pub async fn agent_action(
         let mut browser = core.browsers.lock().unwrap();
         let history = trace_history(core, sid, &mut browser)?;
         history.record(step);
-        save_trace(core, sid, history)
+        let result=save_trace(core, sid, history);
+        browser.limit_trace_images();
+        result
     })();
     if let Err(error) = saved {
         eprintln!("Tarayıcı kaydı saklanamadı: {error}");
@@ -1102,6 +1155,24 @@ const READ_SCRIPT: &str = r#"documentId=>{window.__workflowDocument=documentId;w
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hundreds_of_browser_histories_obey_global_cache_and_image_limits() {
+        let mut browser=BrowserState::default();
+        let image="x".repeat(512*1024);
+        for index in 0..600 {
+            let sid=format!("synthetic-{index}");
+            browser.touch_trace(&sid);
+            let history=browser.traces.entry(sid).or_default();
+            for _ in 0..4 { history.record(TraceStep{details:json!({"kind":"assert","passed":false}),image:Some(image.clone())}); }
+            browser.limit_trace_images();
+            assert!(browser.traces.len()<=TRACE_CACHE_SESSIONS);
+            let bytes:usize=browser.traces.values().flat_map(|history|&history.steps)
+                .filter_map(|step|step.image.as_ref()).map(String::len).sum();
+            assert!(bytes<=TRACE_IMAGE_BUDGET);
+        }
+        browser.clear_trace_cache();
+        assert!(browser.traces.is_empty()&&browser.trace_order.is_empty());
+    }
     #[test]
     fn validates_urls() {
         assert_eq!(

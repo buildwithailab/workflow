@@ -1220,6 +1220,78 @@ body.no-left .sidebar {
   color: var(--accent);
   background: var(--raised);
 }
+#session-view-switch button[aria-expanded="true"] {
+  color: var(--accent);
+  background: var(--raised);
+}
+.session-view-divider {
+  height: 15px;
+  width: 1px;
+  margin-inline: 3px;
+  background: var(--line);
+}
+#session-verification-view svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+#verification-panel {
+  flex: 0 1 auto;
+  min-height: 115px;
+  max-height: min(42vh, 390px);
+  display: flex;
+  flex-direction: column;
+  margin-top: 8px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  overflow: hidden;
+  font-size: 12px;
+}
+#chat-view.has-verification {
+  grid-template-rows: minmax(0, 1fr) auto auto;
+}
+#chat-view > #verification-panel {
+  width: min(calc(100% - 24px), 740px);
+  margin: 0 auto 8px;
+  min-height: 110px;
+  max-height: min(38vh, 340px);
+}
+.verification-header {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+}
+#verification-phase { color: var(--muted); font-size: 11px; flex: 1; }
+.verification-header .icon { width: 24px; height: 24px; }
+#verification-content { overflow: auto; min-height: 0; padding: 0 14px 10px; }
+#verification-panel .help { padding: 0; line-height: 1.5; }
+#verification-panel .verification-scope { font-size: 10px; }
+.verification-note { margin-block: 10px; }
+.verification-items { margin: 10px 0; padding-left: 22px; }
+.verification-items li { padding: 6px 0 9px 3px; }
+.verification-items li + li { border-top: 1px solid var(--line); }
+.verification-items p { white-space: pre-wrap; overflow-wrap: anywhere; margin: 5px 0; line-height: 1.5; }
+.verification-items li > p:first-of-type { color: var(--muted); }
+.verification-result { display: inline-block; font-size: 11px; margin-top: 5px; color: var(--muted); }
+.verification-result.passed { color: var(--accent); }
+.verification-result.failed { color: #ed9a91; }
+.verification-result.blocked { color: #d6bd80; }
+.verification-scope { display: block; margin-top: 8px; font-size: 10px; }
+#verification-actions { display: flex; flex: none; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; padding: 8px 12px; border-top: 1px solid var(--line); }
+#verification-actions button { padding: 6px 10px; font-size: 12px; }
+#verification-actions small { flex-basis: 100%; text-align: end; font-size: 10px; }
+.verification-edit-item { display: grid; grid-template-columns: minmax(0, 1fr) 28px; gap: 6px; margin-top: 10px; }
+.verification-edit-item textarea { grid-column: 1 / -1; width: 100%; min-height: 46px; resize: vertical; }
+.verification-edit-item input { min-width: 0; width: 100%; }
+.verification-edit-item :is(input, textarea) { font: inherit; padding: 7px 9px; }
 .session-terminal-icon {
   font: 600 13px/1 ui-monospace, Consolas, monospace;
 }
@@ -1267,6 +1339,17 @@ body.no-left .sidebar {
   flex-wrap: wrap;
   gap: 8px;
 }
+.chat-output-toggle {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  color: var(--muted);
+  border-color: transparent;
+  background: transparent;
+}
+.chat-output-toggle[aria-expanded="true"] { color: var(--accent); background: var(--raised); }
 #chat-scroll {
   overflow: auto;
   padding: 20px clamp(10px, 3vw, 27px);
@@ -3073,3 +3156,17 @@ dialog::backdrop {
   overflow-wrap: anywhere;
   padding: 4px 0;
 }
+.deferred-terminal { resize: none; }
+.deferred-terminal-content { flex: 1; display: grid; align-content: center; justify-items: center; gap: 10px; padding: 20px; }
+.deferred-state { margin-left: auto; }
+.data-stats { display: grid; grid-template-columns: 1fr auto; gap: 10px 22px; margin: 0 0 20px; }
+.data-stats dt { color: var(--muted); }
+.data-stats dd { margin: 0; font-variant-numeric: tabular-nums; }
+.data-actions, .data-records { display: flex; flex-wrap: wrap; gap: 10px; margin: 16px 0; }
+.data-records { padding-top: 12px; border-top: 1px solid var(--line); }
+.data-records .help { flex-basis: 100%; }
+.history-pagination { position: sticky; top: 0; background: var(--panel); padding-block: 8px; z-index: 1; }
+.history-pagination .help { margin: 0 auto; }
+.cleanup-targets { max-height: 200px; overflow: auto; padding-inline-start: 20px; }
+.cleanup-targets li { margin: 8px 0; }
+.cleanup-targets small { display: block; color: var(--muted); overflow-wrap: anywhere; }

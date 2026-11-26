@@ -160,6 +160,10 @@
             <button id="session-chat-view" type="button" aria-label="Sohbet" title="Sohbet" aria-controls="chat-view" aria-pressed="false">
               <span class="session-chat-icon" aria-hidden="true"></span>
             </button>
+            <span class="session-view-divider" aria-hidden="true"></span>
+            <button id="session-verification-view" type="button" aria-label="Doğrulama" title="Doğrulama" aria-controls="verification-panel" aria-expanded="false">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4.5 6v5.5c0 4 3 7.1 7.5 9.5 4.5-2.4 7.5-5.5 7.5-9.5V6Z"/><path d="m8.5 11.8 2.4 2.4 4.6-4.8"/></svg>
+            </button>
           </div>
         </div>
         <div id="viewport">
@@ -223,6 +227,7 @@
                   <select id="chat-approval" aria-label="Onay seviyesi" title="Onay seviyesi"></select>
                   <button id="chat-model" type="button" class="chat-picker-button" title="Model seç" aria-label="Model seç" aria-haspopup="true" aria-controls="chat-model-menu" aria-expanded="false"><span>Model seç</span></button>
                   <button id="chat-effort" type="button" class="chat-picker-button" title="Düşünme seviyesi" aria-label="Düşünme seviyesi" aria-haspopup="true" aria-controls="chat-model-menu" aria-expanded="false"><span>Düşünme seviyesi</span></button>
+                  <button id="chat-show-terminal-output" type="button" class="quiet chat-output-toggle" title="Canlı Terminal çıktısını göster" aria-label="Canlı Terminal çıktısını göster" aria-expanded="false" aria-controls="chat-terminal-output" hidden><span class="session-terminal-icon" aria-hidden="true">&gt;_</span></button>
                 </div>
                 <button id="chat-bind" type="button" hidden>Konuşmayı seç</button>
                 <button id="chat-start" type="button" hidden>Terminali başlat</button>
@@ -230,13 +235,21 @@
               </div>
               <span id="chat-status" role="status"></span>
               <div id="chat-terminal-peek" hidden>
-                <button id="chat-show-terminal-output" type="button" class="quiet" aria-expanded="false" aria-controls="chat-terminal-output"></button>
                 <pre id="chat-terminal-output" tabindex="0" hidden></pre>
               </div>
               <div id="chat-model-menu" popover role="group"></div>
             </form>
           </section>
         </div>
+        <section id="verification-panel" aria-label="Doğrulama" hidden>
+          <header class="verification-header">
+            <strong>Doğrulama</strong><span id="verification-phase" role="status"></span>
+            <button id="verification-refresh" type="button" class="icon quiet" title="Doğrulama kapsamını yenile" aria-label="Doğrulama kapsamını yenile">↻</button>
+            <button id="verification-close" type="button" class="icon quiet" title="Doğrulamayı kapat" aria-label="Doğrulamayı kapat">×</button>
+          </header>
+          <div id="verification-content"></div>
+          <div id="verification-actions"></div>
+        </section>
         <footer class="footer">
           <span class="row" id="running-status"
             ><i class="dot"></i><span>Çalışan oturum yok</span></span
@@ -525,6 +538,8 @@
     <script src="i18n.js"></script>
     <script src="diff.js"></script>
     <script src="chat.js"></script>
+    <script src="data-management.js"></script>
+    <script src="verification.js"></script>
     <script src="notifications.js"></script>
     <script src="app.js"></script>
   </body>

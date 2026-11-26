@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -21,12 +21,138 @@ use std::{
     time::{Duration, Instant},
 };
 
+// Limit only the display replay. The complete transcript remains on disk.
+const MAX_TERMINAL_REPLAY: usize = 512 * 1024;
+const MAX_OSC_BYTES: usize = 16 * 1024;
+
+#[derive(Default)]
+enum OscState {
+    #[default]
+    Text,
+    Escape,
+    Intermediate,
+    Payload(usize),
+    Discard,
+}
+
+// Shared display bytes for vt100, xterm and login polling. Replacements keep
+// their original byte offsets, so acknowledgements also address the disk log.
+#[derive(Default)]
+struct OscGuard {
+    state: OscState,
+    pending_c2: bool,
+}
+
+impl OscGuard {
+    fn byte(&mut self, byte: u8) -> u8 {
+        use OscState::*;
+        match (&mut self.state, byte) {
+            (_, 0x1b) => self.state = Escape,
+            (Discard, 0x07 | 0x18 | 0x1a) => { self.state = Text; return 0; }
+            (Discard, _) => return 0,
+            (_, 0x18 | 0x1a) | (Payload(_), 0x07) => self.state = Text,
+            (Payload(count), _) if *count >= MAX_OSC_BYTES => {
+                self.state = Discard;
+                return 0x18; // Cancel the open string before either parser can grow it.
+            }
+            (Payload(count), _) => *count += 1,
+            (Escape, b']') => self.state = Payload(0),
+            (Escape, 0x20..=0x2f) => self.state = Intermediate,
+            (Escape | Intermediate, 0x30..=0x7e) => self.state = Text,
+            // C0 (except CAN/SUB), DEL and high bytes do not dispatch an ESC
+            // final in vte. ESC intermediates do not introduce OSC on ']'.
+            _ => {}
+        }
+        byte
+    }
+
+    fn filter(&mut self, input: &[u8], finished: bool, out: &mut Vec<u8>) {
+        out.clear();
+        for &byte in input {
+            if self.pending_c2 {
+                self.pending_c2 = false;
+                // xterm recognizes UTF-8-encoded OSC/ST. Represent these two
+                // codepoints by their equal-length 7-bit forms for both parsers.
+                if matches!(byte, 0x9d | 0x9c) {
+                    out.push(self.byte(0x1b));
+                    out.push(self.byte(if byte == 0x9d { b']' } else { b'\\' }));
+                    continue;
+                }
+                out.push(self.byte(0xc2));
+            }
+            if byte == 0xc2 { self.pending_c2 = true; }
+            else { out.push(self.byte(byte)); }
+        }
+        if finished && self.pending_c2 {
+            self.pending_c2 = false;
+            out.push(self.byte(0xc2));
+        }
+    }
+}
+
+#[derive(Default)]
+struct DisplayStream {
+    subscription: String,
+    pending: Option<u64>,
+    acknowledged: u64,
+    screen_only: bool,
+    frame: u64,
+    dirty: bool,
+}
+impl DisplayStream {
+    fn acknowledge(&mut self, subscription: &str, seq: u64, frame: u64) -> bool {
+        if self.subscription.is_empty() || self.subscription != subscription
+            || self.pending != Some(seq) || self.frame != frame { return false; }
+        self.pending = None;
+        self.acknowledged = seq;
+        true
+    }
+}
+
+fn replay_tail(bytes: &[u8], truncated: bool) -> &[u8] {
+    if !truncated {
+        return bytes;
+    }
+    // A seek may land inside UTF-8 or an ANSI command. Discard that partial row.
+    bytes.iter().position(|byte| *byte == b'\n').map_or(&[], |end| &bytes[end + 1..])
+}
+
+fn saved_terminal_replay(path: &Path) -> Result<Value> {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(json!({"data":"","exited":true,"seq":0,"truncated":false}));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(MAX_TERMINAL_REPLAY as u64);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity((length - start) as usize);
+    file.take(MAX_TERMINAL_REPLAY as u64).read_to_end(&mut bytes)?;
+    let screen_only = start != 0 && !bytes.contains(&b'\n');
+    let replay = if screen_only { &bytes[..] } else { replay_tail(&bytes, start != 0) };
+    let mut display = Vec::with_capacity(replay.len());
+    OscGuard::default().filter(replay, true, &mut display);
+    if screen_only {
+        // Some TUIs redraw only with CR/CSI. Keep their final viewport instead
+        // of treating the entire bounded tail as one disposable partial row.
+        let mut parser = vt100::Parser::new(36,120,0);
+        parser.process(&display);
+        return Ok(json!({"data":B64.encode(parser.screen().state_formatted()),"rows":36,"cols":120,
+            "exited":true,"seq":0,"truncated":true}));
+    }
+    Ok(json!({"data":B64.encode(display),"exited":true,
+        "seq":0,"truncated":start != 0}))
+}
+
 pub struct LiveTerminal {
     pub run_id: String,
     pub pid: u32,
     pub exited: AtomicBool,
     pub history: Mutex<Vec<u8>>,
     pub seq: Mutex<u64>,
+    display: Mutex<DisplayStream>,
     submitted: std::sync::atomic::AtomicU64,
     prompt_answers: std::sync::atomic::AtomicU64,
     unbound_finished: std::sync::atomic::AtomicU64,
@@ -52,6 +178,8 @@ struct TerminalInput {
     terminal_slash: bool,
     thread_uncertain: bool,
     answered_prompt: Option<AnsweredPrompt>,
+    ordinary_draft: bool,
+    ordinary_chars: usize,
 }
 
 struct AnsweredPrompt {
@@ -74,6 +202,38 @@ impl AnsweredPrompt {
 }
 
 impl TerminalInput {
+    fn records_message_submission(&mut self, screen: &vt100::Screen, provider: &str, data: &[u8]) -> bool {
+        if self.ordinary_draft && self.ordinary_chars == 0 {
+            self.ordinary_chars = terminal_composer_draft(screen,provider)
+                .filter(|text| text.trim() != CODEX_EMPTY_PROMPT)
+                .map_or(0,|text| text.chars().count());
+        }
+        let pasted = data.strip_prefix(b"\x1b[200~").and_then(|data| data.strip_suffix(b"\x1b[201~"));
+        let payload = pasted.unwrap_or(data);
+        let text_input = !payload.contains(&0x1b) && std::str::from_utf8(payload)
+            .is_ok_and(|text| text.chars().any(|ch| !ch.is_control()));
+        if native_prompt_ready(screen,provider) && terminal_prompt(screen,provider).is_none()
+            && wrapped_question_preview(screen,provider).is_none()
+        {
+            // Input provenance is essential: an unnumbered selected menu option
+            // can otherwise look identical to a Codex draft at the cursor.
+            if text_input { self.ordinary_draft = true; }
+            if data == b"\x1b[A" { self.ordinary_draft = true; self.ordinary_chars = 1; }
+        }
+        if self.ordinary_draft && text_input {
+            self.ordinary_chars = self.ordinary_chars.saturating_add(std::str::from_utf8(payload)
+                .map_or(0,|text| text.chars().filter(|ch| !ch.is_control()).count()));
+        }
+        if matches!(data,b"\x08"|b"\x7f"|b"\x1b[3~") {
+            self.ordinary_chars = self.ordinary_chars.saturating_sub(1);
+        } else if data == b"\x15" {
+            self.ordinary_chars = 0;
+        }
+        let submitted = terminal_submits_message(screen,provider,data,self.ordinary_draft,self.ordinary_chars);
+        if pasted.is_none() && (data.iter().any(|byte| matches!(byte,b'\r'|b'\n'))
+            || matches!(data,b"\x1b"|b"\x03")) { self.ordinary_draft = false; self.ordinary_chars = 0; }
+        submitted
+    }
     fn write(&mut self, data: &[u8]) -> Result<()> {
         self.revision += 1;
         self.write_bytes(data)
@@ -208,7 +368,99 @@ impl LiveTerminal {
     }
     pub fn snapshot(&self) -> Value {
         let seq = self.seq.lock().unwrap();
-        json!({"runId":self.run_id,"pid":self.pid,"seq":*seq,"data":B64.encode(&*self.history.lock().unwrap()),"exited":self.exited.load(Ordering::SeqCst)})
+        let history = self.history.lock().unwrap();
+        let truncated = *seq > history.len() as u64;
+        if truncated {
+            drop(history);
+            return self.snapshot_screen(*seq);
+        }
+        json!({"runId":self.run_id,"pid":self.pid,"seq":*seq,"data":B64.encode(&*history),
+            "exited":self.exited.load(Ordering::SeqCst),"truncated":false})
+    }
+
+    fn screen_snapshot(&self) -> Value {
+        // The reader uses this same order so the screen and byte sequence agree.
+        let seq = self.seq.lock().unwrap();
+        self.snapshot_screen(*seq)
+    }
+
+    fn login_snapshot(&self, since: u64) -> Value {
+        let seq = self.seq.lock().unwrap();
+        let history = self.history.lock().unwrap();
+        let mut display = self.display.lock().unwrap();
+        if since > *seq || since < seq.saturating_sub(history.len() as u64) {
+            display.screen_only = true;
+        }
+        if display.screen_only && (display.dirty || since != *seq) {
+            display.dirty = false;
+            drop(history);
+            let mut frame = self.snapshot_screen(*seq);
+            frame["reset"] = json!(true);
+            return frame;
+        }
+        let count = seq.saturating_sub(since) as usize;
+        json!({"seq":*seq,"data":B64.encode(&history[history.len()-count..]),
+            "exited":self.exited.load(Ordering::SeqCst)})
+    }
+
+    fn snapshot_screen(&self, seq: u64) -> Value {
+        let parser = self.screen.lock().unwrap();
+        let screen = parser.screen();
+        let (rows, cols) = screen.size();
+        let mut data = if screen.alternate_screen() { b"\x1b[?1049h".to_vec() } else { Vec::new() };
+        data.extend(screen.state_formatted());
+        json!({"runId":self.run_id,"pid":self.pid,"seq":seq,"data":B64.encode(data),
+            "rows":rows,"cols":cols,"exited":self.exited.load(Ordering::SeqCst),"truncated":true})
+    }
+
+    fn subscribe(&self, screen_only: bool) -> Value {
+        let seq = self.seq.lock().unwrap();
+        let history = self.history.lock().unwrap();
+        let screen_only = screen_only || *seq > history.len() as u64;
+        let mut snapshot = if screen_only {
+            drop(history);
+            self.snapshot_screen(*seq)
+        } else {
+            json!({"runId":self.run_id,"pid":self.pid,"seq":*seq,"data":B64.encode(&*history),
+                "exited":self.exited.load(Ordering::SeqCst),"truncated":false})
+        };
+        let subscription = id();
+        *self.display.lock().unwrap() = DisplayStream {
+            subscription: subscription.clone(), pending: Some(*seq), acknowledged: *seq, screen_only,
+            frame: 0, dirty: false,
+        };
+        snapshot["subscription"] = json!(subscription);
+        snapshot["frame"] = json!(0);
+        snapshot
+    }
+
+    // Call only while holding seq. At most one native IPC packet can be in flight
+    // for this renderer; only its matching post-parse acknowledgement advances it.
+    fn display_packet(&self, seq: u64) -> Option<Value> {
+        let mut stream = self.display.lock().unwrap();
+        if stream.subscription.is_empty() || stream.pending.is_some() || (stream.acknowledged >= seq && !stream.dirty) { return None; }
+        let history = self.history.lock().unwrap();
+        let first = seq.saturating_sub(history.len() as u64);
+        if stream.acknowledged < first { stream.screen_only = true; }
+        let mut packet = if stream.screen_only {
+            drop(history);
+            let mut packet = self.snapshot_screen(seq);
+            // A normalized snapshot is always followed by normalized frames.
+            // Never append raw bytes to an incomplete UTF-8/CSI snapshot state.
+            packet["reset"] = json!(true);
+            packet
+        } else {
+            let offset = (stream.acknowledged - first) as usize;
+            let length = (history.len() - offset).min(16 * 1024);
+            json!({"runId":self.run_id,"seq":stream.acknowledged + length as u64,
+                "data":B64.encode(&history[offset..offset+length])})
+        };
+        stream.pending = packet["seq"].as_u64();
+        stream.frame += 1;
+        stream.dirty = false;
+        packet["subscription"] = json!(stream.subscription);
+        packet["frame"] = json!(stream.frame);
+        Some(packet)
     }
 }
 pub fn executable(provider: &str, custom: Option<&str>) -> Option<PathBuf> {
@@ -434,6 +686,9 @@ pub fn start(core: &Arc<Core>, session_id: &str) -> Result<Value> {
     repository.validate(&[directory])?;
     let _guard = core.operations.lock().unwrap();
     let session = core.session(session_id)?;
+    if session["workspaceCleanupPending"]==true || session["workspaceFilesRemoved"]==true {
+        bail!("Bu ayrı çalışma alanı temizlendi veya temizliği yarım kaldı. Veri yönetiminden işlemi tamamla ya da yeni bir oturum oluştur.");
+    }
     if session["directory"] != initial["directory"] {
         bail!(crate::repository_operations::CHANGED);
     }
@@ -558,7 +813,7 @@ pub fn start(core: &Arc<Core>, session_id: &str) -> Result<Value> {
         let _ = child.wait();
         return Err(error);
     }
-    read_terminal(
+    let output_reader = read_terminal(
         core.clone(),
         t.clone(),
         reader,
@@ -570,13 +825,25 @@ pub fn start(core: &Arc<Core>, session_id: &str) -> Result<Value> {
     let rid = run_id.clone();
     std::thread::spawn(move || {
         let status = child.wait().map(|s| s.exit_code()).unwrap_or(1);
-        let _guard = c.operations.lock().unwrap();
-        tt.exited.store(true, Ordering::SeqCst);
         #[cfg(windows)]
         tt.job.lock().unwrap().take();
         #[cfg(target_os = "macos")]
         tt.group.lock().unwrap().take();
-        let _ = c.update_session(&sid, json!({"state":"stopped","exitCode":status}));
+        // Preserve every final transcript byte before releasing the native PTY,
+        // parser and history. Hundreds of closed sessions must not retain them.
+        drop(tt.master.lock().unwrap().take());
+        let _ = output_reader.join();
+        let _guard = c.operations.lock().unwrap();
+        tt.exited.store(true, Ordering::SeqCst);
+        {
+            let mut terminals = c.terms.lock().unwrap();
+            if terminals.get(&sid).is_some_and(|current| Arc::ptr_eq(current, &tt)) {
+                terminals.remove(&sid);
+            }
+        }
+        if c.session(&sid).ok().is_some_and(|session| session["runId"] == rid) {
+            let _ = c.update_session(&sid, json!({"state":"stopped","exitCode":status}));
+        }
         c.emit("terminal", json!({"id":sid,"runId":rid,"exitCode":status}));
     });
     if provider == "codex"
@@ -605,6 +872,8 @@ pub fn start(core: &Arc<Core>, session_id: &str) -> Result<Value> {
                                 .is_ok()
                             {
                                 *bound = Some(thread);
+                                drop(bound);
+                                let _ = crate::verification::bind_first_conversation(&c, &sid, &run_id);
                             }
                         }
                         break;
@@ -689,6 +958,7 @@ fn spawn_terminal(
         codex_status: Mutex::new(CodexStatus::default()),
         history: Mutex::new(vec![]),
         seq: Mutex::new(0),
+        display: Mutex::new(DisplayStream::default()),
         input: Mutex::new(TerminalInput {
             writer,
             revision: 0,
@@ -697,11 +967,13 @@ fn spawn_terminal(
             terminal_slash: false,
             thread_uncertain: false,
             answered_prompt: None,
+            ordinary_draft: false,
+            ordinary_chars: 0,
         }),
         chat_thread: Mutex::new(None),
         provider: provider.to_owned(),
         master: Mutex::new(Some(pair.master)),
-        screen: Mutex::new(vt100::Parser::new(36, 120, 10000)),
+        screen: Mutex::new(vt100::Parser::new(36, 120, 0)),
         #[cfg(not(target_os = "macos"))]
         killer: Mutex::new(child.clone_killer()),
         #[cfg(windows)]
@@ -724,85 +996,94 @@ fn read_terminal(
             None => (None, None),
         };
         let mut buffer = [0u8; 16384];
+        let mut display = Vec::with_capacity(buffer.len()+1);
+        let mut guard = OscGuard::default();
         let mut query = Vec::<u8>::new();
         let mut completion = CodexCompletion::default();
         loop {
-            match reader.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if let Some(f) = log.as_mut() {
-                        let _ = f.write_all(&buffer[..n]);
+            let received = reader.read(&mut buffer).unwrap_or(0);
+            if received > 0 {
+                if let Some(f) = log.as_mut() {
+                    let _ = f.write_all(&buffer[..received]);
+                }
+            }
+            guard.filter(&buffer[..received], received == 0, &mut display);
+            let n = display.len();
+            if n > 0 {
+                let buffer = &display;
+                let mut seq = tt.seq.lock().unwrap();
+                {
+                    let mut parser = tt.screen.lock().unwrap();
+                    for byte in &buffer[..n] {
+                        parser.process(&[*byte]);
+                        query.push(*byte);
+                        if query.len() > 16 {
+                            query.remove(0);
+                        }
+                        if query.ends_with(b"\x1b[6n") {
+                            let (row, col) = parser.screen().cursor_position();
+                            let _ = tt.input.lock().unwrap().write_bytes(
+                                format!("\x1b[{};{}R", row + 1, col + 1).as_bytes(),
+                            );
+                            query.clear();
+                        } else if query.ends_with(b"\x1b[c") || query.ends_with(b"\x1b[0c") {
+                            let _ = tt.input.lock().unwrap().write_bytes(b"\x1b[?1;2c");
+                            query.clear();
+                        } else if query.ends_with(b"\x1b[>c") {
+                            let _ = tt.input.lock().unwrap().write_bytes(b"\x1b[>0;1;0c");
+                            query.clear();
+                        }
                     }
+                    // A fast turn can redraw straight from the verified draft to the empty composer.
+                    let mut input = tt.input.lock().unwrap();
+                    let submitted = tt.submitted.load(Ordering::Relaxed);
+                    if tt.provider == "codex" && !input.thread_uncertain {
+                        tt.codex_status
+                            .lock()
+                            .unwrap()
+                            .observe(&buffer[..n], submitted);
+                    }
+                    if tt.provider == "codex"
+                        && submitted > tt.unbound_finished.load(Ordering::Relaxed)
+                        && !input.thread_uncertain
+                        && tt.chat_thread.lock().unwrap().is_none()
+                        && completion.observe(submitted, &buffer[..n], parser.screen())
                     {
-                        let mut parser = tt.screen.lock().unwrap();
-                        for byte in &buffer[..n] {
-                            parser.process(&[*byte]);
-                            query.push(*byte);
-                            if query.len() > 16 {
-                                query.remove(0);
-                            }
-                            if query.ends_with(b"\x1b[6n") {
-                                let (row, col) = parser.screen().cursor_position();
-                                let _ = tt.input.lock().unwrap().write_bytes(
-                                    format!("\x1b[{};{}R", row + 1, col + 1).as_bytes(),
-                                );
-                                query.clear();
-                            } else if query.ends_with(b"\x1b[c") || query.ends_with(b"\x1b[0c") {
-                                let _ = tt.input.lock().unwrap().write_bytes(b"\x1b[?1;2c");
-                                query.clear();
-                            } else if query.ends_with(b"\x1b[>c") {
-                                let _ = tt.input.lock().unwrap().write_bytes(b"\x1b[>0;1;0c");
-                                query.clear();
-                            }
-                        }
-                        // A fast turn can redraw straight from the verified draft to the empty composer.
-                        let mut input = tt.input.lock().unwrap();
-                        let submitted = tt.submitted.load(Ordering::Relaxed);
-                        if tt.provider == "codex" && !input.thread_uncertain {
-                            tt.codex_status
-                                .lock()
-                                .unwrap()
-                                .observe(&buffer[..n], submitted);
-                        }
-                        if tt.provider == "codex"
-                            && submitted > tt.unbound_finished.load(Ordering::Relaxed)
-                            && !input.thread_uncertain
-                            && tt.chat_thread.lock().unwrap().is_none()
-                            && completion.observe(submitted, &buffer[..n], parser.screen())
+                        tt.unbound_finished.store(submitted, Ordering::Relaxed);
+                    }
+                    input.chat_pending = false;
+                    if input.ordinary_draft && input.ordinary_chars == 0
+                        && native_prompt_ready(parser.screen(), &tt.provider)
+                    { input.ordinary_draft = false; }
+                    if let Some(answered) = &input.answered_prompt {
+                        let different_menu = !input.chat_pasting
+                            && terminal_prompt(parser.screen(), &tt.provider).is_some_and(
+                                |prompt| prompt.menu.is_some() && !answered.matches(&prompt),
+                            );
+                        if different_menu
+                            || provider_prompt_ready(parser.screen(), &tt.provider)
                         {
-                            tt.unbound_finished.store(submitted, Ordering::Relaxed);
-                        }
-                        input.chat_pending = false;
-                        if let Some(answered) = &input.answered_prompt {
-                            let different_menu = !input.chat_pasting
-                                && terminal_prompt(parser.screen(), &tt.provider).is_some_and(
-                                    |prompt| prompt.menu.is_some() && !answered.matches(&prompt),
-                                );
-                            if different_menu
-                                || provider_prompt_ready(parser.screen(), &tt.provider)
-                            {
-                                input.answered_prompt = None;
-                            }
+                            input.answered_prompt = None;
                         }
                     }
-                    let mut seq = tt.seq.lock().unwrap();
-                    *seq += n as u64;
-                    {
-                        let mut h = tt.history.lock().unwrap();
-                        h.extend_from_slice(&buffer[..n]);
-                        if h.len() > 16 * 1024 * 1024 {
-                            let drain = h.len() - 12 * 1024 * 1024;
-                            h.drain(..drain);
-                        }
+                }
+                *seq += n as u64;
+                {
+                    let mut h = tt.history.lock().unwrap();
+                    h.extend_from_slice(&buffer[..n]);
+                    if h.len() > MAX_TERMINAL_REPLAY {
+                        let drain = h.len() - MAX_TERMINAL_REPLAY * 3 / 4;
+                        h.drain(..drain);
                     }
-                    if let Some(sid) = &session_id {
-                        core.emit(
-                            "terminal",
-                            json!({"id":sid,"runId":tt.run_id,"seq":*seq,"data":B64.encode(&buffer[..n])}),
-                        );
+                }
+                if let Some(sid) = &session_id {
+                    if let Some(mut packet) = tt.display_packet(*seq) {
+                        packet["id"] = json!(sid);
+                        core.emit("terminal",packet);
                     }
                 }
             }
+            if received == 0 { break; }
         }
     })
 }
@@ -814,6 +1095,7 @@ pub struct LoginTerminal {
 }
 
 impl LoginTerminal {
+    pub(crate) fn running(&self) -> bool { !self.terminal.exited.load(Ordering::SeqCst) }
     pub(crate) fn uses_account(&self, provider: &str, account_id: &str) -> bool {
         self.provider == provider
             && self.account_id == account_id
@@ -902,17 +1184,7 @@ pub fn login(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
         bail!("Hesap girişi kapalı")
     };
     match action {
-        "poll" => {
-            let seq = terminal.seq.lock().unwrap();
-            let history = terminal.history.lock().unwrap();
-            let since = args["since"].as_u64().unwrap_or(0);
-            let count = seq.saturating_sub(since).min(history.len() as u64) as usize;
-            Ok(json!({
-                "seq":*seq,
-                "data":B64.encode(&history[history.len()-count..]),
-                "exited":terminal.exited.load(Ordering::SeqCst)
-            }))
-        }
+        "poll" => Ok(terminal.login_snapshot(args["since"].as_u64().unwrap_or(0))),
         "write" => {
             terminal.write(string(args, "data")?.as_bytes())?;
             Ok(json!(true))
@@ -942,8 +1214,10 @@ pub fn get(core: &Core, args: &Value) -> Result<Arc<LiveTerminal>> {
     Ok(t)
 }
 fn resize_terminal(t: &LiveTerminal, args: &Value) -> Result<Value> {
+    let _seq = t.seq.lock().unwrap();
     let cols = args["cols"].as_u64().unwrap_or(120).clamp(20, 500) as u16;
     let rows = args["rows"].as_u64().unwrap_or(36).clamp(5, 300) as u16;
+    if t.screen.lock().unwrap().screen().size() == (rows,cols) { return Ok(json!(true)); }
     t.master
         .lock()
         .unwrap()
@@ -956,6 +1230,8 @@ fn resize_terminal(t: &LiveTerminal, args: &Value) -> Result<Value> {
             pixel_height: 0,
         })?;
     t.screen.lock().unwrap().screen_mut().set_size(rows, cols);
+    let mut display = t.display.lock().unwrap();
+    if display.screen_only { display.dirty = true; }
     Ok(json!(true))
 }
 
@@ -996,6 +1272,46 @@ fn provider_prompt_ready(screen: &vt100::Screen, provider: &str) -> bool {
     native_prompt_ready(screen, provider) && terminal_prompt(screen, provider).is_none()
 }
 
+// Permission menus are not ordinary messages, even when a new CLI version or
+// locale uses an overlay that our question parser does not yet recognize.
+// Require a positive editable composer and actual draft text, never merely
+// "not an empty composer". Wrapped Codex drafts still count as new requests.
+fn terminal_submits_message(screen: &vt100::Screen, provider: &str, data: &[u8], entered_in_composer: bool, pending_chars: usize) -> bool {
+    if data.contains(&0x1b) || !data.iter().any(|byte| matches!(byte,b'\r'|b'\n'))
+        || terminal_prompt(screen,provider).is_some()
+        || wrapped_question_preview(screen,provider).is_some()
+    { return false; }
+    if !entered_in_composer { return false; }
+    if native_prompt_ready(screen,provider) {
+        return pending_chars > 0;
+    }
+    terminal_composer_draft(screen,provider).is_some_and(|draft| {
+        let text = draft.trim();
+        !text.is_empty() && text != CODEX_EMPTY_PROMPT
+    })
+}
+
+fn terminal_composer_draft(screen: &vt100::Screen, provider: &str) -> Option<String> {
+    if provider == "codex" {
+        if !screen.bracketed_paste() || !codex_composer_unblocked(screen) { return None; }
+        let rows = screen.rows(0, screen.size().1).collect::<Vec<_>>();
+        let mut first = screen.cursor_position().0 as usize;
+        let mut last = first;
+        while first > 0 && screen.row_wrapped((first-1) as u16) { first -= 1; }
+        while last+1 < rows.len() && screen.row_wrapped(last as u16) { last += 1; }
+        rows[first..=last].join("").trim_start().strip_prefix(['›','❯','>']).map(str::to_owned)
+    } else {
+        provider_composer(screen).and_then(|(draft,footer)| {
+            let tags: &[&str] = match provider {
+                "claude" => &["for shortcuts", "/effort", "mode on", "accept edits on"],
+                "copilot" => &["manual approval", "assisted approval"],
+                _ => return None,
+            };
+            tags.iter().any(|tag| footer.contains(tag)).then_some(draft)
+        })
+    }
+}
+
 fn native_prompt_ready(screen: &vt100::Screen, provider: &str) -> bool {
     if provider == "codex" {
         return codex_prompt_ready(screen);
@@ -1022,7 +1338,7 @@ fn screen_text(screen: &vt100::Screen, start: usize) -> String {
 }
 
 fn question_overlay(text: &str) -> bool {
-    ["enter to select", "to submit answer", "to submit all", "to navigate questions",
+    ["enter to select", "enter to submit", "to submit answer", "to submit all", "to navigate questions",
         "tab/arrow keys to navigate", "tab/arrow keys to switch"]
         .iter().any(|hint| text.contains(hint))
 }
@@ -1430,6 +1746,113 @@ fn terminal_menu(lines: &[&str], footer: &str, kind: &str, provider: &str) -> Op
     })
 }
 
+fn mcp_tool_heading(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("allow the ") else { return false; };
+    let Some((server, tool)) = rest.split_once(" mcp server to run tool ") else { return false; };
+    let Some(tool) = tool.strip_prefix('"').and_then(|text| text.strip_suffix("\"?")) else { return false; };
+    !server.trim().is_empty() && !server.contains(['…','\n','\r']) && !server.contains("...")
+        && !tool.is_empty() && !tool.contains("...")
+        && tool.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_./:-".contains(&byte))
+}
+
+// Codex renders MCP tool approval as a one-field elicitation, not its command
+// approval modal. Keep this protocol separate: "submit" and "confirm" have
+// different meanings, and accepting a multi-field form would be unsafe.
+fn codex_mcp_prompt(screen: &vt100::Screen, rows: &[String], start: usize, end: usize) -> Option<TerminalPrompt> {
+    let header = (start..end).rev().find(|&row| rows[row].trim_start().to_ascii_lowercase().starts_with("allow the "))?;
+    let mut heading = String::new();
+    let mut header_end = header;
+    let mut complete_heading = false;
+    for (row, line) in rows.iter().enumerate().take(end.min(header+4)).skip(header) {
+        if row > header && (line.trim().is_empty() || menu_line(line).is_some()) { break; }
+        if !heading.is_empty() && !screen.row_wrapped((row-1) as u16) { heading.push(' '); }
+        heading.push_str(line.trim());
+        header_end = row+1;
+        if mcp_tool_heading(&heading) { complete_heading = true; break; }
+    }
+    if !heading.to_ascii_lowercase().contains("mcp server") { return None; }
+    let first = (header_end..end).find(|&row| menu_line(&rows[row]).is_some());
+    // The screen may contain a completed dialog above the current composer.
+    if let Some(first) = first {
+        let cursor = screen.cursor_position().0 as usize;
+        if cursor > first && terminal_composer_draft(screen,"codex").is_some()
+            && rows[first..cursor].iter().any(|line| line.to_ascii_lowercase().contains("enter to submit"))
+        { return None; }
+    }
+    let field = rows[start..header].iter().rev().find(|line| !line.trim().is_empty());
+    let single_field = field.is_some_and(|line| {
+        let lower = line.trim().to_ascii_lowercase();
+        lower == "field 1/1" || lower.starts_with("field 1/1 (")
+    });
+    let last_option = (header_end..end).rfind(|&row| menu_line(&rows[row]).is_some());
+    let footer_rows = &rows[last_option.map_or(end,|row| row+1)..end];
+    let footer = footer_rows.join(" ").to_ascii_lowercase();
+    let submit = footer_rows.iter().any(|line| {
+        line.to_ascii_lowercase().split(['|','·','│','•']).any(|part| {
+            part.trim().strip_prefix("press ").unwrap_or(part.trim()) == "enter to submit"
+        })
+    });
+    let mut choices = Vec::new();
+    let mut descriptions = Vec::<String>::new();
+    let mut selected = None;
+    let mut identity = String::new();
+    let mut valid = complete_heading && single_field && submit && footer.contains("esc to cancel");
+    let mut ended = false;
+    for line in &rows[header..end] {
+        if line.contains('…') || line.contains("...") { valid = false; }
+        if let Some((number, text, focused)) = menu_line(line) {
+            if ended || number != choices.len()+1 || (focused && selected.replace(number).is_some()) { valid = false; }
+            let parsed = ["Allow for this session","Always allow","Allow","Cancel"]
+                .iter().find_map(|label| text.strip_prefix(label)
+                    .filter(|rest| rest.is_empty() || rest.starts_with("  ") || rest.starts_with('\t'))
+                    .map(|rest| ((*label).to_owned(), rest.trim().to_owned())));
+            if let Some((label,description)) = parsed {
+                choices.push(label);
+                descriptions.push(description);
+            } else { valid = false; }
+            identity.push_str(&format!("{number}. {text}\n"));
+        } else {
+            identity.push_str(line);
+            identity.push('\n');
+            if !choices.is_empty() {
+                if line.to_ascii_lowercase().contains("enter to submit") { ended = true; }
+                else if !line.trim().is_empty() && !ended {
+                    if let Some(description) = descriptions.last_mut() {
+                        if !description.is_empty() { description.push(' '); }
+                        description.push_str(line.trim());
+                    }
+                }
+            }
+        }
+    }
+    valid &= choices.first().is_some_and(|label| label=="Allow")
+        && choices.last().is_some_and(|label| label=="Cancel")
+        && (2..=4).contains(&choices.len())
+        && choices.iter().collect::<std::collections::HashSet<_>>().len() == choices.len()
+        && selected.is_some_and(|number| number<=choices.len());
+    for (label,description) in choices.iter().zip(&descriptions) {
+        let expected = match label.as_str() {
+            "Allow" => "Run the tool and continue",
+            "Allow for this session" => "Run the tool and remember this choice for this session",
+            "Always allow" => "Run the tool and remember this choice for future requests",
+            "Cancel" => "Cancel this tool call",
+            _ => { valid = false; continue; },
+        };
+        let normalized = description.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !normalized.is_empty() && !normalized.trim_end_matches('.').eq_ignore_ascii_case(expected) {
+            valid = false;
+        }
+    }
+    let question_end = first.unwrap_or(end);
+    let menu = valid.then(|| TerminalMenu {
+        key: crate::core::hash(identity.as_bytes()), selected:selected.unwrap_or(1), choices, descriptions,
+        question: rows[header..question_end].join("\n").trim().to_owned(), custom_choice:None,
+        context: question_context(&rows[header..end].join("\n")), input_revision:0,
+    });
+    Some(TerminalPrompt {kind:"approval",text:rows[header..end].join("\n").trim().to_owned(),menu,first_row:header,end_row:end})
+}
+
 fn terminal_prompt(screen: &vt100::Screen, provider: &str) -> Option<TerminalPrompt> {
     let rows = screen.rows(0, screen.size().1).collect::<Vec<_>>();
     let end = rows.iter().rposition(|line| !line.trim().is_empty())? + 1;
@@ -1447,6 +1870,9 @@ fn terminal_prompt(screen: &vt100::Screen, provider: &str) -> Option<TerminalPro
         }) {
             display_start = frame + 3;
         }
+    }
+    if provider == "codex" {
+        if let Some(prompt) = codex_mcp_prompt(screen,&rows,display_start,end) { return Some(prompt); }
     }
     let visible = rows.get(display_start.max(end.saturating_sub(30))..end)?;
     let cues = visible
@@ -1718,13 +2144,14 @@ pub(crate) fn chat_state(core: &Core, session: &Value, include_output: bool) -> 
     state.run_id = Some(terminal.run_id.clone());
     state.prompt = terminal_prompt(screen.screen(), &terminal.provider)
         .or_else(|| wrapped_question_preview(screen.screen(), &terminal.provider));
+    let raw_prompt_visible = state.prompt.is_some();
+    if state.prompt.as_ref().is_some_and(|prompt| input.answered_prompt.as_ref()
+        .is_some_and(|answered| answered.matches(prompt))) {
+        state.prompt = None;
+    }
     if let Some(prompt) = &mut state.prompt {
         if !chat_is_bound(session)
             || input.chat_pasting
-            || input
-                .answered_prompt
-                .as_ref()
-                .is_some_and(|answered| answered.matches(prompt))
         {
             prompt.menu = None;
         } else if let Some(menu) = &mut prompt.menu {
@@ -1760,7 +2187,7 @@ pub(crate) fn chat_state(core: &Core, session: &Value, include_output: bool) -> 
         && !input.chat_pasting
         && !input.chat_pending
         && !input.terminal_slash
-        && state.prompt.is_none()
+        && !raw_prompt_visible
         && native_prompt_ready(screen.screen(), &terminal.provider)
     {
         state.ticket = json!({"runId":terminal.run_id,"inputRevision":input.revision});
@@ -2187,6 +2614,14 @@ fn codex_draft_visible(screen: &vt100::Screen, text: &str, indent: usize) -> boo
 }
 
 pub(crate) fn send_chat(core: &Core, args: &Value) -> Result<Value> {
+    send_chat_for(core, args, None)
+}
+
+pub(crate) fn send_verification(core: &Core, args: &Value, operation: &str) -> Result<Value> {
+    send_chat_for(core, args, Some(operation))
+}
+
+fn send_chat_for(core: &Core, args: &Value, operation: Option<&str>) -> Result<Value> {
     let text = string(args, "text")?;
     let terminal = get(core, args)?;
     let input = if terminal.provider == "codex" {
@@ -2194,7 +2629,7 @@ pub(crate) fn send_chat(core: &Core, args: &Value) -> Result<Value> {
     } else {
         chat_input_for(text, &terminal.provider)?
     };
-    submit_chat_input(core, args, text, &input, |_, _| Ok(()))?;
+    submit_chat_input(core, args, text, &input, operation, |_, _| Ok(()))?;
     Ok(json!(true))
 }
 
@@ -2215,7 +2650,7 @@ pub(crate) fn apply_chat_model(
         &confirmation,
         effort,
     );
-    submit_chat_input(core, args, &command, &command, |terminal, revision| {
+    submit_chat_input(core, args, &command, &command, None, |terminal, revision| {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             {
@@ -2247,7 +2682,7 @@ pub(crate) fn apply_copilot_approval(core: &Core, args: &Value, mode: &str) -> R
         ("default", "manual approval")
     };
     let command = format!("/permissions {option}");
-    submit_chat_input(core, args, &command, &command, |terminal, revision| {
+    submit_chat_input(core, args, &command, &command, None, |terminal, revision| {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             {
@@ -2296,6 +2731,7 @@ fn submit_chat_input(
     args: &Value,
     text: &str,
     data: &str,
+    operation: Option<&str>,
     confirm: impl FnOnce(&LiveTerminal, u64) -> Result<()>,
 ) -> Result<()> {
     let guard = core.operations.lock().unwrap();
@@ -2321,12 +2757,21 @@ fn submit_chat_input(
     {
         bail!("Sağlayıcı hazır değil. Terminalde onay veya taslak olup olmadığına bak.");
     }
+    if let Some(operation) = operation {
+        crate::verification::authorize_delivery(core, id, &terminal.run_id, operation)?;
+    } else {
+        crate::verification::invalidate(core, id, "newMessage")?;
+    }
     let composer_row = screen.screen().cursor_position().0 as usize;
     let indent = screen
         .screen()
         .rows(0, screen.screen().size().1)
         .nth(composer_row)
         .map_or(0, |line| line.len() - line.trim_start().len());
+    // A cleared, abandoned raw draft must not leak its provenance into a new
+    // application-delivered message and its later provider permission dialogs.
+    input.ordinary_draft = false;
+    input.ordinary_chars = 0;
     input.write(data.as_bytes())?;
     input.chat_pasting = true;
     let pasted_revision = input.revision;
@@ -2334,7 +2779,7 @@ fn submit_chat_input(
     drop(screen);
     drop(guard);
 
-    let result = submit_chat_draft(core, args, id, text, indent, pasted_revision)
+    let result = submit_chat_draft(core, args, id, text, indent, pasted_revision, operation)
         .and_then(|revision| confirm(&terminal, revision));
     terminal.input.lock().unwrap().chat_pasting = false;
     result
@@ -2347,6 +2792,7 @@ fn submit_chat_draft(
     text: &str,
     indent: usize,
     pasted_revision: u64,
+    operation: Option<&str>,
 ) -> Result<u64> {
     // Codex may treat Enter as part of the paste burst until the draft is rendered.
     let timeout = if get(core, args)?.provider == "codex" {
@@ -2382,6 +2828,9 @@ fn submit_chat_draft(
                 })
             };
             if verified {
+                if let Some(operation) = operation {
+                    crate::verification::authorize_delivery(core, id, &current.run_id, operation)?;
+                }
                 input.write(b"\r")?;
                 current.submitted.fetch_add(1, Ordering::Relaxed);
                 input.chat_pending = true;
@@ -2406,21 +2855,45 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
                 "exited":terminal.exited.load(Ordering::SeqCst)}))
         }
         "start" => start(core, string(args, "id")?),
+        "ack" => {
+            let terminal = get(core,args)?;
+            let seq = terminal.seq.lock().unwrap();
+            {
+                let mut stream = terminal.display.lock().unwrap();
+                let acknowledged = args["seq"].as_u64().context("Terminal çıktı sırası gerekli")?;
+                let frame = args["frame"].as_u64().context("Terminal görüntü sırası gerekli")?;
+                if !stream.acknowledge(string(args,"subscription")?,acknowledged,frame) {
+                    return Ok(json!(false));
+                }
+            }
+            if let Some(mut packet) = terminal.display_packet(*seq) {
+                packet["id"] = args["id"].clone();
+                core.emit("terminal",packet);
+            }
+            Ok(json!(true))
+        }
+        "detach" => {
+            if let Ok(terminal) = get(core,args) {
+                let _seq = terminal.seq.lock().unwrap();
+                let mut stream = terminal.display.lock().unwrap();
+                if stream.subscription == string(args,"subscription")? { *stream = DisplayStream::default(); }
+            }
+            Ok(json!(true))
+        }
         "attach" => {
+            let sid=string(args,"id")?;
+            core.session(sid)?;
             let t = core.terms.lock().unwrap().get(string(args, "id")?).cloned();
             if let Some(t) = t {
-                Ok(t.snapshot())
+                Ok(if args["subscribe"] == true { t.subscribe(args["screenOnly"] == true) }
+                    else if args["screenOnly"] == true { t.screen_snapshot() } else { t.snapshot() })
             } else {
-                let log = core
-                    .directory
-                    .join("transcripts")
-                    .join(format!("{}.ansi", string(args, "id")?));
-                Ok(
-                    json!({"data":B64.encode(fs::read(log).unwrap_or_default()),"exited":true,"seq":0}),
-                )
+                let log = crate::core::safe_path(&core.directory,&format!("transcripts/{sid}.ansi"))?;
+                saved_terminal_replay(&log)
             }
         }
         "write" => {
+            let _guard = core.operations.lock().unwrap();
             let terminal = get(core, args)?;
             let data = string(args, "data")?.as_bytes();
             if matches!(terminal.provider.as_str(), "codex" | "claude" | "copilot") {
@@ -2448,6 +2921,9 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
                 {
                     input.thread_uncertain = true;
                 }
+                if input.records_message_submission(screen.screen(), &terminal.provider, data) {
+                    crate::verification::invalidate(core, string(args, "id")?, "newMessage")?;
+                }
                 input.write_from_terminal(data, composer_empty, visible_draft.as_deref())?;
                 if matches!(data, b"\r" | b"\n" | b"\x1b" | b"\x03")
                     && terminal_prompt(screen.screen(), &terminal.provider).is_some()
@@ -2467,9 +2943,20 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             }
             Ok(json!(true))
         }
-        "resize" => resize_terminal(get(core, args)?.as_ref(), args),
+        "resize" => {
+            let terminal = get(core,args)?;
+            resize_terminal(&terminal,args)?;
+            let seq = terminal.seq.lock().unwrap();
+            if let Some(mut packet) = terminal.display_packet(*seq) {
+                packet["id"] = args["id"].clone(); core.emit("terminal",packet);
+            }
+            Ok(json!(true))
+        }
         "stop" => {
-            get(core, args)?.stop();
+            let _guard = core.operations.lock().unwrap();
+            let terminal = get(core, args)?;
+            crate::verification::invalidate(core, string(args, "id")?, "stopped")?;
+            terminal.stop();
             Ok(json!(true))
         }
         _ => bail!("Geçersiz terminal işlemi"),
@@ -2479,6 +2966,382 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(target_os = "macos"))]
+    #[derive(Debug)]
+    struct TestKiller;
+    #[cfg(not(target_os = "macos"))]
+    impl ChildKiller for TestKiller {
+        fn kill(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> { Box::new(Self) }
+    }
+    fn memory_terminal(provider: &str) -> LiveTerminal {
+        LiveTerminal { run_id:id(),pid:0,exited:AtomicBool::new(false),history:Mutex::new(Vec::new()),seq:Mutex::new(0),
+            display:Mutex::new(DisplayStream::default()),submitted:Default::default(),prompt_answers:Default::default(),
+            unbound_finished:Default::default(),codex_status:Mutex::new(CodexStatus::default()),
+            input:Mutex::new(TerminalInput { writer:Box::new(std::io::sink()),revision:0,chat_pasting:false,chat_pending:false,
+                terminal_slash:false,thread_uncertain:false,answered_prompt:None,ordinary_draft:false,ordinary_chars:0 }),
+            chat_thread:Mutex::new(None),provider:provider.into(),master:Mutex::new(None),screen:Mutex::new(vt100::Parser::new(36,120,0)),
+            #[cfg(not(target_os = "macos"))] killer:Mutex::new(Box::new(TestKiller)),
+            #[cfg(windows)] job:Mutex::new(None),
+            #[cfg(target_os = "macos")] group:Mutex::new(None),
+        }
+    }
+    fn feed_memory_terminal(terminal: &LiveTerminal, data: &[u8]) {
+        let mut seq=terminal.seq.lock().unwrap();
+        terminal.screen.lock().unwrap().process(data);
+        let mut history=terminal.history.lock().unwrap();
+        history.extend_from_slice(data);
+        if history.len()>MAX_TERMINAL_REPLAY { let discard=history.len()-MAX_TERMINAL_REPLAY; history.drain(..discard); }
+        *seq+=data.len() as u64;
+    }
+
+    #[test]
+    fn display_guard_preserves_short_controls_unicode_and_escape_intermediates() {
+        let mut original = "📝\u{075d}\u{a0}\r\n".as_bytes().to_vec();
+        original.extend_from_slice(b"\x1b[31mcolor\x1b[0m\x1b]7501;status=ready\x07");
+        original.extend_from_slice(b"\x1b]0;title\x1b\\\x1b(]"); // ']' is an ESC final here.
+        original.extend(std::iter::repeat_n(b'x', MAX_OSC_BYTES + 2));
+        original.extend_from_slice(b"\x9d\xc2"); // A lone continuation and an incomplete last byte.
+        for size in [1, 3, 16_384] {
+            let mut guard = OscGuard::default();
+            let mut output = Vec::new();
+            let mut chunk = Vec::new();
+            for bytes in original.chunks(size) {
+                guard.filter(bytes, false, &mut chunk);
+                output.extend_from_slice(&chunk);
+            }
+            guard.filter(&[], true, &mut chunk);
+            output.extend_from_slice(&chunk);
+            assert_eq!(output, original);
+        }
+    }
+
+    #[test]
+    fn oversized_display_strings_are_bounded_across_reads_and_recover_at_terminators() {
+        for (opening, ending) in [
+            (&b"\x1b\x01]"[..], &b"\x07"[..]),
+            (&b"\x1b\x7f]"[..], &b"\x1b\\"[..]),
+            (&b"\xc2\x9d"[..], &b"\xc2\x9c"[..]),
+        ] {
+            let mut guard = OscGuard::default();
+            let mut chunk = Vec::new();
+            let mut parser = vt100::Parser::new(12, 80, 0);
+            for byte in opening {
+                guard.filter(&[*byte], false, &mut chunk);
+                parser.process(&chunk);
+            }
+            let body = vec![b'a'; 4096];
+            for _ in 0..MAX_OSC_BYTES / body.len() {
+                guard.filter(&body, false, &mut chunk);
+                assert_eq!(chunk, body);
+                parser.process(&chunk);
+            }
+            guard.filter(&body, false, &mut chunk);
+            assert_eq!(chunk[0], 0x18);
+            assert!(chunk[1..].iter().all(|byte| *byte == 0));
+            parser.process(&chunk);
+            for _ in 0..16 {
+                guard.filter(&body, false, &mut chunk);
+                assert!(chunk.iter().all(|byte| *byte == 0));
+                parser.process(&chunk);
+            }
+            for byte in ending {
+                guard.filter(&[*byte], false, &mut chunk);
+                parser.process(&chunk);
+            }
+            guard.filter(b"ready", true, &mut chunk);
+            parser.process(&chunk);
+            assert_eq!(parser.screen().contents(), "ready");
+        }
+    }
+
+    #[test]
+    fn guarded_replay_and_raw_ack_packets_keep_transcript_offsets_for_all_providers() {
+        for provider in ["codex", "claude", "copilot"] {
+            let terminal = memory_terminal(provider);
+            let initial = terminal.subscribe(false);
+            let token = initial["subscription"].as_str().unwrap();
+            assert!(terminal.display.lock().unwrap().acknowledge(token, 0, 0));
+            let mut raw = b"\xc2\x9d0;".to_vec();
+            raw.extend(std::iter::repeat_n(b'a', 4 * MAX_OSC_BYTES));
+            raw.extend_from_slice(b"\xc2\x9c");
+            raw.extend_from_slice(provider.as_bytes());
+            let mut guard = OscGuard::default();
+            let mut chunk = Vec::new();
+            guard.filter(&raw[..1], false, &mut chunk);
+            assert!(chunk.is_empty());
+            for bytes in raw[1..].chunks(997) {
+                guard.filter(bytes, false, &mut chunk);
+                feed_memory_terminal(&terminal, &chunk);
+            }
+            let final_seq = *terminal.seq.lock().unwrap();
+            assert_eq!(final_seq, raw.len() as u64);
+            let mut rendered = Vec::new();
+            while let Some(packet) = terminal.display_packet(final_seq) {
+                rendered.extend(B64.decode(packet["data"].as_str().unwrap()).unwrap());
+                let seq = packet["seq"].as_u64().unwrap();
+                assert_eq!(seq, rendered.len() as u64);
+                assert!(terminal.display.lock().unwrap().acknowledge(token, seq, packet["frame"].as_u64().unwrap()));
+            }
+            assert_eq!(rendered.len(), raw.len());
+            assert_eq!(rendered[2 + MAX_OSC_BYTES], 0x18);
+            assert!(rendered[3 + MAX_OSC_BYTES..raw.len() - provider.len() - 2].iter().all(|&byte| byte == 0));
+            assert_eq!(terminal.screen.lock().unwrap().screen().contents(), provider);
+            let reattached = terminal.subscribe(false);
+            assert_eq!(B64.decode(reattached["data"].as_str().unwrap()).unwrap(), rendered);
+            let path = std::env::temp_dir().join(format!("workflow-osc-test-{}", id()));
+            fs::write(&path, &raw).unwrap();
+            let replay = saved_terminal_replay(&path).unwrap();
+            assert_eq!(B64.decode(replay["data"].as_str().unwrap()).unwrap(), rendered);
+            assert_eq!(fs::read(&path).unwrap(), raw);
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn lagging_login_poll_uses_complete_frames_after_losing_raw_history() {
+        for provider in ["codex", "claude", "copilot"] {
+            let terminal = memory_terminal(provider);
+            feed_memory_terminal(&terminal, b"login");
+            let initial = terminal.login_snapshot(0);
+            assert_eq!(B64.decode(initial["data"].as_str().unwrap()).unwrap(), b"login");
+            assert!(initial["reset"].is_null());
+            feed_memory_terminal(&terminal, &vec![0; MAX_TERMINAL_REPLAY + 8]);
+            let mut since = 5;
+            for bytes in [&b"\x1b[2J\x1b[Hready "[..], &b"\xf0\x9f"[..], &b"\x93\x9d"[..]] {
+                feed_memory_terminal(&terminal, bytes);
+                let frame = terminal.login_snapshot(since);
+                assert_eq!(frame["reset"], true);
+                assert_eq!((frame["rows"].as_u64(), frame["cols"].as_u64()), (Some(36), Some(120)));
+                let mut renderer = vt100::Parser::new(36, 120, 0);
+                renderer.process(&B64.decode(frame["data"].as_str().unwrap()).unwrap());
+                assert_eq!(renderer.screen().contents(), terminal.screen.lock().unwrap().screen().contents());
+                since = frame["seq"].as_u64().unwrap();
+                assert_eq!(terminal.login_snapshot(since)["data"], "");
+            }
+        }
+    }
+
+    #[test]
+    fn native_terminal_ipc_requires_exact_ack_and_non_subscribers_emit_nothing() {
+        for provider in ["codex","claude","copilot"] {
+            let terminal=memory_terminal(provider);
+            feed_memory_terminal(&terminal,b"ready");
+            assert!(terminal.display_packet(*terminal.seq.lock().unwrap()).is_none());
+            let snapshot=terminal.subscribe(false);
+            let token=snapshot["subscription"].as_str().unwrap();
+            feed_memory_terminal(&terminal,b" first packet");
+            assert!(terminal.display_packet(*terminal.seq.lock().unwrap()).is_none());
+            {
+                let mut display=terminal.display.lock().unwrap();
+                assert!(!display.acknowledge("obsolete",5,0));
+                assert!(!display.acknowledge(token,5,1));
+                assert!(display.acknowledge(token,5,0));
+            }
+            let packet=terminal.display_packet(*terminal.seq.lock().unwrap()).unwrap();
+            assert_eq!(B64.decode(packet["data"].as_str().unwrap()).unwrap(),b" first packet");
+            feed_memory_terminal(&terminal,b" another packet");
+            assert!(terminal.display_packet(*terminal.seq.lock().unwrap()).is_none());
+            assert!(!terminal.display.lock().unwrap().acknowledge(token,5,0));
+            assert!(terminal.display.lock().unwrap().acknowledge(token,packet["seq"].as_u64().unwrap(),1));
+            assert!(terminal.display_packet(*terminal.seq.lock().unwrap()).is_some());
+        }
+    }
+
+    #[test]
+    fn slow_renderer_switches_to_independent_frames_and_retains_split_input_fidelity() {
+        for provider in ["codex","claude","copilot"] {
+            let terminal=memory_terminal(provider);
+            let initial=terminal.subscribe(false);
+            let token=initial["subscription"].as_str().unwrap();
+            feed_memory_terminal(&terminal,&vec![b'x';MAX_TERMINAL_REPLAY+20]);
+            assert!(terminal.display_packet(*terminal.seq.lock().unwrap()).is_none());
+            assert!(terminal.display.lock().unwrap().acknowledge(token,0,0));
+            let first=terminal.display_packet(*terminal.seq.lock().unwrap()).unwrap();
+            assert_eq!(first["reset"],true);
+            let mut frame=1;
+            let mut acknowledged=first["seq"].as_u64().unwrap();
+            for data in [b"\x1b[?1049h\x1b[Halt".as_slice(),b"\x1b[2",b"J\xf0\x9f",b"\x98\x80",b"\x1b[?1049l"] {
+                feed_memory_terminal(&terminal,data);
+                assert!(terminal.display.lock().unwrap().acknowledge(token,acknowledged,frame));
+                let packet=terminal.display_packet(*terminal.seq.lock().unwrap()).unwrap();
+                assert_eq!(packet["reset"],true);
+                let mut renderer=vt100::Parser::new(36,120,0);
+                renderer.process(&B64.decode(packet["data"].as_str().unwrap()).unwrap());
+                assert_eq!(renderer.screen().contents(),terminal.screen.lock().unwrap().screen().contents());
+                frame+=1; acknowledged=packet["seq"].as_u64().unwrap();
+            }
+        }
+    }
+    #[test]
+    fn saved_replay_reads_a_bounded_tail_and_preserves_full_transcripts_for_all_providers() {
+        let directory = std::env::temp_dir().join(format!("workflow-replay-test-{}", id()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("terminal.ansi");
+        for provider in ["codex", "claude", "copilot"] {
+            let mut file = fs::File::create(&path).unwrap();
+            file.write_all(b"retained original transcript\n").unwrap();
+            file.set_len(96 * 1024 * 1024).unwrap();
+            file.seek(SeekFrom::End(0)).unwrap();
+            let suffix = format!("\r\n{provider} current prompt\r\n");
+            file.write_all(suffix.as_bytes()).unwrap();
+            let length = file.metadata().unwrap().len();
+            drop(file);
+            let replay = saved_terminal_replay(&path).unwrap();
+            let bytes = B64.decode(replay["data"].as_str().unwrap()).unwrap();
+            assert_eq!(replay["truncated"], true);
+            assert!(bytes.len() <= MAX_TERMINAL_REPLAY);
+            assert!(bytes.ends_with(suffix.trim_start_matches(['\r','\n']).as_bytes()));
+            assert_eq!(fs::metadata(&path).unwrap().len(), length);
+            let mut first = [0u8; 29];
+            fs::File::open(&path).unwrap().read_exact(&mut first).unwrap();
+            assert_eq!(&first, b"retained original transcript\n");
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn replay_skips_partial_rows_without_splitting_utf8_and_keeps_small_logs() {
+        assert_eq!(replay_tail(b"\x9f\x92\x1b[3\nready\r\n", true), b"ready\r\n");
+        assert!(replay_tail(b"unfinished partial row", true).is_empty());
+        let text = "Türkçe 😀\r\nready".as_bytes();
+        assert_eq!(replay_tail(text, false), text);
+        assert!(saved_terminal_replay(&std::env::temp_dir().join(id())).unwrap()["data"] == "");
+    }
+
+    #[test]
+    fn codex_single_field_mcp_approval_is_actionable_without_widening_scope() {
+        let mut parser=vt100::Parser::new(30,140,0);
+        let header="Allow the workflow MCP server to run tool \"verification_request\"?";
+        let show=|parser:&mut vt100::Parser,selected:usize,arg:&str,field:&str,heading:&str| {
+            let options=[("Allow","Run the tool and continue."),
+                ("Allow for this session","Run the tool and remember this choice for this session."),
+                ("Always allow","Run the tool and remember this choice for future requests."),
+                ("Cancel","Cancel this tool call")];
+            let body=options.iter().enumerate().map(|(index,(label,description))|
+                format!("{} {}. {label}  {description}",if selected==index+1 {"›"}else{" "},index+1))
+                .collect::<Vec<_>>().join("\r\n");
+            parser.process(format!("\x1b[?2004h\x1b[2J\x1b[H{field}\r\n{heading}\r\n\r\noperation: {arg}\r\n\r\n{body}\r\nenter to submit | esc to cancel").as_bytes());
+            terminal_prompt(parser.screen(),"codex").unwrap()
+        };
+        let first=show(&mut parser,1,"sample-A","Field 1/1",header);
+        assert_eq!(first.kind,"approval");
+        let a=first.menu.unwrap();
+        assert_eq!(a.choices,["Allow","Allow for this session","Always allow","Cancel"]);
+        assert_eq!(a.descriptions[0],"Run the tool and continue.");
+        assert!(a.question.contains("sample-A"));
+        let moved=show(&mut parser,2,"sample-A","Field 1/1",header).menu.unwrap();
+        assert_eq!(moved.key,a.key,"selection moves keep the same exact request identity");
+        assert_ne!(show(&mut parser,1,"sample-B","Field 1/1",header).menu.unwrap().key,a.key);
+        assert!(show(&mut parser,1,"sample-A","Field 1/2",header).menu.is_none());
+        assert!(show(&mut parser,1,"sample-A","",header).menu.is_none());
+        assert!(show(&mut parser,1,"sample…","Field 1/1",header).menu.is_none());
+        let wrapped="Allow the workflow MCP server to\r\nrun tool \"verification_request\"?";
+        assert!(show(&mut parser,1,"sample-A","Field 1/1",wrapped).menu.is_some());
+        show(&mut parser,1,"sample-A","Field 1/1",header);
+        let original=parser.screen().contents();
+        for altered in [
+            original.replace("Allow for this session","Allow for this project"),
+            original.replace("1. Allow  ","1. Allow permanently  "),
+            original.replace("1. Allow  ","1. Allow\n  permanently  "),
+            original.replace("enter to submit | esc to cancel","")
+                .replace("operation: sample-A","operation: sample-A\nenter to submit | esc to cancel"),
+        ] {
+            parser.process(format!("\x1b[?2004h\x1b[2J\x1b[H{}",altered.replace('\n',"\r\n")).as_bytes());
+            assert!(terminal_prompt(parser.screen(),"codex").unwrap().menu.is_none(),"unknown scopes and argument text never authorize a shortcut");
+        }
+        show(&mut parser,1,"sample-A","Field 1/1",header);
+        parser.process("\r\n› Ask Codex to do anything\x1b[14;3H".as_bytes());
+        // Re-render a returned ordinary composer at a deterministic row.
+        parser.process(b"\x1b[20;1H\x1b[J");
+        parser.process("› Ask Codex to do anything\x1b[20;3H".as_bytes());
+        assert!(terminal_prompt(parser.screen(),"codex").is_none());
+    }
+    #[test]
+    fn cropped_mcp_approval_still_appears_but_never_guesses_missing_options() {
+        let mut parser=vt100::Parser::new(12,100,0);
+        parser.process("\x1b[?2004hField 1/1\r\nAllow the workflow MCP server to run tool \"verification_request\"?\r\n\r\noperation: sample\r\n› 1. Allow  Run the tool and continue.\r\n  2. Allow for this session".as_bytes());
+        let prompt=terminal_prompt(parser.screen(),"codex").unwrap();
+        assert_eq!(prompt.kind,"approval");
+        assert!(prompt.text.contains("verification_request"));
+        assert!(prompt.menu.is_none());
+    }
+    #[test]
+    fn unknown_tool_approval_enter_is_not_a_new_development_message_for_any_provider() {
+        for provider in ["codex","claude","copilot"] {
+            let mut parser = vt100::Parser::new(24,80,0);
+            parser.process("\x1b[?2004hWorkflow tool: verification_propose\r\n› 1. Allow once\r\n  2. Deny\r\nConfirm selection\x1b[2;5H".as_bytes());
+            // No known English permission heading/footer. This was previously
+            // mistaken for ordinary input solely because the composer wasn't empty.
+            assert!(terminal_prompt(parser.screen(),provider).is_none());
+            for input in [b"\r".as_slice(),b"1\r",b"\x1b[6n",b"\x1b[I"] {
+                assert!(!terminal_submits_message(parser.screen(),provider,input,false,0),"{provider}");
+            }
+        }
+    }
+    #[test]
+    fn only_actual_composer_submissions_revoke_verification() {
+        for provider in ["codex","claude","copilot"] {
+            let mut parser=vt100::Parser::new(24,80,0);
+            if provider=="codex" {
+                parser.process(b"\x1b[?2004h\x1b[2J\x1b[H> Change the API");
+            } else {
+                let footer=if provider=="claude" {"? for shortcuts"} else {"Interactive · Manual Approval"};
+                parser.process(format!("\x1b[?2004h\x1b[2J\x1b[H─────────\r\n❯ Change the API\r\n─────────\r\n{footer}").as_bytes());
+            }
+            assert!(terminal_submits_message(parser.screen(),provider,b"\r",true,1),"{provider}");
+            assert!(!terminal_submits_message(parser.screen(),provider,b"\x1b[200~notes\x1b[201~",true,1));
+        }
+        let mut wrapped=vt100::Parser::new(24,24,0);
+        wrapped.process("\x1b[?2004h› Change the API and its regression tests".as_bytes());
+        assert!(terminal_submits_message(wrapped.screen(),"codex",b"\r",true,1));
+    }
+    #[test]
+    fn menu_text_never_supplies_input_provenance_and_numbered_messages_remain_messages() {
+        for provider in ["codex","claude","copilot"] {
+            let mut input=TerminalInput {writer:Box::new(Vec::<u8>::new()),revision:0,
+                chat_pasting:false,chat_pending:false,terminal_slash:false,thread_uncertain:false,
+                answered_prompt:None,ordinary_draft:false,ordinary_chars:0};
+            for choice in ["Allow once","Yalnızca bu kez izin ver","1. Allow once"] {
+                let mut menu=vt100::Parser::new(24,80,0);
+                menu.process(format!("\x1b[?2004hWorkflow tool\r\n› {choice}\r\nConfirm selection\x1b[2;5H").as_bytes());
+                assert!(!input.records_message_submission(menu.screen(),provider,b"\r"),"{provider}: {choice}");
+            }
+            let show = |draft:&str| if provider=="codex" {
+                format!("\x1b[?2004h\x1b[2J\x1b[H› {}{}",if draft.is_empty(){CODEX_EMPTY_PROMPT}else{draft},if draft.is_empty(){"\x1b[1;3H"}else{""})
+            } else {
+                let footer=if provider=="claude" {"? for shortcuts"}else{"Interactive · Manual Approval"};
+                format!("\x1b[?2004h\x1b[2J\x1b[H─────────\r\n❯ {draft}\r\n─────────\r\n{footer}")
+            };
+            let mut composer=vt100::Parser::new(24,80,0);
+            composer.process(show("").as_bytes());
+            assert!(!input.records_message_submission(composer.screen(),provider,b"1. Update the API"));
+            composer.process(show("1. Update the API").as_bytes());
+            assert!(input.records_message_submission(composer.screen(),provider,b"\r"),"{provider}");
+            assert!(!input.ordinary_draft);
+            composer.process(show("").as_bytes());
+            assert!(!input.records_message_submission(composer.screen(),provider,b"\x1b[A"));
+            composer.process(show("Recalled development request").as_bytes());
+            assert!(input.records_message_submission(composer.screen(),provider,b"\r"),"{provider} history recall");
+            for erase in [b"\x08".as_slice(), b"\x15"] {
+                composer.process(show("").as_bytes());
+                assert!(!input.records_message_submission(composer.screen(),provider,b"x"));
+                composer.process(show("x").as_bytes());
+                assert!(!input.records_message_submission(composer.screen(),provider,erase));
+                composer.process(show("").as_bytes());
+                assert!(!input.records_message_submission(composer.screen(),provider,b"\r"),"{provider} erased draft");
+            }
+            for erase in [b"\x1b[3~".as_slice(),b"\x15"] {
+                composer.process(show("").as_bytes());
+                input.records_message_submission(composer.screen(),provider,b"x");
+                composer.process(show("x").as_bytes());
+                input.records_message_submission(composer.screen(),provider,erase);
+                // Delete can be a no-op at the end; Ctrl-U may leave a suffix.
+                composer.process(show("x").as_bytes());
+                assert!(input.records_message_submission(composer.screen(),provider,b"\r"),"{provider} remaining draft");
+            }
+        }
+    }
     #[test]
     fn claude_effort_is_scoped_to_new_and_resumed_provider_processes() {
         let session = json!({"id":"sample","provider":"claude","model":"sample-model","effort":"high"});
@@ -2894,6 +3757,8 @@ mod tests {
             terminal_slash: false,
             thread_uncertain: false,
             answered_prompt: None,
+            ordinary_draft: false,
+            ordinary_chars: 0,
         };
         input.write_from_terminal(b"/", true, None).unwrap();
         input

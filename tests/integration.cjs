@@ -342,6 +342,201 @@ async function testCopilotNpm() {
   console.log("PASS Copilot npm discovery, launcher and installation option without WinGet");
 }
 
+async function testVerification() {
+  await start();
+  const setup = page.locator("#dialog").getByRole("button", { name: "Skip", exact: true });
+  if (await setup.isVisible()) await setup.click();
+  const sessions = [];
+  const items = [{ title: "Build", check: "Run the build and record its exit status." },
+    { title: "Browser", check: "Open the sample form, enter text and check the visible result." }];
+  const state = id => api("verification", "state", { id });
+  const perform = async (id, action, extra = {}) => api("verification", action, { id, revision: (await state(id)).revision, ...extra });
+  const select = async id => page.evaluate(async id => { await window.workflow.refresh(); window.workflow.selectSession(id, true); }, id);
+  const ready = id => until(async () => !!(await api("chat", "read", { id })).ticket, "verification composer");
+  const captureCount = provider => fs.readdirSync(path.join(data, "test-input")).filter(name => name.startsWith(provider + "-verification-")).length;
+  const propose = async (s, operation, proposal = items) => {
+    const response = await mcp(s.id, "verification_propose", { operation, items: proposal });
+    assert(!response.error, response.error);
+    assert.deepEqual(Object.keys(response.result).sort(), ["count", "phase"]);
+    return state(s.id);
+  };
+  for (const provider of ["codex", "claude", "copilot"]) {
+    const folder = path.join(temporary, provider + "-verification");
+    fs.mkdirSync(folder);
+    for (const marker of ["chat-terminal-fixture", "verification-terminal-fixture", "verification-tool-approval-fixture"]) fs.writeFileSync(path.join(folder, marker), "");
+    if (provider === "codex") fs.writeFileSync(path.join(folder,"codex-mcp-permission-fixture"),"");
+    fs.mkdirSync(path.join(folder, "src", "bin"), { recursive: true });
+    fs.writeFileSync(path.join(folder, "src", "bin", "sample.txt"), "before\n");
+    const project = await api("app", "add_project", { directory: folder });
+    const s = await api("app", "create_session", { projectId: project.id, provider, workspaceMode: "isolated", tools: true });
+    fs.mkdirSync(path.join(s.directory, "src", "bin"), { recursive: true });
+    fs.writeFileSync(path.join(s.directory, "src", "bin", "sample.txt"), "before\n");
+    sessions.push(s);
+    await select(s.id);
+    assert.equal(await page.locator("#verification-panel").isVisible(), false);
+    const beforeActive = (await api("app", "state")).active;
+    await page.locator("#session-verification-view").click();
+    await page.locator("#verification-panel").getByText("Not prepared", { exact: true }).waitFor();
+    await page.locator("#session-chat-view").click();
+    await page.locator("#session-terminal-view").click();
+    await page.locator("#verification-close").click();
+    assert.deepEqual((await api("app", "state")).active, beforeActive, "view controls never start a CLI");
+    assert.equal((await state(s.id)).phase, "idle");
+    await assert.rejects(perform(s.id, "prepare"), /hazır değil/);
+    const terminal = await api("terminal", "start", { id: s.id });
+    await ready(s.id);
+    await select(s.id);
+    await page.locator("#session-verification-view").click();
+    await until(() => page.locator("#verification-panel").getByRole("button", { name: "Prepare verification", exact: true }).isEnabled(), "prepare enabled");
+    await page.locator("#verification-panel").getByRole("button", { name: "Prepare verification", exact: true }).click();
+    await until(async () => (await state(s.id)).phase === "preparing", "preparation request");
+    const prepared = await state(s.id);
+    assert.equal((await api("terminal", "attach", { id: s.id })).runId, terminal.runId);
+    await until(()=>captureCount(provider)===1,"prepare reaches the provider");
+    assert.equal(captureCount(provider), 1);
+    const request = await mcp(s.id, "verification_request", { operation: prepared.operation });
+    assert.equal(request.result.phase, "preparing");
+    assert.match(request.result.instructions, /Do NOT run checks/);
+    if (provider === "codex") {
+      await page.locator("#session-chat-view").click();
+      const permission = page.locator("#chat-terminal-prompt");
+      await permission.getByText("Approval required",{exact:true}).waitFor();
+      await permission.getByRole("button",{name:"2 · Allow for this session",exact:true}).waitFor();
+      assert(await page.locator("#chat-terminal-output").isHidden(),"permission is independent of collapsed output");
+      const interaction = await api("chat","interaction",{id:s.id});
+      assert.equal(interaction.terminalPrompt.kind,"approval");
+      assert.equal(interaction.terminalPrompt.menu.choices[2],"Always allow");
+      if (process.env.WORKFLOW_TEST_CHAT_CAPTURE === "1") {
+        const directory=path.join(root,"target","verification-development");
+        fs.mkdirSync(directory,{recursive:true});
+        await permission.screenshot({path:path.join(directory,"mcp-approval.png")});
+      }
+      await assert.rejects(api("chat","answer_prompt",{id:s.id,runId:terminal.runId,...interaction.terminalPrompt.menu,key:"outdated",choice:2}),/Soru değişti/);
+      await permission.getByRole("button",{name:"2 · Allow for this session",exact:true}).click();
+      await permission.waitFor({state:"hidden"});
+      await until(()=>fs.existsSync(path.join(data,"test-input",provider+"-tool-approval.bin")),"native MCP choice captured");
+      assert.equal(fs.readFileSync(path.join(data,"test-input",provider+"-tool-approval.bin"),"utf8"),"\x1b[B\r","the exact session-scoped choice is submitted once");
+    } else {
+      await until(async () => Buffer.from((await api("terminal", "attach", { id: s.id })).data,"base64").toString().includes("Confirm selection"), "unrecognized tool permission menu");
+      await api("terminal", "write", { id: s.id, runId: terminal.runId, data: "\r" });
+    }
+    await ready(s.id);
+    assert.equal((await state(s.id)).operation, prepared.operation, "permission Enter keeps the preparation valid");
+    assert.equal((await mcp(s.id,"verification_request",{operation:prepared.operation})).result.phase,"preparing");
+    assert((await mcp(s.id, "verification_report", { operation: prepared.operation, results: [] })).error);
+    if (sessions.length > 1) {
+      await api("terminal", "start", { id: sessions[0].id });
+      await ready(sessions[0].id);
+      assert((await mcp(sessions[0].id, "verification_request", { operation: prepared.operation })).error, "another live authenticated session cannot read this operation");
+    }
+    const seven = [...items, ...Array.from({length:5},(_,index)=>({title:"Regression " + (index+1),check:"Record the relevant actual outcome without changing implementation."}))];
+    assert.equal((await propose(s, prepared.operation, seven)).items.length,7,"seven checks survive the tool permission response");
+    await perform(s.id,"edit",{items});
+    await page.locator("#verification-panel").getByRole("button", { name: "Start verification", exact: true }).waitFor();
+    await sleep(350);
+    assert.equal(captureCount(provider), 1, "proposal never starts tests");
+    await page.locator("#verification-panel").getByRole("button", { name: "Edit list", exact: true }).click();
+    await page.getByLabel("Check title 1", { exact: true }).fill("Build and regression");
+    await page.getByLabel("Check procedure 1", { exact: true }).fill("Run build and regression checks; record actual output.");
+    await page.getByRole("button", { name: "Remove check 2", exact: true }).click();
+    await page.locator("#verification-panel").getByRole("button", { name: "Add check", exact: true }).click();
+    await page.getByLabel("Check title 2", { exact: true }).fill("Failure path");
+    await page.getByLabel("Check procedure 2", { exact: true }).fill("Check failure handling without changing source.");
+    await page.locator("#verification-panel").getByRole("button", { name: "Save list", exact: true }).click();
+    await until(async () => (await state(s.id)).items?.[0].title === "Build and regression", "saved checks");
+    assert.equal(captureCount(provider), 1, "editing never sends input");
+    await page.locator("#session-chat-view").click();
+    assert.equal(await page.locator("#chat-view > #verification-panel").count(), 1);
+    await page.locator("#session-terminal-view").click();
+    assert.equal(await page.locator(".main > #verification-panel").count(), 1);
+    assert.equal(await page.locator("#fit").isVisible(), true, "terminal footer remains available");
+    await page.locator("#focus-card").click();
+    assert.equal(await page.locator("#fit").isVisible(), true, "focused terminal keeps its footer");
+    const panelBox = await page.locator("#verification-panel").boundingBox();
+    const footerBox = await page.locator(".main > .footer").boundingBox();
+    assert(panelBox && footerBox && panelBox.y + panelBox.height <= footerBox.y + 1, "verification does not cover the footer");
+    if (process.env.WORKFLOW_TEST_VERIFICATION_CAPTURE === "1" && provider === "codex") {
+      const capture = path.join(root, "target", "verification-development");
+      fs.mkdirSync(capture, { recursive: true });
+      await page.screenshot({ path: path.join(capture, "terminal.png") });
+      await page.locator("#session-chat-view").click();
+      await page.screenshot({ path: path.join(capture, "chat.png") });
+      await page.locator("#session-terminal-view").click();
+    }
+    // Same-size source edit in a source/bin folder must revoke approval.
+    fs.writeFileSync(path.join(s.directory, "src", "bin", "sample.txt"), "after!\n");
+    await assert.rejects(perform(s.id, "start"), /yeniden hazırla/);
+    assert.equal((await state(s.id)).phase, "stale");
+    assert.equal((await state(s.id)).reason, "sourceChanged");
+    await ready(s.id);
+    const cancelled = await perform(s.id, "prepare");
+    await ready(s.id);
+    await perform(s.id, "cancel");
+    const current = await perform(s.id, "prepare");
+    await ready(s.id);
+    assert((await mcp(s.id, "verification_propose", { operation: cancelled.operation, items })).error, "late same-run callback rejected after cancel and new prepare");
+    const approved = await propose(s, current.operation);
+    await assert.rejects(api("verification", "edit", { id: s.id, revision: approved.revision - 1, items }), /değişti/);
+    const running = await perform(s.id, "start");
+    await ready(s.id);
+    assert.equal((await api("terminal", "attach", { id: s.id })).runId, terminal.runId, "prepare/start share the same CLI process");
+    const execution = await mcp(s.id, "verification_request", { operation: running.operation });
+    assert.deepEqual(execution.result.items, approved.items);
+    assert((await mcp(s.id, "verification_report", { operation: running.operation, results: [] })).error);
+    const reports = approved.items.map((item, index) => ({ id: item.id, status: index ? "blocked" : "passed", evidence: index ? "The test requires a signed-in account; not performed." : "Controlled fixture report; no real project build was executed." }));
+    const reported = await mcp(s.id, "verification_report", { operation: running.operation, results: reports });
+    assert.equal(reported.result.phase, "reported");
+    assert.deepEqual(Object.keys(reported.result).sort(), ["count", "phase"]);
+    assert((await state(s.id)).results.every(result => result.source === "model-report"));
+    await page.locator("#verification-panel").getByText("Reported passed", { exact: true }).waitFor();
+    await page.locator("#verification-panel").getByText("Not verified", { exact: true }).waitFor();
+    assert((await mcp(s.id, "verification_report", { operation: running.operation, results: reports })).error, "replayed result rejected");
+    // Ordinary development input supersedes old evidence in both views.
+    await api("chat", "send", { id: s.id, ...(await api("chat", "read", { id: s.id })).ticket, text: "Change the sample preference." });
+    await ready(s.id);
+    assert.equal((await state(s.id)).phase, "stale");
+    assert.equal((await state(s.id)).reason, "newMessage");
+    const terminalPreparation = await perform(s.id, "prepare");
+    await ready(s.id);
+    await api("terminal", "write", { id: s.id, runId: terminal.runId, data: "Another development request" });
+    await sleep(200);
+    await api("terminal", "write", { id: s.id, runId: terminal.runId, data: "\r" });
+    await ready(s.id);
+    assert((await mcp(s.id, "verification_propose", { operation: terminalPreparation.operation, items })).error, "new ordinary Terminal input revokes pending callbacks");
+    const finalPreparation = await perform(s.id, "prepare");
+    await ready(s.id);
+    await propose(s, finalPreparation.operation);
+    const finalRun = await perform(s.id, "start");
+    await ready(s.id);
+    await api("terminal", "stop", { id: s.id });
+    const stoppedReport = await mcp(s.id, "verification_report", { operation: finalRun.operation, results: reports });
+    assert(!stoppedReport.result, "stopped run cannot report");
+    assert.equal((await state(s.id)).items.length, items.length);
+    await api("terminal", "start", { id: s.id });
+    await ready(s.id);
+    const nextRequest = await perform(s.id, "prepare");
+    await ready(s.id);
+    await assert.rejects(api("terminal", "stop", { id: s.id, runId: terminal.runId }));
+    assert.equal((await state(s.id)).operation, nextRequest.operation, "late old Stop cannot invalidate a newer operation");
+    await propose(s, nextRequest.operation);
+    await api("terminal", "stop", { id: s.id });
+    console.log("PASS " + provider + " user-initiated verification, editable checks, one CLI run, guarded MCP callbacks, stale source/input and honest model evidence");
+  }
+  const persisted = JSON.parse(fs.readFileSync(path.join(data, "workspace.json")));
+  assert.equal(Object.keys(persisted.verifications).length, 3);
+  for (const s of sessions) assert.equal(fs.existsSync(path.join(s.directory, "verification.json")), false, "verification data never enters the project");
+  await stop();
+  await start();
+  assert.equal((await api("app", "state")).active.length, 0, "restart never resumes providers");
+  for (const s of sessions) {
+    assert.equal((await state(s.id)).items.length, 2);
+    await select(s.id);
+    assert.equal(await page.locator("#verification-panel").isVisible(), false, "panel starts collapsed");
+  }
+  await stop();
+  console.log("PASS verification private persistence, collapsed restart and no automatic providers");
+}
+
 async function testCodexChat() {
   const profile = path.join(temporary, "chat-test-profile");
   const folder = path.join(temporary, "chat-project");
@@ -936,7 +1131,8 @@ async function testMinimizedSelectedNotifications() {
 }
 
 async function testPendingChatInteraction() {
-  for (const [provider, replyMode] of [["codex", "choice"], ["claude", "choice"], ["copilot", "choice"], ["codex", "custom"]]) {
+  const cases = [["codex", "choice"], ["claude", "choice"], ["copilot", "choice"], ["codex", "custom"], ["codex", "composer"]];
+  for (const [provider, replyMode] of cases.filter(([,mode]) => process.env.WORKFLOW_TEST_MAIN_COMPOSER_ONLY !== "1" || mode === "composer")) {
     const profile = path.join(temporary, provider + "-" + replyMode + "-interaction-profile");
     const folder = path.join(temporary, provider + "-" + replyMode + "-interaction-workspace");
     for (const name of [`${provider}-interaction.bin`, `${provider}-custom.txt`]) {
@@ -1012,8 +1208,12 @@ async function testPendingChatInteraction() {
         const disabled = controls.length > 0 && controls.every(control => control.disabled);
         return disabled;
       }, s.id));
-      const reply = replyMode === "custom" ? "Use the shared validator." : "2";
-      if (replyMode === "custom") {
+      const reply = replyMode !== "choice" ? "Use the shared validator." : "2";
+      if (replyMode === "composer") {
+        await input.fill(reply);
+        await send.click();
+        await until(()=>page.locator(".chat-reply-question").count().then(count=>count===0),"main composer reply closes the old question");
+      } else if (replyMode === "custom") {
         const plainCard = page.locator(".chat-reply-question");
         await plainCard.getByRole("textbox", { name: "Your own answer", exact: true }).fill(reply);
         const captures = path.join(root, "target", "question-card-qa");
@@ -1027,7 +1227,7 @@ async function testPendingChatInteraction() {
       const submitted = path.join(data, "test-input", "codex-interaction.bin");
       await until(() => fs.existsSync(submitted), "clicking the plain chat option sends the chosen number");
       assert.equal(fs.readFileSync(submitted, "utf8"), "\x1b[200~" + reply + "\x1b[201~\r");
-      assert.equal(await input.inputValue(), "Keep my original draft.");
+      assert.equal(await input.inputValue(), replyMode === "composer" ? "" : "Keep my original draft.");
     } else {
       await input.fill("Prepare the sample output.");
       await send.click();
@@ -1040,7 +1240,7 @@ async function testPendingChatInteraction() {
     await api("notifications", "seen", { id: approvalNotice.id });
     assert((await attentionEntries()).some(entry => entry.id === approvalNotice.id), "opening the session does not resolve approval");
     assert.match(await card.locator("pre").textContent(), /Read the sample notes/);
-    assert.match(await card.locator("pre").textContent(), /2\. No/);
+    assert.match(await card.textContent(), provider === "codex" ? /2 · No/ : /2\. No/);
     const live = await api("chat", "read", { id: s.id });
     assert.equal(live.ticket, null);
     assert.equal(!!live.terminalPrompt.menu, provider === "codex");
@@ -1131,8 +1331,11 @@ async function testPendingChatInteraction() {
       await assert.rejects(api("chat", "answer_prompt", { id: s.id, runId, ...customMenu, key: first.key, text: customAnswer }), /Soru değişti/);
       await customInput.press("Enter");
       await until(async () => !(await choiceMenu()), "answered custom menu stays consumed before provider redraw");
+      await card.waitFor({state:"hidden"});
       const echoed = await api("chat", "read", { id: s.id });
       assert.equal(echoed.terminalPrompt?.menu, undefined);
+      assert.equal(echoed.terminalPrompt, null, "submitted custom question is completely hidden during redraw");
+      assert.equal(echoed.ticket, null, "hidden answered question does not imply the provider is ready");
       const received = path.join(data, "test-input", provider + "-custom.txt");
       await until(() => fs.existsSync(received), provider + " native question receives the custom answer");
       assert.equal(fs.readFileSync(received, "utf8"), customAnswer);
@@ -1143,6 +1346,13 @@ async function testPendingChatInteraction() {
     assert.equal((await api("terminal", "attach", { id: s.id })).runId, runId);
     assert.equal(fs.readFileSync(path.join(data, "test-input", `${provider}-choice-0.txt`), "utf8"), "2");
     assert.equal(fs.readFileSync(path.join(data, "test-input", `${provider}-choice-1.txt`), "utf8"), "1");
+    assert(await page.locator("#chat-terminal-output").isHidden(),"terminal output stays collapsed by default");
+    if (process.env.WORKFLOW_TEST_CHAT_CAPTURE === "1" && provider === "codex" && replyMode === "choice") {
+      const directory=path.join(root,"target","verification-development");
+      fs.mkdirSync(directory,{recursive:true});
+      await page.locator("#chat-composer").screenshot({path:path.join(directory,"composer-terminal-icon.png")});
+    }
+    await page.getByRole("button", { name: "Show live Terminal output" }).click();
     await page.locator("#chat-terminal-output").getByText("Fixture interaction uses a different layout.").waitFor();
     await page.getByRole("button", { name: "Hide live Terminal output" }).click();
     assert(await page.locator("#chat-terminal-output").isHidden());
@@ -1152,6 +1362,7 @@ async function testPendingChatInteraction() {
     assert.equal(await input.inputValue(), "Keep this separate draft.");
     assert(await card.isHidden());
     await stop();
+    console.log("PASS Chat interaction " + provider + " / " + replyMode);
   }
   console.log("PASS clickable Chat choices for text and native menus, stale choice rejection, approval display and fallback for all three providers");
 }
@@ -1861,6 +2072,246 @@ async function testModelSettings() {
   console.log("PASS immediate model dialog, scoped/coalesced cache, forced refresh, stale context rejection, terminal approval controls, Claude effort metadata and persistence");
 }
 
+async function testDataManagement() {
+  const profile=path.join(temporary,"data-management-profile"), folder=path.join(temporary,"data-management-source");
+  fs.mkdirSync(folder);
+  const sourceMarker=path.join(folder,"source-marker.txt"), marker="Synthetic original source must remain.\n";
+  fs.writeFileSync(sourceMarker,marker);
+  await start("",profile);
+  const project=await api("app","add_project",{directory:folder});
+  const direct=[];
+  for(const provider of ["codex","claude","copilot"])
+    direct.push(await api("app","create_session",{projectId:project.id,provider,workspaceMode:"direct",tools:false}));
+  const copy=await api("app","create_session",{projectId:project.id,provider:"claude",tools:false});
+  const archived=await api("app","create_session",{projectId:project.id,provider:"copilot",tools:false});
+  await api("app","session_patch",{id:archived.id,archived:true});
+  const archivedState=(await api("app","state")).sessions.find(s=>s.id===archived.id);
+  const gitOwner=await api("app","add_project",{directory:gitProject});
+  const worktree=await api("app","create_session",{projectId:gitOwner.id,provider:"codex",tools:false});
+  assert.equal(worktree.workspaceKind,"worktree");
+  const gitHead=cp.execFileSync("git",["rev-parse","HEAD"],{cwd:gitProject,encoding:"utf8",windowsHide:true}).trim();
+  const copyMarker=path.join(copy.directory,"unmerged-change.txt");
+  fs.writeFileSync(copyMarker,"Synthetic unmerged copy change.\n");
+  const accountMarker=path.join(profile,"accounts","account-marker.txt");
+  fs.mkdirSync(path.dirname(accountMarker),{recursive:true}); fs.writeFileSync(accountMarker,"synthetic account retained");
+  const terminalMarker=path.join(profile,"transcripts",direct[0].id+".ansi");
+  fs.mkdirSync(path.dirname(terminalMarker),{recursive:true}); fs.writeFileSync(terminalMarker,"synthetic saved output\r\n");
+  await stop();
+  const file=path.join(profile,"workspace.json");
+  const saved=JSON.parse(fs.readFileSync(file,"utf8"));
+  saved.verifications||={};
+  for(let index=0;index<600;index++) {
+    const id=require("node:crypto").randomUUID(), original=direct[index%3];
+    saved.sessions.push({...original,id,name:"Synthetic session "+index,runId:null,state:"stopped",archived:index%2===0,
+      position:{x:40+(index%2)*780,y:50+Math.floor(index/2)*580},size:{width:720,height:500}});
+    saved.verifications[id]={phase:"reported",evidence:"synthetic note ".repeat(1024)};
+  }
+  fs.writeFileSync(file,JSON.stringify(saved));
+  await start("",profile);
+  const initial=await api("app","state");
+  assert.equal(initial.sessions.length,606);
+  assert.equal(initial.verifications,undefined,"detailed reports do not travel in global workspace updates");
+  assert(Buffer.byteLength(JSON.stringify(initial))<2*1024*1024);
+  const accounts=JSON.stringify(initial.providers);
+  await page.evaluate(id=>window.workflow.selectProject(id),project.id);
+  for(const mode of ["map","grid","focus"]) {
+    await page.evaluate(mode=>setMode(mode),mode);
+    await sleep(180);
+    const counts=await page.evaluate(()=>({views:views.size,cards:sessionCards.size,active:window.workflow.state().active.length}));
+    assert(counts.views<=8); if(mode==="focus") assert.equal(counts.views,1);
+    assert.equal(counts.active,0,"selecting a view never starts providers");
+  }
+  await page.evaluate(async id=>{await window.workflow.selectSession(id,true);chatView(id).draft="synthetic unsent draft";},direct[0].id);
+  await page.locator("#app-settings").click();
+  await page.getByRole("button",{name:"Data management",exact:true}).click();
+  await page.locator("#data-reset-layout").waitFor();
+  await page.locator("#data-reset-layout").click();
+  await page.locator("#dialog-footer .primary").click();
+  await page.locator("#dialog").waitFor({state:"hidden"});
+  assert.equal(await page.evaluate(id=>chatViews.get(id).draft,direct[0].id),"synthetic unsent draft");
+  assert.equal((await api("app","state")).sessions.length,606);
+  const openData=async()=>{
+    await page.locator("#app-settings").click();
+    await page.getByRole("button",{name:"Data management",exact:true}).click();
+    await page.locator("#data-reset-records").waitFor();
+  };
+  await openData();
+  await page.locator("#data-clear-memory").click();
+  assert.equal(await page.evaluate(id=>chatViews.get(id).draft,direct[0].id),"synthetic unsent draft");
+  await page.locator("#data-reset-records").click();
+  assert(await page.locator("#dialog-footer .primary").isDisabled());
+  await page.locator("#data-reset-confirmation").fill("wrong");
+  assert(await page.locator("#dialog-footer .primary").isDisabled());
+  await page.locator("#dialog-footer button").first().click();
+  let status=await api("data_management","status");
+  await api("app","session_patch",{id:direct[0].id,name:"Synthetic renamed session"});
+  await assert.rejects(api("data_management","reset_records",{confirmation:"RESET",revision:status.revision}),/Kayıtlar değişti/);
+  assert(fs.existsSync(copyMarker)&&fs.existsSync(archivedState.directory));
+  for(const s of direct) {
+    const run=await api("terminal","start",{id:s.id});
+    status=await api("data_management","status");
+    await assert.rejects(api("data_management","reset_records",{confirmation:"RESET",revision:status.revision}),/terminalleri/);
+    await api("terminal","write",{id:s.id,runId:run.runId,data:"exit\r"});
+    await until(async()=>!(await api("app","state")).active.length,"fixture exit and final output drain");
+    await until(async()=>(await api("data_management","status")).retainedTerminals===0,"native terminal resources released");
+  }
+  await openData(); await page.locator("#data-reset-records").click();
+  await page.locator("#data-reset-confirmation").fill("SIFIRLA");
+  await page.locator("#dialog-footer .primary").click();
+  await page.locator("#dialog").waitFor({state:"hidden"});
+  assert.equal((await api("app","state")).sessions.length,0);
+  assert(fs.existsSync(copyMarker)&&fs.existsSync(archivedState.directory)&&fs.existsSync(worktree.directory));
+  assert.equal(fs.readFileSync(sourceMarker,"utf8"),marker);
+  assert(fs.existsSync(accountMarker)&&fs.existsSync(terminalMarker));
+  assert.equal(JSON.stringify((await api("app","state")).providers),accounts);
+  await api("app","preferences",{notificationsEnabled:false});
+  await openData(); await page.locator("#data-restore-records").click();
+  await page.locator("#dialog-footer .primary").click();
+  await page.locator("#dialog").waitFor({state:"hidden"});
+  const restored=await api("app","state");
+  assert.equal(restored.sessions.length,606); assert.equal(restored.active.length,0);
+  assert.equal(restored.preferences.notificationsEnabled,false);
+  status=await api("data_management","status");
+  let preview=await api("data_management","cleanup_preview");
+  assert.equal(preview.blocked.length,0); assert.equal(preview.folders.length,3);
+  await assert.rejects(api("data_management","reset_records",{confirmation:"RESET",revision:status.revision,deleteWorkspaces:true,cleanupFingerprint:preview.fingerprint}),/ayrı onay/);
+  fs.appendFileSync(copyMarker,"changed after preview\n");
+  await assert.rejects(api("data_management","reset_records",{confirmation:"RESET",revision:status.revision,deleteWorkspaces:true,fileConfirmation:"DELETE",cleanupFingerprint:preview.fingerprint}),/Önizlemeyi yenileyin/);
+  assert(fs.existsSync(copyMarker));
+  await openData(); await page.locator("#data-reset-records").click();
+  await page.locator("#data-delete-workspaces").check();
+  await page.getByText("3 isolated folders",{exact:false}).waitFor();
+  await page.locator("#data-reset-confirmation").fill("SIFIRLA");
+  assert(await page.locator("#dialog-footer .primary").isDisabled());
+  await page.locator("#data-reset-confirmation").fill("SIL VE SIFIRLA");
+  await page.locator("#dialog-footer .primary").click();
+  await page.locator("#dialog").waitFor({state:"hidden"});
+  assert.equal((await api("app","state")).sessions.length,0);
+  assert(!fs.existsSync(copy.directory)&&!fs.existsSync(archivedState.directory)&&!fs.existsSync(worktree.directory));
+  assert.equal(fs.readFileSync(sourceMarker,"utf8"),marker);
+  assert(fs.existsSync(accountMarker)&&fs.existsSync(terminalMarker));
+  assert.equal(cp.execFileSync("git",["rev-parse","HEAD"],{cwd:gitProject,encoding:"utf8",windowsHide:true}).trim(),gitHead);
+  assert(cp.execFileSync("git",["branch","--list",worktree.branch],{cwd:gitProject,encoding:"utf8",windowsHide:true}).includes(worktree.branch));
+  await assert.rejects(api("data_management","restore_records",{confirmation:"RESTORE"}),/geri alınamaz/);
+  await assert.rejects(api("terminal","attach",{id:direct[0].id}),/Oturum bulunamadı/);
+  await stop(); await start("",profile);
+  assert.equal((await api("app","state")).active.length,0);
+  assert.equal((await api("app","state")).sessions.length,0);
+  await stop();
+  console.log("PASS 606-session lazy rendering, three-provider final-output/resource release, safe reset/restore, confirmation and stale-preview guards, owned copy/archive/worktree deletion with source/accounts/branches preserved");
+}
+
+async function testTerminalMemory() {
+  const profile = path.join(temporary, "terminal-memory-profile");
+  const folder = path.join(temporary, "terminal-memory-project");
+  const other = path.join(temporary, "terminal-memory-other");
+  fs.mkdirSync(folder); fs.mkdirSync(other);
+  fs.writeFileSync(path.join(folder, "terminal-memory-fixture"), "");
+  await start("", profile);
+  const p = await api("app", "add_project", { directory: folder });
+  const alternate = await api("app", "add_project", { directory: other });
+  const sessions = [];
+  const transcriptFolder = path.join(profile, "transcripts");
+  fs.mkdirSync(transcriptFolder, { recursive: true });
+  for (const provider of ["codex", "claude", "copilot"]) {
+    const s = await api("app", "create_session", { projectId: p.id, provider, workspaceMode: "direct", tools: false });
+    sessions.push(s);
+    const file = path.join(transcriptFolder, s.id + ".ansi");
+    const fd = fs.openSync(file, "w");
+    try {
+      fs.writeSync(fd, "synthetic transcript retained\r\n");
+      fs.ftruncateSync(fd, 96 * 1024 * 1024);
+      const row = Buffer.from("\x1b[0msynthetic archived output\r\n");
+      const tail = Buffer.alloc(512 * 1024);
+      for (let offset = 0; offset < tail.length; offset += row.length)
+        row.copy(tail, offset, 0, Math.min(row.length, tail.length - offset));
+      const marker = Buffer.from("\r\n" + provider + " latest saved line\r\n");
+      marker.copy(tail, tail.length - marker.length);
+      fs.writeSync(fd, tail, 0, tail.length, 96 * 1024 * 1024 - tail.length);
+    } finally { fs.closeSync(fd); }
+    const replay = await api("terminal", "attach", { id: s.id });
+    assert.equal(replay.truncated, true);
+    const bytes = Buffer.from(replay.data, "base64");
+    assert(bytes.length <= 512 * 1024);
+    assert(bytes.toString().includes(provider + " latest saved line"));
+    assert.equal(fs.statSync(file).size, 96 * 1024 * 1024);
+  }
+  await page.evaluate(async ({ project, alternate }) => {
+    await window.workflow.refresh();
+    window.workflow.selectProject(alternate);
+    window.workflow.selectProject(project);
+  }, { project: p.id, alternate: alternate.id });
+  for (const s of sessions) {
+    await page.evaluate(id=>window.workflow.selectSession(id,true),s.id);
+    await until(()=>page.evaluate(id=>{
+      const v=window.workflow.views.get(id); return v?.ready && !v.outputBusy && !v.queue.length;
+    },s.id),"bounded archived terminal replay");
+    const archived = await page.evaluate(id => {
+      const v = window.workflow.views.get(id);
+      return { lines: v.term.buffer.active.length, rows: v.term.rows, scrollback: v.term.options.scrollback };
+    }, s.id);
+    assert.equal(archived.scrollback, 2000);
+    assert(archived.lines <= archived.rows + archived.scrollback);
+    const run = await api("terminal", "start", { id: s.id });
+    await page.evaluate(async id => { await window.workflow.refresh(); await attach(window.workflow.views.get(id), session(id)); }, s.id);
+    await until(async () => Buffer.from((await api("terminal", "attach", { id: s.id, screenOnly: true })).data, "base64").toString().includes("Ready"), "fixture ready " + s.provider);
+    const input = "synthetic-memory-check";
+    await api("terminal", "write", { id: s.id, runId: run.runId, data: input + "\r" });
+    await until(async () => Buffer.from((await api("terminal", "attach", { id: s.id, screenOnly: true })).data, "base64").toString().includes("Received: " + input), "fixture interaction " + s.provider);
+    const overflow = await page.evaluate(id => {
+      const v = window.workflow.views.get(id);
+      const data = btoa("x".repeat(4096));
+      for (let index = 1; index <= 1000; index++) terminalPacket({ id, runId: v.runId, subscription:v.subscription, frame:v.frame+index, seq: v.seq + index, data });
+      return { bytes: v.queuedBytes, recover: v.needsSnapshot };
+    }, s.id);
+    assert(overflow.bytes <= 768 * 1024);
+    assert.equal(overflow.recover, true);
+    await until(() => page.evaluate(id => {
+      const v = window.workflow.views.get(id);
+      return v.ready && !v.outputBusy && !v.needsSnapshot && !v.queue.length;
+    }, s.id), "native screen recovery " + s.provider);
+    const screen = await api("terminal", "attach", { id: s.id, screenOnly: true });
+    assert.equal(screen.runId, run.runId);
+    assert(Buffer.from(screen.data, "base64").toString().includes("Ready"));
+    await api("terminal", "stop", { id: s.id, runId: run.runId });
+  }
+  await page.evaluate(id => window.workflow.selectProject(id), alternate.id);
+  assert.equal(await page.evaluate(() => window.workflow.views.size), 0, "off-project renderers are released without deleting sessions");
+  assert.equal((await api("app", "state")).sessions.filter(s => s.projectId === p.id).length, 3);
+  // Distribution acceptance also exercises the embedded browser with no user data.
+  const owner = sessions[0];
+  await page.evaluate(async ({ project, id }) => {
+    window.workflow.selectProject(project);
+    window.workflow.selectSession(id, true);
+    await window.workflow.openPanel("browser");
+  }, { project: p.id, id: owner.id });
+  const native = await api("browser", "open", { sessionId: owner.id, url: "http://127.0.0.1:" + server.address().port });
+  const scope = { sessionId: owner.id, pageId: native.id };
+  await page.evaluate(async () => { await loadBrowser(); await scheduleViewport(); });
+  const document = await until(async () => {
+    const read = await api("browser", "read", scope);
+    return read.elements?.some(element => element.text === "Save") ? read : null;
+  }, "browser smoke page");
+  const input = document.elements.find(element => element.tag === "input" && element.type === "text");
+  const save = document.elements.find(element => element.text === "Save");
+  await api("browser", "action", { ...scope, action: "fill", ref: input.ref, documentId: document.documentId, text: "Synthetic browser check" });
+  await api("browser", "action", { ...scope, action: "click", ref: save.ref, documentId: document.documentId });
+  assert((await api("browser", "read", scope)).text.includes("Synthetic browser check"));
+  await api("browser", "pick", scope);
+  await api("browser", "action", { ...scope, action: "click", x: save.bounds.x + save.bounds.width / 2, y: save.bounds.y + save.bounds.height / 2 });
+  const picked = await until(async () => {
+    const result = await api("browser", "poll", scope);
+    return result.picked || null;
+  }, "browser smoke picker");
+  assert(picked.html.includes("button"));
+  await api("browser", "close", scope);
+  await stop();
+  await start("", profile);
+  assert.equal((await api("app", "state")).active.length, 0, "reopen never starts providers");
+  await stop();
+  console.log("PASS bounded 96-MiB archived replay, output flood recovery, input and lifecycle for three controlled provider fixtures, browser actions and element selection; not signed-in provider acceptance");
+}
+
 async function test() {
   const git = (args) =>
     cp.execFileSync("git", args, {
@@ -1938,6 +2389,18 @@ async function test() {
     );
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  if (process.env.WORKFLOW_TEST_DATA_MANAGEMENT_ONLY === "1") {
+    await testDataManagement();
+    return;
+  }
+  if (process.env.WORKFLOW_TEST_TERMINAL_MEMORY_ONLY === "1") {
+    await testTerminalMemory();
+    return;
+  }
+  if (process.env.WORKFLOW_TEST_VERIFICATION_ONLY === "1") {
+    await testVerification();
+    return;
+  }
   if (process.env.WORKFLOW_TEST_MODELS_ONLY === "1") {
     await testModelSettings();
     await testCodexChat();

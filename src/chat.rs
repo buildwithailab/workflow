@@ -27,7 +27,7 @@ pub(crate) struct LogCache {
     retry_after: Option<Instant>,
 }
 
-fn locate_log(core: &Core, session: &Value, thread: &str) -> Result<Option<PathBuf>> {
+pub(crate) fn locate_log(core: &Core, session: &Value, thread: &str) -> Result<Option<PathBuf>> {
     let scope = json!([
         session["id"],
         session["provider"],

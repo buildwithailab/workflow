@@ -25,6 +25,9 @@ struct CachedCatalog {
 pub(crate) struct CatalogCache(Mutex<HashMap<String, Arc<Mutex<CachedCatalog>>>>);
 
 impl CatalogCache {
+    pub(crate) fn clear_idle(&self) {
+        self.0.lock().unwrap().retain(|_, entry| Arc::strong_count(entry) > 1);
+    }
     fn load(
         &self,
         key: &str,

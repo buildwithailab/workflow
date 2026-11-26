@@ -62,6 +62,9 @@ impl Run {
 }
 
 impl Previews {
+    pub(crate) fn any_running(&self) -> bool {
+        self.runs.lock().unwrap().values().any(|run| run.lock().unwrap().job.is_some())
+    }
     fn get(&self, sid: &str) -> Option<Arc<Mutex<Run>>> {
         self.runs.lock().unwrap().get(sid).cloned()
     }
