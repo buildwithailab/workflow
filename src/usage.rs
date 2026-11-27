@@ -319,6 +319,7 @@ fn claude_snapshot_version(output: &str) -> Option<bool> {
 }
 
 fn claude_probe(exe: &std::path::Path, profile: &Profile, args: &[&str]) -> Result<Vec<u8>> {
+    let network = crate::provider_network::prepare("claude", profile)?;
     let mut command = if cfg!(windows)
         && exe
             .extension()
@@ -348,6 +349,7 @@ fn claude_probe(exe: &std::path::Path, profile: &Profile, args: &[&str]) -> Resu
         }
     }
     profile.apply(&mut command);
+    network.apply(&mut command);
     #[cfg(target_os = "macos")]
     command.env("PATH", crate::platform::macos::child_path(exe)?);
     command
@@ -362,6 +364,8 @@ fn claude_probe(exe: &std::path::Path, profile: &Profile, args: &[&str]) -> Resu
     #[cfg(target_os = "macos")]
     crate::platform::macos::process::configure(&mut command);
     let mut child = command.spawn()?;
+    #[cfg(windows)]
+    let job=match terminal::Job::new(child.id()){Ok(job)=>job,Err(error)=>{let _=child.kill();let _=child.wait();return Err(error);}};
     #[cfg(target_os = "macos")]
     let group = match crate::platform::macos::process::Group::new(child.id(), false) {
         Ok(group) => group,
@@ -383,11 +387,7 @@ fn claude_probe(exe: &std::path::Path, profile: &Profile, args: &[&str]) -> Resu
     // Only this short-lived read-only probe is stopped; provider terminals are untouched.
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        let _ = Command::new("taskkill.exe")
-            .args(["/pid", &child.id().to_string(), "/t", "/f"])
-            .creation_flags(0x08000000)
-            .output();
+        drop(job);
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -475,7 +475,7 @@ fn claude_quota(
     } else {
         "https://api.anthropic.com/api/oauth/usage".into()
     };
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::provider_network::http_client(reqwest::blocking::Client::builder(), &address, profile)?
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(4))
         .timeout(Duration::from_secs(10))
@@ -558,9 +558,23 @@ pub fn verify_account(core: &Core, args: &Value) -> Result<Value> {
     accounts::verify(core, provider, &profile, &found)?;
     Ok(json!(true))
 }
+pub(crate) fn custom_connection(core:&Core,provider:&str,profile:&Profile)->Result<(String,Option<String>)> {
+    let exe=executable(core,provider).context("CLI kurulumu bulunamadı")?;
+    let auth=match provider {
+        "codex"=>codex_rpc(core,&exe,profile)?.request("account/read",json!({"refreshToken":false}))?,
+        "claude"=>claude_status(&exe,profile)?,
+        _=>copilot_rpc(core,&exe,profile)?.request("auth.getStatus",json!({}))?,
+    };
+    let connected=match provider {"codex"=>!auth["account"].is_null(),"claude"=>auth["loggedIn"]==true,_=>auth["isAuthenticated"]==true};
+    let fingerprint=identity(provider,&auth).map(|identity|hash(json!([identity,auth["orgId"],auth["authMethod"],connected]).to_string().as_bytes()));
+    Ok((if connected{"connected"}else{"signed-out"}.into(),fingerprint))
+}
 pub fn read(core: &Arc<Core>, args: &Value) -> Result<Value> {
     let provider = string(args, "provider")?;
     let profile = Profile::get(core, provider, &args["accountId"])?;
+    if let Some(setting)=crate::custom_usage::configured(core,provider) {
+        return Ok(crate::custom_usage::read(core,args,&profile,&setting));
+    }
     let Some(exe) = executable(core, provider) else {
         return Ok(status("missing", "Kullanım için CLI kurulumu gerekli."));
     };

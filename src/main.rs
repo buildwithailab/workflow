@@ -11,6 +11,7 @@ mod clipboard;
 #[path = "platform/macos/clipboard.rs"]
 mod clipboard;
 mod core;
+mod custom_usage;
 mod data_management;
 mod files;
 mod git;
@@ -24,6 +25,7 @@ mod notification_popup;
 #[cfg(any(windows, target_os = "macos"))]
 mod preview;
 mod provider_setup;
+mod provider_network;
 mod repository_operations;
 mod session_folders;
 mod session_usage;
@@ -194,6 +196,8 @@ fn app_action(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
             Ok(core.snapshot())
         }
         "provider_usage" => usage::read(core, args),
+        "usage_commands_read" => custom_usage::dispatch(core,"read",args),
+        "usage_commands_save" => custom_usage::dispatch(core,"save",args),
         "provider_install_options" => Ok(provider_setup::options()),
         "provider_install" => provider_setup::install(core, args),
         "provider_account_add" => accounts::add(core, args),
@@ -632,9 +636,11 @@ fn fixture(provider: &str) -> Result<()> {
     Ok(())
 }
 fn rpc_fixture(provider: &str) -> Result<()> {
+    #[cfg(all(feature = "desktop-tests", debug_assertions))]
+    crate::provider_network::verify_fixture(provider)?;
     use std::io::{BufRead, Read, Write};
     let profile = account_fixture_directory(provider);
-    let login = profile
+    let mut login = profile
         .as_ref()
         .and_then(|p| {
             let value = std::fs::read_to_string(p.join("auth-status.json")).ok()?;
@@ -642,6 +648,12 @@ fn rpc_fixture(provider: &str) -> Result<()> {
             auth["login"].as_str().map(str::to_owned)
         })
         .or_else(|| profile.is_none().then(|| "fixture".into()));
+    #[cfg(all(feature="desktop-tests",debug_assertions))]
+    if profile.is_none(){
+        if let Some(root)=std::env::var_os("WORKFLOW_DATA_DIR").map(PathBuf::from) {
+            if let Ok(value)=std::fs::read_to_string(root.join(format!("quota-identity-{provider}.txt"))){login=Some(value.trim().to_owned());}
+        }
+    }
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();
     loop {
@@ -679,6 +691,28 @@ fn rpc_fixture(provider: &str) -> Result<()> {
         }
         let catalog_request = v["method"] == "model/list" || v["method"] == "models.list"
             || (provider == "claude" && v["request"]["subtype"] == "initialize");
+        #[cfg(all(feature="desktop-tests",debug_assertions))]
+        if matches!(v["method"].as_str(),Some("account/read"|"auth.getStatus")) {
+            if let Some(root)=std::env::var_os("WORKFLOW_DATA_DIR").map(PathBuf::from) {
+                if root.join("quota-auth-pause-fixture").is_file(){std::fs::write(root.join("quota-auth-preflight.txt"),b"")?;std::thread::sleep(std::time::Duration::from_secs(2));}
+            }
+        }
+        #[cfg(all(feature = "desktop-tests", debug_assertions))]
+        if catalog_request && std::env::current_dir()?.join("model-context-rewrite-fixture").is_file() {
+            let (variable,name,default)=match provider {
+                "codex"=>("CODEX_HOME","config.toml",b"".as_slice()),
+                "claude"=>("CLAUDE_CONFIG_DIR","settings.json",b"{}".as_slice()),
+                _=>("COPILOT_HOME","config.json",b"{}".as_slice()),
+            };
+            let directory=PathBuf::from(std::env::var_os(variable).context("Missing synthetic profile")?);
+            std::fs::create_dir_all(&directory)?;
+            let file=directory.join(name);
+            let mut contents=std::fs::read(&file).unwrap_or_else(|_|default.to_vec());
+            if std::env::current_dir()?.join("model-context-unstable-fixture").is_file() {contents.extend_from_slice(b" ");}
+            let once=std::env::current_dir()?.join("model-context-once-fixture");
+            if once.is_file(){contents.extend_from_slice(b" ");std::fs::remove_file(once)?;}
+            crate::core::atomic(&file,&contents)?;
+        }
         if catalog_request && std::env::current_dir()?.join("model-dialog-fixture").is_file() {
             let file = std::env::current_dir()?.join(format!("model-requests-{provider}.txt"));
             let mut log = std::fs::OpenOptions::new().create(true).append(true).open(file)?;
@@ -764,6 +798,8 @@ fn main() {
     if args.get(1).is_some_and(|s| s == "--usage-auth-fixture")
         && std::env::var("WORKFLOW_TEST_MODE").ok().as_deref() == Some("1")
     {
+        #[cfg(all(feature = "desktop-tests", debug_assertions))]
+        if crate::provider_network::verify_fixture("claude").is_err() {std::process::exit(1);}
         if let Some(folder) = account_fixture_directory("claude")
             .or_else(|| std::env::var_os("WORKFLOW_TEST_USAGE_DIR").map(PathBuf::from))
         {

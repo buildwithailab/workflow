@@ -2072,6 +2072,243 @@ async function testModelSettings() {
   console.log("PASS immediate model dialog, scoped/coalesced cache, forced refresh, stale context rejection, terminal approval controls, Claude effort metadata and persistence");
 }
 
+async function testProviderNetwork() {
+  const clear = Object.fromEntries(["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"].map(key => [key, ""]));
+  const providers = ["codex", "claude", "copilot"];
+  const proxy = "http://127.0.0.1:" + await freePort() + "/";
+  const folder = path.join(temporary, "network-project");
+  fs.mkdirSync(folder);
+  for (const mode of ["proxy", "direct", "explicit", "saved", "fail", "timeout"]) {
+    const profile = path.join(temporary, "network-" + mode);
+    fs.mkdirSync(profile);
+    const discovery = mode === "explicit" || mode === "saved" ? "fail" : mode;
+    fs.writeFileSync(path.join(profile, "network-fixture.json"), JSON.stringify({ mode: discovery, proxy }));
+    if (!["fail", "timeout"].includes(mode))
+      fs.writeFileSync(path.join(profile, "network-expected-proxy.txt"), ["direct", "saved"].includes(mode) ? "DIRECT" : proxy);
+    const settings = [];
+    if (mode === "saved") {
+      for (const [provider, value] of [["copilot", { proxyUrl: proxy }], ["claude", { env: { HTTPS_PROXY: proxy } }]]) {
+        const file = path.join(profile, "test-" + provider + "-home", "settings.json");
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        const contents = JSON.stringify(value) + " // preserve explicit configuration\n";
+        fs.writeFileSync(file, contents);
+        settings.push([file, contents]);
+      }
+    }
+    await start("", profile, { ...clear, ...(mode === "explicit" ? { HTTPS_PROXY: proxy, NO_PROXY: "localhost,127.0.0.1,::1" } : {}) });
+    const p = await api("app", "add_project", { directory: folder });
+    assert.equal((await api("app", "state")).active.length, 0, "opening a profile must not start providers");
+    for (const provider of providers.filter(provider => mode !== "saved" || provider !== "codex")) {
+      const session = await api("app", "create_session", { projectId: p.id, provider, workspaceMode: "direct", tools: false });
+      if (["fail", "timeout"].includes(mode)) {
+        const pending = api("terminal", "start", { id: session.id });
+        const rejected = assert.rejects(pending, /Windows proxy|Windows proxy settings/);
+        await sleep(100);
+        const before = Date.now();
+        const other = path.join(temporary, "network-unrelated-" + mode + "-" + provider);
+        fs.mkdirSync(other);
+        await api("app", "add_project", { directory: other });
+        assert(Date.now() - before < 1500, "proxy discovery must not hold the global application lock");
+        await rejected;
+        assert.equal((await api("app", "state")).active.length, 0, "failed discovery must not start a provider");
+        await assert.rejects(api("provider_login", "start", { provider }), /Windows proxy|Windows proxy settings/);
+        await assert.rejects(api("models", "list", { id: session.id }), /proxy/);
+        continue;
+      }
+      const login = await api("provider_login", "start", { provider });
+      await until(async () => Buffer.from((await api("provider_login", "poll", { runId: login.runId, since: 0 })).data, "base64").toString().includes("Automatic proxy environment verified"), provider + " login proxy");
+      await api("provider_login", "close", { runId: login.runId });
+      await api("models", "list", { id: session.id });
+      assert.equal((await api("app", "provider_usage", { provider })).connection, "connected", provider + " usage probe remains connected");
+      assert(fs.existsSync(path.join(profile, "network-rpc-" + provider + ".ok")), provider + " read-only probes inherit the same network plan");
+      const run = await api("terminal", "start", { id: session.id });
+      const output = async () => Buffer.from((await api("terminal", "attach", { id: session.id, screenOnly: true })).data, "base64").toString();
+      await until(async () => (await output()).includes("Automatic proxy environment verified"), provider + " terminal proxy");
+      assert.equal((await api("terminal", "start", { id: session.id })).runId, run.runId, "start must reuse the live provider without rediscovery or replacement");
+      await api("terminal", "write", { id: session.id, runId: run.runId, data: "synthetic-network-check\r" });
+      await until(async () => (await output()).includes("Received: synthetic-network-check"), provider + " live input");
+      await api("terminal", "stop", { id: session.id, runId: run.runId });
+      await until(async () => (await api("terminal", "attach", { id: session.id })).exited, "owned provider stopped");
+      if (mode === "proxy") {
+        const account = await api("app", "provider_account_add", { provider, name: "Synthetic network account" });
+        const signIn = await api("provider_login", "start", { provider, accountId: account.id });
+        await until(async () => Buffer.from((await api("provider_login", "poll", { runId: signIn.runId, since: 0 })).data, "base64").toString().includes("Automatic proxy environment verified"), provider + " isolated account login proxy");
+        await api("provider_login", "write", { runId: signIn.runId, data: "connect\r" });
+        await until(async () => (await api("provider_login", "poll", { runId: signIn.runId, since: 0 })).exited, "synthetic account login completes");
+        await api("provider_login", "close", { runId: signIn.runId });
+        await api("app", "provider_account_verify", { provider, accountId: account.id });
+        assert.equal((await api("app", "provider_usage", { provider, accountId: account.id })).connection, "connected");
+        const isolated = await api("app", "create_session", { projectId: p.id, provider, accountId: account.id, workspaceMode: "direct", tools: false });
+        await api("models", "list", { id: isolated.id });
+        const active = await api("terminal", "start", { id: isolated.id });
+        await until(async () => Buffer.from((await api("terminal", "attach", { id: isolated.id, screenOnly: true })).data, "base64").toString().includes("Account: " + account.id), provider + " isolated account retained");
+        await api("terminal", "stop", { id: isolated.id, runId: active.runId });
+      }
+    }
+    for (const [file, contents] of settings) assert.equal(fs.readFileSync(file, "utf8"), contents, "saved provider settings remain unchanged");
+    await stop();
+    console.log("PASS Windows provider network " + mode + ": all applicable providers");
+  }
+}
+
+async function testModelCatalogChurn() {
+  const profile = path.join(temporary, "model-context-profile"), folder = path.join(temporary, "model-context-project");
+  fs.mkdirSync(folder);
+  fs.writeFileSync(path.join(folder, "model-context-rewrite-fixture"), "");
+  fs.writeFileSync(path.join(folder, "model-dialog-fixture"), "");
+  await start("", profile);
+  const project = await api("app", "add_project", { directory: folder });
+  for (const provider of ["copilot", "codex", "claude"]) {
+    const requests = () => fs.readFileSync(path.join(folder, `model-requests-${provider}.txt`), "utf8").trim().split("\n").length;
+    const config = path.join(profile, "test-" + provider + "-home", provider === "codex" ? "config.toml" : provider === "claude" ? "settings.json" : "config.json");
+    fs.mkdirSync(path.dirname(config), { recursive: true });
+    const contents = provider === "codex" ? "# synthetic configuration\n" : "{}";
+    fs.writeFileSync(config, contents);
+    const session = await api("app", "create_session", { projectId: project.id, provider, workspaceMode: "direct", tools: false });
+    const models = await api("models", "list", { id: session.id });
+    assert(models.length > 0, provider + " same-content provider rewrites must not invalidate its catalog");
+    assert.equal(requests(), 1, "unchanged content requires only one CLI query");
+    assert.equal(fs.readFileSync(config, "utf8"), contents);
+    fs.writeFileSync(config, provider === "codex" ? "model = \"changed-model\"\n" : JSON.stringify({ model: "changed-model" }));
+    await assert.rejects(api("models", "apply", { id: session.id, model: models[0].id }), /Model listesi değişti/);
+    fs.unlinkSync(config);
+    assert((await api("models", "list", { id: session.id, refresh: true })).length > 0, provider + " first-run settings creation must be retried with fresh context");
+    assert.equal(requests(), 3, "first-run initialization retries only once");
+    fs.writeFileSync(path.join(folder, "model-context-unstable-fixture"), "");
+    await assert.rejects(api("models", "list", { id: session.id, refresh: true }), /Model listesi değişti/);
+    assert.equal(requests(), 5, "unstable files must not create a retry loop");
+    await assert.rejects(api("models", "apply", { id: session.id, model: models[0].id }), /Önce model listesini aç/);
+    fs.unlinkSync(path.join(folder, "model-context-unstable-fixture"));
+    const restored = await api("models", "list", { id: session.id, refresh: true });
+    await api("models", "apply", { id: session.id, model: restored[0].id });
+    const stable=fs.readFileSync(config), count=requests();
+    fs.writeFileSync(path.join(folder,"model-context-once-fixture"),"");
+    await api("models","list",{id:session.id,refresh:true});
+    fs.writeFileSync(config,stable);
+    await api("models","list",{id:session.id});
+    assert.equal(requests(),count+3,"A to B to A never reuses a catalog fetched during the context change");
+    assert.equal((await api("app", "state")).active.length, 0, "catalog reads never start a provider terminal");
+  }
+  await stop();
+  console.log("PASS three-provider model catalogs tolerate same-content rewrites and first-run setup, reject unstable or changed settings, and never start terminals");
+}
+
+async function testCustomUsage() {
+  const profile = path.join(temporary, "custom-usage-profile"), folder = path.join(temporary, "custom-usage-project");
+  fs.mkdirSync(folder);
+  fs.writeFileSync(path.join(folder, "quota-terminal-fixture"), "");
+  const spent = 10 + randomBytes(1)[0], budget = spent * 4;
+  fs.writeFileSync(path.join(folder, "quota-values.txt"), spent + "\n" + budget);
+  await start("", profile, { WORKFLOW_TEST_QUOTA_DIR: folder });
+  const project = await api("app", "add_project", { directory: folder });
+  const sessions = [];
+  for (const provider of ["codex", "claude", "copilot"])
+    sessions.push(await api("app", "create_session", { projectId: project.id, provider, workspaceMode: "isolated", tools: false }));
+  fs.writeFileSync(path.join(folder,"quota-native-id.txt"),require("crypto").randomUUID());
+  fs.writeFileSync(path.join(folder,"quota-timestamp.txt"),new Date().toISOString());
+  const run = await api("terminal", "start", { id: sessions[1].id });
+  await page.locator("#app-settings").click();
+  await page.locator("#dialog").getByRole("button", { name: "Quota queries", exact: true }).click();
+  for (const provider of ["codex", "claude", "copilot"]) assert.equal(await page.locator("#quota-command-" + provider).inputValue(), "");
+  await page.locator("#quota-command-claude").fill("/usage-fixture:spend");
+  await page.locator("#dialog-footer").getByRole("button", { name: "Save", exact: true }).click();
+  await page.locator("#dialog").waitFor({ state: "hidden" });
+  const saved = await api("app", "usage_commands_read");
+  assert.equal(saved.claude.command, "/usage-fixture:spend");
+  assert.equal(saved.copilot.command, "");
+  const result = await api("app", "provider_usage", { provider: "claude" });
+  assert.equal(result.source, "custom"); assert.equal(result.windows[0].spent, spent); assert.equal(result.windows[0].budget, budget);
+  await page.evaluate(async () => { document.querySelector("#providers-section").hidden = false; await scanProviders(); await refreshProviderUsage("claude"); });
+  await until(async () => (await page.locator('[data-provider="claude"] .provider-usage').innerText()).includes("Spend / Budget"), "custom budget amounts rendered");
+  const live = await api("terminal", "attach", { id: sessions[1].id });
+  assert.equal(live.runId, run.runId);
+  assert(!Buffer.from(live.data, "base64").toString().includes("/usage-fixture:spend"), "quota commands never enter the development terminal");
+  assert.equal((await api("app", "provider_usage", { provider: "copilot" })).source, undefined, "blank Copilot settings keep its native quota reader");
+  await api("terminal", "stop", { id: sessions[1].id, runId: run.runId });
+  for (const provider of ["codex", "claude", "copilot"]) {
+    const commands = { [provider]: { kind: "provider", command: "/usage-fixture:spend" } };
+    await api("app", "usage_commands_save", { commands });
+    const quota = await api("app", "provider_usage", { provider, refresh: true });
+    assert.equal(quota.state, "ready", provider + " slash command completes");
+    assert.equal(quota.windows[0].remainingPercent, 75);
+    const own=sessions.find(session=>session.provider===provider);
+    assert.deepEqual(await api("history","list",{id:own.id}),[],"native quota logs never enter development history");
+    assert.equal((await api("history","discover",{id:own.id})).found,false,"quota probe cannot bind the isolated card");
+    await assert.rejects(api("history","bind",{id:own.id,conversationId:fs.readFileSync(path.join(folder,`quota-last-id-${provider}.txt`),"utf8")}));
+    if(provider==="codex")assert.notEqual(fs.readFileSync(path.join(folder,"quota-cwd-codex.txt"),"utf8"),own.directory);
+    fs.writeFileSync(path.join(folder,"quota-json-fixture"),"");
+    const jsonQuota=await api("app","provider_usage",{provider,refresh:true});
+    assert.equal(jsonQuota.state,"ready");assert.equal(jsonQuota.windows[0].remainingPercent,75);
+    fs.unlinkSync(path.join(folder,"quota-json-fixture"));
+    assert(!JSON.stringify(quota).includes("Synthetic hook result"), "raw output is never returned");
+    const inputFile = path.join(folder, `quota-input-${provider}.txt`), before = fs.readFileSync(inputFile).length;
+    await Promise.all([api("app", "provider_usage", { provider }), api("app", "provider_usage", { provider })]);
+    assert.equal(fs.readFileSync(inputFile).length, before, "cached queries do not start more terminals");
+    const alternate=path.join(temporary,"quota-cli-"+provider+".exe");fs.copyFileSync(fixtureExe,alternate);
+    await api("app","provider_path",{provider,path:alternate});
+    await api("app","provider_usage",{provider});
+    assert(fs.readFileSync(inputFile).length>before,"changing the configured CLI invalidates an existing quota cache");
+    if(process.env.WORKFLOW_TEST_EXTENDED_QUOTA==="1") {
+      const count=fs.readFileSync(inputFile).length;
+      if(provider==="claude") {
+        fs.writeFileSync(path.join(usageRoot,"auth-status.json"),JSON.stringify({...usageAuth,email:randomBytes(8).toString("hex")+"@localhost",orgId:require("crypto").randomUUID()}));
+      }else fs.writeFileSync(path.join(profile,`quota-identity-${provider}.txt`),require("crypto").randomUUID());
+      await api("app","provider_usage",{provider});
+      assert(fs.readFileSync(inputFile).length>count,"live identity changes outside profile file stamps invalidate the quota cache");
+      if(provider==="claude") {
+        fs.writeFileSync(path.join(usageRoot,"auth-status.json"),JSON.stringify({...usageAuth,authMethod:"api_key",email:null,orgId:null}));
+        await api("app","provider_usage",{provider});const unknownCount=fs.readFileSync(inputFile).length;
+        await api("app","provider_usage",{provider});
+        assert(fs.readFileSync(inputFile).length>unknownCount,"connected but unidentified accounts never reuse a quota cache");
+        fs.writeFileSync(path.join(usageRoot,"auth-status.json"),JSON.stringify(usageAuth));
+      }
+    }
+    const script = "Write-Output '" + JSON.stringify({ spent, budget }) + "'";
+    await api("app", "usage_commands_save", { commands: { [provider]: { kind: "shell", command: script } } });
+    const external = await api("app", "provider_usage", { provider, refresh: true });
+    assert.equal(external.state, "ready", provider + " system command completes");
+    assert.equal(external.windows[0].remainingPercent, 75);
+    await api("app", "usage_commands_save", { commands: { [provider]: { kind: "shell", command: "Write-Output 'unrecognized synthetic output'" } } });
+    const invalid = await api("app", "provider_usage", { provider, refresh: true });
+    assert.equal(invalid.state, "unavailable"); assert.deepEqual(invalid.windows, []);
+    assert(!JSON.stringify(invalid).includes("unrecognized synthetic output"));
+    fs.writeFileSync(path.join(folder, "quota-deny-fixture"), "");
+    await api("app", "usage_commands_save", { commands });
+    const denied = await api("app", "provider_usage", { provider, refresh: true });
+    assert.equal(denied.state, "unavailable");
+    fs.unlinkSync(path.join(folder, "quota-deny-fixture"));
+  }
+  if(process.env.WORKFLOW_TEST_EXTENDED_QUOTA==="1") {
+    await page.evaluate(()=>{document.querySelector("#providers-section").hidden=true;});
+    await api("app","usage_commands_save",{commands:{codex:{kind:"provider",command:"/usage-fixture:spend"}}});
+    fs.writeFileSync(path.join(profile,"quota-auth-pause-fixture"),"");
+    const probes=Array.from({length:6},()=>api("app","provider_usage",{provider:"codex"}));
+    await until(()=>fs.existsSync(path.join(profile,"quota-auth-preflight.txt")),"auth preflight began before quota process spawn");
+    const state=await api("data_management","status");
+    await assert.rejects(api("data_management","reset_records",{confirmation:"RESET",revision:state.revision}),/kota sorgusu/);
+    const results=await Promise.all(probes);
+    assert(results.filter(result=>result.state==="unavailable").length>=2,"only four queries may reserve auth/PAC/spawn work");
+    assert(results.some(result=>result.state==="ready"));
+    fs.unlinkSync(path.join(profile,"quota-auth-pause-fixture"));
+  }
+  await api("app", "usage_commands_save", { commands: {} });
+  for (const provider of ["codex", "claude", "copilot"]) assert.equal((await api("app", "provider_usage", { provider })).source, undefined);
+  await stop();
+  await start("", profile, { WORKFLOW_TEST_QUOTA_DIR: folder });
+  for(const session of sessions)assert.deepEqual(await api("history","list",{id:session.id}),[],"probe history remains excluded after restart");
+  assert.deepEqual(await api("app", "usage_commands_read"), {}, "clearing settings persists across restarts");
+  const commands = Object.fromEntries(["codex", "claude", "copilot"].map(provider => [provider, { kind: "provider", command: "/usage-fixture:spend" }]));
+  await api("app", "usage_commands_save", { commands });
+  fs.writeFileSync(path.join(folder, "quota-wait-fixture"), "");
+  for (const provider of Object.keys(commands)) { const file = path.join(folder, `quota-process-${provider}.txt`); if (fs.existsSync(file)) fs.unlinkSync(file); }
+  const pending = Object.keys(commands).map(provider => api("app", "provider_usage", { provider, refresh: true }).catch(() => null));
+  await until(() => Object.keys(commands).every(provider => fs.existsSync(path.join(folder, `quota-process-${provider}.txt`))), "all query children started");
+  const owned = Object.keys(commands).map(provider => Number(fs.readFileSync(path.join(folder, `quota-process-${provider}.txt`), "utf8")));
+  await stop(); await Promise.all(pending);
+  for (const pid of owned) { let alive = true; try { process.kill(pid, 0); } catch { alive = false; } assert.equal(alive, false, "application close stops custom quota processes"); }
+  console.log("PASS custom quota settings UI, provider-scoped fallback, measured Spend/Budget and JSON, three-provider slash/system commands, caching, failure and permission handling, preserved live terminals and shutdown cleanup");
+}
+
 async function testSessionUsage() {
   const profile=path.join(temporary,'session-usage-profile'),folder=path.join(temporary,'session-usage-project');
   fs.mkdirSync(folder);
@@ -2490,6 +2727,18 @@ async function test() {
     );
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  if (process.env.WORKFLOW_TEST_CUSTOM_USAGE_ONLY === "1") {
+    await testCustomUsage();
+    return;
+  }
+  if (process.env.WORKFLOW_TEST_MODEL_CONTEXT_ONLY === "1") {
+    await testModelCatalogChurn();
+    return;
+  }
+  if (process.env.WORKFLOW_TEST_NETWORK_ONLY === "1") {
+    await testProviderNetwork();
+    return;
+  }
   if (process.env.WORKFLOW_TEST_SESSION_USAGE_ONLY === "1") {
     await testSessionUsage();
     return;

@@ -251,6 +251,7 @@ pub struct Core {
     pub(crate) chat_log: Mutex<crate::chat::LogCache>,
     pub(crate) session_usage: Mutex<crate::session_usage::Cache>,
     pub(crate) model_catalog: crate::models::CatalogCache,
+    pub(crate) custom_usage: crate::custom_usage::Queries,
     pub(crate) notifications: Mutex<crate::notifications::Notifications>,
     pub browsers: Mutex<BrowserState>,
     #[cfg(any(windows, target_os = "macos"))]
@@ -304,6 +305,7 @@ impl Core {
             chat_log: Mutex::new(crate::chat::LogCache::default()),
             session_usage: Mutex::new(crate::session_usage::Cache::default()),
             model_catalog: crate::models::CatalogCache::default(),
+            custom_usage: crate::custom_usage::Queries::default(),
             notifications: Mutex::new(crate::notifications::Notifications::default()),
             browsers: Mutex::new(BrowserState::default()),
             #[cfg(any(windows, target_os = "macos"))]
@@ -431,6 +433,7 @@ impl Core {
         Ok(out)
     }
     pub fn shutdown(&self) {
+        self.custom_usage.shutdown();
         crate::notification_popup::shutdown(self);
         #[cfg(any(windows, target_os = "macos"))]
         self.previews.shutdown();

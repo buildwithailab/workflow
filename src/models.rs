@@ -11,6 +11,10 @@ use std::{
 };
 
 const CATALOG_TTL: Duration = Duration::from_secs(120);
+#[derive(Debug)]
+struct ContextChanged;
+impl std::fmt::Display for ContextChanged {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.write_str("Model listesi değişti; listeyi yeniden aç.")}}
+impl std::error::Error for ContextChanged {}
 const EFFORTS: &[&str] = &[
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 ];
@@ -25,6 +29,7 @@ struct CachedCatalog {
 pub(crate) struct CatalogCache(Mutex<HashMap<String, Arc<Mutex<CachedCatalog>>>>);
 
 impl CatalogCache {
+    fn invalidate(&self,key:&str){let slot=self.0.lock().unwrap().get(key).cloned();if let Some(slot)=slot{let mut slot=slot.lock().unwrap();slot.loaded=None;slot.models.clear();}}
     pub(crate) fn clear_idle(&self) {
         self.0.lock().unwrap().retain(|_, entry| Arc::strong_count(entry) > 1);
     }
@@ -71,6 +76,21 @@ fn file_stamp(path: &Path) -> Value {
         .unwrap_or(Value::Null)
 }
 
+fn configuration_stamp(path: &Path) -> Result<Value> {
+    const ERROR: &str = "Sağlayıcı ayarları güvenle okunamadı. Dosya erişimini ve yapılandırmayı kontrol et.";
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Value::Null),
+        Err(_) => bail!(ERROR),
+    };
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1).read_to_end(&mut bytes).map_err(|_| anyhow::anyhow!(ERROR))?;
+    if bytes.len() > 1024 * 1024 { bail!(ERROR); }
+    // Providers can atomically rewrite unchanged settings during startup.
+    // Retain only a bounded content digest, never account/configuration contents.
+    Ok(json!([bytes.len(), hash(&bytes)]))
+}
+
 fn catalog_context(core: &Core, s: &Value, profile: &Profile) -> Result<(PathBuf, String)> {
     let provider = string(s, "provider")?;
     let custom = core.db.lock().unwrap()["providers"][provider]["executable"]
@@ -85,7 +105,8 @@ fn catalog_context(core: &Core, s: &Value, profile: &Profile) -> Result<(PathBuf
     }
     .context("CLI kurulumu bulunamadı")?;
     let directory = profile.config_dir();
-    // Only metadata is fingerprinted. No account contents enter this in-memory cache.
+    // Content digests ignore timestamp-only rewrites. Account contents never
+    // enter this in-memory cache; the executable still uses a metadata stamp.
     let stamps: Vec<_> = [
         "auth.json",
         "auth-status.json",
@@ -95,8 +116,8 @@ fn catalog_context(core: &Core, s: &Value, profile: &Profile) -> Result<(PathBuf
         "config.json",
     ]
     .iter()
-    .map(|name| file_stamp(&directory.join(name)))
-    .collect();
+    .map(|name| configuration_stamp(&directory.join(name)))
+    .collect::<Result<_>>()?;
     let project = Path::new(string(s, "directory")?);
     let project_stamps: Vec<_> = [
         ".claude/settings.json",
@@ -104,8 +125,8 @@ fn catalog_context(core: &Core, s: &Value, profile: &Profile) -> Result<(PathBuf
         ".codex/config.toml",
     ]
     .iter()
-    .map(|name| file_stamp(&project.join(name)))
-    .collect();
+    .map(|name| configuration_stamp(&project.join(name)))
+    .collect::<Result<_>>()?;
     let identity = core.db.lock().unwrap()["providers"][provider]["accounts"][&profile.id]
         ["identity"]
         .as_str()
@@ -240,6 +261,8 @@ pub fn configured(provider: &str, profile: &Profile) -> Option<String> {
 }
 pub(crate) struct Rpc {
     child: Child,
+    #[cfg(windows)]
+    job: Option<terminal::Job>,
     #[cfg(target_os = "macos")]
     group: crate::platform::macos::process::Group,
     input: ChildStdin,
@@ -253,11 +276,7 @@ impl Drop for Rpc {
         self.group.stop();
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
-            let _ = Command::new("taskkill.exe")
-                .args(["/pid", &self.child.id().to_string(), "/t", "/f"])
-                .creation_flags(0x08000000)
-                .output();
+            self.job.take();
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -270,6 +289,7 @@ impl Rpc {
         directory: &std::path::Path,
         profile: &Profile,
     ) -> Result<Self> {
+        let network = crate::provider_network::prepare(provider, profile)?;
         let mut args: Vec<String> = match provider {
             "codex" => vec!["app-server", "--listen", "stdio://"],
             "claude" => vec![
@@ -323,6 +343,7 @@ impl Rpc {
             }
         }
         profile.apply(&mut c);
+        network.apply(&mut c);
         #[cfg(target_os = "macos")]
         c.env("PATH", crate::platform::macos::child_path(exe)?);
         #[cfg(windows)]
@@ -333,6 +354,8 @@ impl Rpc {
         #[cfg(target_os = "macos")]
         crate::platform::macos::process::configure(&mut c);
         let mut child = c.spawn()?;
+        #[cfg(windows)]
+        let job=match terminal::Job::new(child.id()){Ok(job)=>job,Err(error)=>{let _=child.kill();let _=child.wait();return Err(error);}};
         #[cfg(target_os = "macos")]
         let group = match crate::platform::macos::process::Group::new(child.id(), false) {
             Ok(group) => group,
@@ -391,6 +414,8 @@ impl Rpc {
         });
         Ok(Self {
             child,
+            #[cfg(windows)]
+            job:Some(job),
             #[cfg(target_os = "macos")]
             group,
             input,
@@ -441,9 +466,17 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
     let s = core.session(sid)?;
     let provider = string(&s, "provider")?;
     if action == "list" {
+        // A first read may create defaults or refresh account files. Query the
+        // resulting context once more, but never follow a session/account switch.
+        for attempt in 0..2 {
+        let current = core.session(sid)?;
+        if ["provider", "accountId", "directory"].iter().any(|key| current[key] != s[key]) {
+            core.pending.lock().unwrap().remove(&format!("models:{sid}"));
+            bail!("Model listesi değişti; listeyi yeniden aç.");
+        }
         let profile = Profile::get(core, provider, &s["accountId"])?;
-        let (exe, context) = catalog_context(core, &s, &profile)?;
-        let models = core.model_catalog.load(&context, args["refresh"] == true, || {
+        let (exe, context) = catalog_context(core, &current, &profile)?;
+        let models = core.model_catalog.load(&context, attempt > 0 || args["refresh"] == true, || {
         usage::require_account(core, provider, &profile)?;
         let mut rpc = Rpc::new(
             provider,
@@ -483,22 +516,35 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
                     .collect()
             }
         };
+        let current=core.session(sid)?;
+        let current_profile=Profile::get(core,string(&current,"provider")?,&current["accountId"])?;
+        if ["provider","accountId","directory"].iter().any(|key|current[key]!=s[key])
+            || catalog_context(core,&current,&current_profile)?.1!=context {return Err(ContextChanged.into());}
         Ok(models)
-        }).map_err(|error| {
-            core.pending.lock().unwrap().remove(&format!("models:{sid}"));
-            error
-        })?;
+        });
+        let models=match models {
+            Ok(models)=>models,
+            Err(error)=>{core.pending.lock().unwrap().remove(&format!("models:{sid}"));if error.is::<ContextChanged>(){continue;}return Err(error);}
+        };
         let current = core.session(sid)?;
         let current_profile =
             Profile::get(core, string(&current, "provider")?, &current["accountId"])?;
-        if catalog_context(core, &current, &current_profile)?.1 != context {
+        if ["provider", "accountId", "directory"].iter().any(|key| current[key] != s[key]) {
+            core.pending.lock().unwrap().remove(&format!("models:{sid}"));
             bail!("Model listesi değişti; listeyi yeniden aç.");
+        }
+        if catalog_context(core, &current, &current_profile)?.1 != context {
+            core.model_catalog.invalidate(&context);
+            core.pending.lock().unwrap().remove(&format!("models:{sid}"));
+            continue;
         }
         core.pending.lock().unwrap().insert(
             format!("models:{sid}"),
             json!({"context":context,"models":models}),
         );
         return Ok(json!(models));
+        }
+        bail!("Model listesi değişti; listeyi yeniden aç.");
     }
     if action == "apply" {
         let model = string(args, "model")?;
@@ -591,6 +637,37 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn configuration_context_ignores_identical_rewrites_but_detects_same_size_edits() {
+        let directory = std::env::temp_dir().join(format!("workflow-model-context-{}",id()));
+        std::fs::create_dir(&directory).unwrap();
+        let file=directory.join("settings.json");
+        assert!(configuration_stamp(&file).unwrap().is_null());
+        std::fs::write(&file,b"{\"model\":\"a\"}").unwrap();
+        let original=configuration_stamp(&file).unwrap();
+        crate::core::atomic(&file,b"{\"model\":\"a\"}").unwrap();
+        assert_eq!(configuration_stamp(&file).unwrap(),original);
+        let modified=std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::fs::write(&file,b"{\"model\":\"b\"}").unwrap();
+        let opened=std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        opened.set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
+        drop(opened);
+        assert_ne!(configuration_stamp(&file).unwrap(),original);
+        std::fs::remove_file(file).unwrap();std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn unreadable_and_oversized_configuration_is_never_accepted_as_missing() {
+        let directory = std::env::temp_dir().join(format!("workflow-model-limit-{}",id()));
+        std::fs::create_dir(&directory).unwrap();
+        assert!(configuration_stamp(&directory).is_err());
+        let file=directory.join("settings.json");
+        std::fs::write(&file,vec![b' ';1024*1024+1]).unwrap();
+        let error=configuration_stamp(&file).unwrap_err().to_string();
+        assert!(!error.contains(directory.to_str().unwrap()));
+        std::fs::remove_file(file).unwrap();std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
     fn catalogs_reuse_success_but_refresh_and_context_changes_fetch_again() {
         let cache = CatalogCache::default();
         let calls = AtomicUsize::new(0);
@@ -614,6 +691,15 @@ mod tests {
             .is_err());
         cache.load("account-a/project-a", false, fetch).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 6);
+    }
+    #[test]
+    fn a_catalog_rejected_during_context_change_never_enters_the_old_slot() {
+        let cache=CatalogCache::default();let calls=AtomicUsize::new(0);
+        let unstable=cache.load("context-a",false,|| {calls.fetch_add(1,Ordering::SeqCst);Err(ContextChanged.into())});
+        assert!(unstable.is_err());
+        cache.load("context-b",false,||Ok(vec![json!({"id":"model-b"})])).unwrap();
+        let returned=cache.load("context-a",false,|| {calls.fetch_add(1,Ordering::SeqCst);Ok(vec![json!({"id":"model-a"})])}).unwrap();
+        assert_eq!(returned[0]["id"],"model-a");assert_eq!(calls.load(Ordering::SeqCst),2);
     }
 
     #[test]

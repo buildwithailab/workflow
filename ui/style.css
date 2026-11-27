@@ -3200,4 +3200,11 @@ dialog::backdrop {
 .session-usage-settings { border-top:1px solid var(--line); padding-top:14px; margin-top:8px; display:grid; gap:10px; }
 .session-usage-settings .help { padding:0; }
 .session-usage-settings > button { justify-self:start; }
+.quota-command-settings { display:grid; gap:16px; }
+.quota-command-settings > .help { padding:0; margin:0; }
+.quota-command-provider { display:grid; gap:10px; border:1px solid var(--line); border-radius:10px; padding:14px; }
+.quota-command-provider > strong { color:var(--text); }
+.quota-command-provider textarea { width:100%; resize:vertical; font-family:var(--mono, monospace); }
+.quota-command-help summary { cursor:pointer; color:var(--muted); }
+.quota-command-help pre { white-space:pre-wrap; font-size:12px; }
 .card-footer .session-usage-meter { min-height:22px; padding:3px 5px; font-size:10px; gap:4px; }

@@ -93,6 +93,7 @@ fn restore_records(db: &Value, mut saved: Value) -> Result<Value> {
 }
 
 fn ensure_idle(core: &Core) -> Result<()> {
+    if core.custom_usage.running() {bail!("Önce çalışan özel kota sorgusunun tamamlanmasını bekle.");}
     if core.browser_opening.load(std::sync::atomic::Ordering::SeqCst)!=0 {
         bail!("Dahili tarayıcı açılıyor. Tamamlanmasını bekle.");
     }
@@ -161,6 +162,7 @@ pub(crate) fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<V
             core.session_usage.lock().unwrap().clear();
             *core.chat_log.lock().unwrap() = crate::chat::LogCache::default();
             core.model_catalog.clear_idle();
+            core.custom_usage.clear_idle();
             core.browsers.lock().unwrap().clear_trace_cache();
             Ok(json!(true))
         }

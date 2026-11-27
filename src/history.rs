@@ -64,6 +64,7 @@ fn read_metadata(f: &fs::File, file: &Path, provider: &str) -> Option<Value> {
             continue;
         };
         if provider == "codex" && v["type"] == "session_meta" {
+            if v["payload"]["id"].as_str().is_some_and(crate::custom_usage::is_probe_conversation){return None;}
             return Some(
                 json!({"id":v["payload"]["id"],"cwd":v["payload"]["cwd"],"createdAt":v["payload"]["timestamp"],"file":file}),
             );
@@ -76,12 +77,14 @@ fn read_metadata(f: &fs::File, file: &Path, provider: &str) -> Option<Value> {
                 .as_str()
                 .map(str::to_string)
                 .or_else(|| file.parent()?.file_name()?.to_str().map(str::to_string))?;
+            if crate::custom_usage::is_probe_conversation(&thread){return None;}
             return Some(json!({"id":thread,"cwd":cwd,"createdAt":v["timestamp"],"file":file}));
         }
         if provider == "claude" && v["isSidechain"] != true {
             let (Some(thread), Some(cwd)) = (v["sessionId"].as_str(), v["cwd"].as_str()) else {
                 continue;
             };
+            if crate::custom_usage::is_probe_conversation(thread){return None;}
             return Some(json!({"id":thread,"cwd":cwd,"createdAt":v["timestamp"],"file":file}));
         }
     }
@@ -430,6 +433,23 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostic_provider_conversations_are_never_bindable_history() {
+        let root=std::env::temp_dir().join(format!("workflow-history-probe-{}",id()));std::fs::create_dir(&root).unwrap();
+        let probe=crate::custom_usage::conversation_id();let ordinary=id();
+        for provider in ["codex","claude","copilot"] {
+            let file=root.join(format!("{provider}.jsonl"));
+            let record=|thread:&str|match provider {
+                "codex"=>json!({"type":"session_meta","payload":{"id":thread,"cwd":root,"timestamp":now()}}),
+                "claude"=>json!({"sessionId":thread,"cwd":root,"timestamp":now()}),
+                _=>json!({"type":"session.start","data":{"sessionId":thread,"context":{"cwd":root}},"timestamp":now()}),
+            };
+            std::fs::write(&file,format!("{}\n",record(&probe))).unwrap();assert!(metadata(&file,provider).is_none());
+            std::fs::write(&file,format!("{}\n",record(&ordinary))).unwrap();assert_eq!(metadata(&file,provider).unwrap()["id"],ordinary);
+            std::fs::remove_file(file).unwrap();
+        }
+        std::fs::remove_dir(root).unwrap();
+    }
     use std::io::{Cursor, Write};
 
     fn row(provider: &str, text: &str) -> Vec<u8> {

@@ -4,6 +4,17 @@ use std::{
     path::PathBuf,
 };
 fn main() -> io::Result<()> {
+    if env::args().nth(1).as_deref()==Some("--quota-fixture") {
+        return chat_terminal(&env::args().nth(2).unwrap());
+    }
+    if let Some(root)=env::var_os("WORKFLOW_DATA_DIR").map(PathBuf::from) {
+        if let Ok(expected)=fs::read_to_string(root.join("network-expected-proxy.txt")) {
+            let actual=env::var("HTTPS_PROXY").unwrap_or_default();
+            assert!(actual == if expected=="DIRECT" {""}else{&expected}, "Synthetic child proxy mismatch");
+            if expected!="DIRECT" { assert!(env::var("NO_PROXY").unwrap_or_default().contains("localhost"), "Synthetic loopback bypass missing"); }
+            if env::args().nth(1).as_deref()!=Some("--version") {println!("Automatic proxy environment verified");}
+        }
+    }
     if env::args().nth(1).as_deref() == Some("--version") {
         println!("2.1.265 (Claude Code)");
         return Ok(());
@@ -176,6 +187,7 @@ fn chat_terminal(provider: &str) -> io::Result<()> {
     if !std::process::Command::new("/bin/stty").args(["raw", "-echo"]).status()?.success() {
         return Err(io::Error::other("fixture raw input unavailable"));
     }
+    if env::args().nth(1).as_deref()==Some("--quota-fixture") {return quota_terminal(provider);}
     if env::current_dir()?.join("notification-terminal-fixture").is_file() {
         return notification_terminal();
     }
@@ -456,6 +468,51 @@ fn chat_terminal(provider: &str) -> io::Result<()> {
     // Keep the same process available so the renderer can reattach to it.
     while input.read(&mut packet)? > 0 {}
     Ok(())
+}
+
+fn quota_terminal(provider:&str)->io::Result<()> {
+    let cwd=env::current_dir()?;
+    let directory=env::var_os("WORKFLOW_TEST_QUOTA_DIR").map(PathBuf::from).unwrap_or_else(||cwd.clone());
+    let thread=if provider=="codex" {fs::read_to_string(directory.join("quota-native-id.txt"))?} else {
+        env::args().skip_while(|arg|arg!="--session-id").nth(1).expect("reserved query conversation")
+    };
+    let profile=PathBuf::from(env::var_os(match provider{"codex"=>"CODEX_HOME","claude"=>"CLAUDE_CONFIG_DIR",_=>"COPILOT_HOME"}).unwrap());
+    let log=match provider{"codex"=>profile.join("sessions").join(format!("rollout-{thread}.jsonl")),"claude"=>profile.join("projects/quota-fixture").join(format!("{thread}.jsonl")),_=>profile.join("session-state").join(&thread).join("events.jsonl")};
+    fs::create_dir_all(log.parent().unwrap())?;
+    let escaped=cwd.to_string_lossy().replace('\\',"\\\\").replace('"',"\\\"");
+    let timestamp=fs::read_to_string(directory.join("quota-timestamp.txt"))?;
+    let record=match provider {
+        "codex"=>format!(r#"{{"type":"session_meta","payload":{{"id":"{thread}","cwd":"{escaped}","timestamp":"{timestamp}"}}}}"#),
+        "claude"=>format!(r#"{{"sessionId":"{thread}","cwd":"{escaped}","timestamp":"{timestamp}"}}"#),
+        _=>format!(r#"{{"type":"session.start","data":{{"sessionId":"{thread}","context":{{"cwd":"{escaped}"}}}},"timestamp":"{timestamp}"}}"#),
+    };
+    fs::write(log,format!("{record}\n"))?;
+    fs::write(directory.join(format!("quota-last-id-{provider}.txt")),&thread)?;
+    fs::write(directory.join(format!("quota-cwd-{provider}.txt")),cwd.to_string_lossy().as_bytes())?;
+    let ready=|text:&str|->io::Result<()> {
+        if provider=="codex" {let row=if text.is_empty(){2}else{text.lines().count()+1};print!("\x1b[?2004h\x1b[2J\x1b[H{text}\r\n› Ask Codex to do anything\x1b[{row};3H");}
+        else {let footer=if provider=="claude"{"? for shortcuts"}else{"Interactive · Manual Approval"};print!("\x1b[?2004h\x1b[2J\x1b[H{text}\r\n─────────\r\n❯ \r\n─────────\r\n{footer}");}
+        io::stdout().flush()
+    };
+    fs::write(directory.join(format!("quota-process-{provider}.txt")),std::process::id().to_string())?;
+    ready("")?;
+    let mut input=io::stdin().lock();let mut data=Vec::new();let mut buffer=[0;512];
+    loop {
+        let size=input.read(&mut buffer)?;if size==0{return Ok(());}
+        data.extend_from_slice(&buffer[..size]);
+        if !data.contains(&b'\r'){continue;}
+        fs::OpenOptions::new().create(true).append(true).open(directory.join(format!("quota-input-{provider}.txt")))?.write_all(&data)?;
+        if directory.join("quota-wait-fixture").is_file(){while input.read(&mut buffer)?>0{}return Ok(());}
+        if directory.join("quota-deny-fixture").is_file(){
+            print!("\x1b[2J\x1b[HDo you want to allow this tool?\r\n› 1. Yes\r\n  2. No\r\nEnter to select");io::stdout().flush()?;
+            while input.read(&mut buffer)?>0{}return Ok(());
+        }
+        let values=fs::read_to_string(directory.join("quota-values.txt"))?;
+        let mut values=values.lines();let spent=values.next().unwrap();let budget=values.next().unwrap();
+        if directory.join("quota-json-fixture").is_file(){ready(&format!("Synthetic hook result\r\n{{\"spent\":{spent},\"budget\":{budget}}}"))?;}
+        else {ready(&format!("Synthetic hook result\r\nPeriod runtime-month\r\nSpend ${spent}\r\nBudget ${budget}"))?;}
+        data.clear();
+    }
 }
 
 #[cfg(any(windows, unix))]

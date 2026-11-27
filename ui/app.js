@@ -811,6 +811,20 @@ async function rename(id) {
   name.select();
 }
 const usageInFlight = new Map();
+function createUsageQueue(limit = 4) {
+  const waiting = [];
+  let active = 0;
+  function drain() {
+    while (active < limit && waiting.length) {
+      const { work, resolve, reject } = waiting.shift();
+      active++;
+      Promise.resolve().then(work).then(resolve, reject).finally(() => { active--; drain(); });
+    }
+  }
+  return work => new Promise((resolve, reject) => { waiting.push({ work, resolve, reject }); drain(); });
+}
+const scheduleUsage = createUsageQueue();
+let usageConfigurationRevision = 0;
 const defaultAccount = "default";
 const accountLabel = (account) =>
   account.id === defaultAccount ? tr("Varsayılan hesap") : account.name;
@@ -847,6 +861,10 @@ function usageRow(w) {
   meter.setAttribute("aria-valuenow", String(left));
   meter.append(fill);
   row.append(line, meter);
+  if (Number.isFinite(w.spent) && Number.isFinite(w.budget)) {
+    const number = new Intl.NumberFormat(uiLocale, { maximumFractionDigits: 2 });
+    row.append(el("small", "usage-budget-amount", tr("Harcama / Bütçe") + ": " + number.format(w.spent) + " / " + number.format(w.budget)));
+  }
   if (w.resetsAt) {
     const date = new Date(w.resetsAt);
     if (!Number.isNaN(date.getTime()))
@@ -867,7 +885,7 @@ function renderProviderCards() {
     card.dataset.provider = id;
     const refresh = button(
       "↻",
-      () => Promise.allSettled(p.accounts.map((a) => refreshProviderUsage(id, a.id))),
+      () => Promise.allSettled(p.accounts.map((a) => refreshProviderUsage(id, a.id, true))),
       "icon quiet",
       tr("Kullanımı yenile"),
     );
@@ -1023,22 +1041,26 @@ function renderAccountUsage(provider, account) {
       );
     return usage;
 }
-async function refreshProviderUsage(id, accountId = defaultAccount) {
+async function refreshProviderUsage(id, accountId = defaultAccount, force = false) {
   const p = providerInfo(id);
   if (!p?.installed || !providerAccount(id, accountId)) return;
   const key = usageKey(id, accountId);
   if (usageInFlight.has(key)) return usageInFlight.get(key);
   const executable = p.executable;
-  const request = api("app", "provider_usage", { provider: id, accountId });
+  const configuration = usageConfigurationRevision;
+  const request = scheduleUsage(() => {
+    if (configuration !== usageConfigurationRevision || providerInfo(id)?.executable !== executable || !providerAccount(id, accountId)) return null;
+    return api("app", "provider_usage", { provider: id, accountId, refresh: force });
+  });
   usageInFlight.set(key, request);
   renderProviderCards();
   try {
     const result = await request;
     const current = providerAccount(id, accountId);
-    if (current && providerInfo(id)?.executable === executable) current.usage = result;
+    if (result && current && providerInfo(id)?.executable === executable && configuration === usageConfigurationRevision) current.usage = result;
   } catch {
     const current = providerAccount(id, accountId);
-    if (current && providerInfo(id)?.executable === executable)
+    if (current && providerInfo(id)?.executable === executable && configuration === usageConfigurationRevision)
       current.usage = {
         state: "unavailable",
         message: tr("Kullanım alınamadı. Yeniden dene."),
@@ -1047,7 +1069,7 @@ async function refreshProviderUsage(id, accountId = defaultAccount) {
     usageInFlight.delete(key);
     renderProviderCards();
     if (
-      providerInfo(id)?.executable !== executable &&
+      (providerInfo(id)?.executable !== executable || configuration !== usageConfigurationRevision) &&
       !$("#providers-section").hidden
     )
       refreshProviderUsage(id, accountId);
@@ -2697,12 +2719,48 @@ $("#app-settings").onclick = () => {
     field(tr("Arayüz dili"), language),
     notificationSettings(),
     button(tr("Oturum kullanımı"),openSessionUsageSettings),
+    button(tr("Kota sorgulama"),openUsageCommands),
     button(tr("Veri yönetimi"),openDataManagement),
     button(tr("Sağlayıcı kurulumu"), () => openProviderSetup()),
     button(tr("Hakkında ve güncellemeler"), openAbout),
   ]);
   $("#dialog-footer button").textContent = tr("Kapat");
 };
+
+async function openUsageCommands() {
+  const settings = await api("app", "usage_commands_read");
+  const box = el("div", "quota-command-settings"), fields = [];
+  box.append(el("p", "help", tr("Boş bırakılan sağlayıcılarda otomatik kota sorgusu kullanılır. Özel komut, seçili hesabın ortamıyla çalışır.")));
+  for (const [provider, name] of [["codex", "Codex"], ["claude", "Claude Code"], ["copilot", "GitHub Copilot"]]) {
+    const section = el("section", "quota-command-provider");
+    const kind = select([{ id: "provider", label: tr("Sağlayıcı içi /komut") }, { id: "shell", label: tr("Sistem komutu") }], settings[provider]?.kind || "provider");
+    kind.id = "quota-kind-" + provider;
+    const command = document.createElement("textarea");
+    command.id = "quota-command-" + provider;
+    command.rows = 2; command.maxLength = 4096;
+    command.value = settings[provider]?.command || "";
+    command.spellcheck = false;
+    command.placeholder = tr("Boş: otomatik sorgu");
+    section.append(el("strong", "", name), field(tr("Komut türü"), kind), field(tr("Kota komutu"), command));
+    fields.push({ provider, kind, command }); box.append(section);
+  }
+  const help = el("details", "quota-command-help");
+  help.append(el("summary", "", tr("Desteklenen çıktı biçimleri")),
+    el("p", "help", tr("Sağlayıcı içi komut / ile başlar. Açık oturumlarına yazılmaz; giriş veya izin soruları otomatik yanıtlanmaz. Sistem komutu Windows’ta PowerShell, macOS’ta sh ile çalışır.")),
+    el("p", "help", tr("Sistem komutları ve Codex sorguları ayrı kota dizininde başlar. Betik dosyaları için tam yol kullan. Claude ve Copilot sorguları proje eklentilerine erişimi korur; kota konuşmaları oturum geçmişinden ayrı tutulur.")),
+    el("p", "help", tr("Çıktı Spend ve Budget satırları veya JSON olmalı. Komut en fazla 25 saniye çalışır. Parola ve anahtarları komuta yazma; hesabının mevcut ortamını kullan.")),
+    el("pre", "", 'Spend $25.00\nBudget $100.00\n\n{"spent":25,"budget":100}\n\n{"windows":[{"label":"Daily","remainingPercent":75}]}'));
+  box.append(help);
+  modal(tr("Kota sorgulama"), box, async () => {
+    const commands = Object.fromEntries(fields.map(({ provider, kind, command }) => [provider, { kind: kind.value, command: command.value.trim() }]));
+    await api("app", "usage_commands_save", { commands });
+    usageConfigurationRevision++;
+    for (const provider of providers) for (const account of provider.accounts) account.usage = undefined;
+    await window.workflow.refresh();
+    toast(tr("Kota komutları kaydedildi."));
+    refreshProviderUsageAll().catch(error);
+  });
+}
 
 async function openAbout() {
   const panel = el("div", "about-updates");

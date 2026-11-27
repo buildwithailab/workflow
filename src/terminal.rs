@@ -681,6 +681,11 @@ fn is_codex_mcp_bootstrap_error(bytes: &[u8]) -> bool {
 
 pub fn start(core: &Arc<Core>, session_id: &str) -> Result<Value> {
     let initial = core.session(session_id)?;
+    if let Some(t) = core.terms.lock().unwrap().get(session_id) {
+        if !t.exited.load(Ordering::SeqCst) { return Ok(t.snapshot()); }
+    }
+    let initial_profile = crate::accounts::Profile::get(core, string(&initial,"provider")?, &initial["accountId"])?;
+    let network = crate::provider_network::prepare(string(&initial,"provider")?, &initial_profile)?;
     let directory = PathBuf::from(string(&initial, "directory")?);
     let repository = core.repository_operations.lock(&[directory.clone()])?;
     repository.validate(&[directory])?;
@@ -689,7 +694,7 @@ pub fn start(core: &Arc<Core>, session_id: &str) -> Result<Value> {
     if session["workspaceCleanupPending"]==true || session["workspaceFilesRemoved"]==true {
         bail!("Bu ayrı çalışma alanı temizlendi veya temizliği yarım kaldı. Veri yönetiminden işlemi tamamla ya da yeni bir oturum oluştur.");
     }
-    if session["directory"] != initial["directory"] {
+    if ["directory","provider","accountId"].iter().any(|key| session[key] != initial[key]) {
         bail!(crate::repository_operations::CHANGED);
     }
     if session["archived"] == true {
@@ -777,6 +782,7 @@ pub fn start(core: &Arc<Core>, session_id: &str) -> Result<Value> {
     crate::addons::prepare(core, &session)?;
     let mut cmd = command(&exe, &args);
     profile.apply_pty(&mut cmd);
+    network.apply_pty(&mut cmd);
     cmd.cwd(&directory);
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
@@ -892,6 +898,47 @@ fn login_arguments(provider: &str) -> Vec<String> {
         "claude" => vec!["auth".into(), "login".into()],
         _ => vec!["login".into()],
     }
+}
+
+pub(crate) fn usage_probe(core:&Arc<Core>,provider:&str,profile:&crate::accounts::Profile,exe:&Path,directory:&Path,query:&str,reserved:&crate::custom_usage::Registration<'_>)->Result<String> {
+    let probe_id=crate::custom_usage::conversation_id();
+    let mut args=if matches!(provider,"claude"|"copilot"){vec!["--session-id".into(),probe_id.clone()]}else{Vec::new()};
+    let fixture=std::env::var_os("WORKFLOW_TEST_PROVIDER").filter(|_|std::env::var("WORKFLOW_TEST_MODE").as_deref()==Ok("1"));
+    let exe=if let Some(fixture)=fixture {args=vec!["--quota-fixture".into(),provider.into(),"--session-id".into(),probe_id];PathBuf::from(fixture)}else{exe.to_path_buf()};
+    let mut command=command(&exe,&args);
+    profile.apply_pty(&mut command);crate::provider_network::prepare(provider,profile)?.apply_pty(&mut command);
+    command.cwd(crate::core::external_path(directory));command.env("TERM","xterm-256color");
+    if provider=="claude" {command.env("CLAUDE_CODE_SKIP_PROMPT_HISTORY","1");}
+    reserved.check()?;
+    let(terminal,mut child,reader)=spawn_terminal(command,id(),provider)?;
+    if let Err(error)=reserved.attach(terminal.clone()){let _=child.wait();return Err(error);}
+    let output=read_terminal(core.clone(),terminal.clone(),reader,None);
+    let result=(||->Result<String>{
+        let start=Instant::now();let(mut sent,mut sent_at,mut previous,mut changed)=(false,0,0,Instant::now());
+        loop {
+            if start.elapsed()>Duration::from_secs(25){bail!("Özel kota sorgusu zaman aşımına uğradı.");}
+            let seq=terminal.seq.lock().unwrap();
+            if *seq>crate::custom_usage::LIMIT as u64 {bail!("Özel kota sorgusu çıktısı çok büyük.");}
+            if *seq!=previous {previous=*seq;changed=Instant::now();}
+            let parser=terminal.screen.lock().unwrap();
+            if terminal_prompt(parser.screen(),provider).is_some(){bail!("Özel kota komutu giriş veya onay bekliyor. Sağlayıcıdaki durumu kontrol et.");}
+            if provider_prompt_ready(parser.screen(),provider) {
+                if !sent {
+                    terminal.input.lock().unwrap().write_bytes(format!("{query}\r").as_bytes())?;
+                    sent=true;sent_at=*seq;changed=Instant::now();
+                } else if *seq>sent_at && changed.elapsed()>Duration::from_millis(650) {
+                    let text=screen_text(parser.screen(),0);
+                    if let Ok(payload)=crate::custom_usage::terminal_payload(&text) {return Ok(payload);}
+                }
+            }
+            drop(parser);drop(seq);
+            if child.try_wait()?.is_some(){bail!("Özel kota sorgusu başarısız. Komutu ve sağlayıcı girişini kontrol et.");}
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    })();
+    terminal.stop();let _=child.wait();
+    let master=terminal.master.lock().unwrap().take();drop(master);
+    let _=output.join();result
 }
 
 type SpawnedTerminal = (
@@ -1104,6 +1151,13 @@ impl LoginTerminal {
 }
 
 pub fn login(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
+    // Resolve outside application/login locks, so a slow PAC lookup cannot
+    // block unrelated projects or prevent closing a running login window.
+    let network = if action == "start" {
+        let provider=string(args,"provider")?;
+        let profile=crate::accounts::Profile::get(core,provider,&args["accountId"])?;
+        crate::provider_network::prepare(provider,&profile)?
+    } else {crate::provider_network::Plan::default()};
     let _guard = (action == "start").then(|| core.operations.lock().unwrap());
     let mut current = core.login_terminal.lock().unwrap();
     if action == "start" {
@@ -1146,6 +1200,7 @@ pub fn login(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
         };
         let mut cmd = command(&exe, &arguments);
         profile.apply_pty(&mut cmd);
+        network.apply_pty(&mut cmd);
         cmd.cwd(&core.directory);
         cmd.env("TERM", "xterm-256color");
         let (terminal, mut child, reader) = spawn_terminal(cmd, id(), provider)?;
