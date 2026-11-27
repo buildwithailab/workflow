@@ -3,11 +3,18 @@
 const fs = require("node:fs"), path = require("node:path"), os = require("node:os"), cp = require("node:child_process");
 const net = require("node:net"), http = require("node:http"), assert = require("node:assert/strict"), {randomUUID} = require("node:crypto");
 if (process.platform !== "darwin") throw Error("Run this suite on macOS");
+const guiHome=os.homedir();let isolatedChromeChild;
 const root = path.resolve(__dirname,".."), temporary = fs.mkdtempSync(path.join(os.tmpdir(),"workflow-mac-"));
 const profile = path.join(temporary,"data"), project = path.join(temporary,"project");
 const executable = process.env.WORKFLOW_MAC_TEST_EXE || path.join(root,"target/debug/bundle/macos/Workflow.app/Contents/MacOS/workflow");
 const fixture = path.join(root,"target/test-tools/provider-fixture");
 const homes = Object.fromEntries(["codex","claude","copilot"].map(provider=>[provider,path.join(temporary,provider)]));
+for(const name of ["home","tmp","github","data"])fs.mkdirSync(path.join(temporary,name),{mode:0o700});
+fs.mkdirSync(path.join(profile,"updates"));fs.writeFileSync(path.join(profile,"updates/state.json"),JSON.stringify({automatic:false}));
+const nativeEnvironment={PATH:"/usr/bin:/bin:/usr/sbin:/sbin",SHELL:"/bin/sh",LANG:"en_US.UTF-8",LC_ALL:"en_US.UTF-8",
+  HOME:path.join(temporary,"home"),TMPDIR:path.join(temporary,"tmp")+path.sep,GH_CONFIG_DIR:path.join(temporary,"github"),
+  WORKFLOW_DATA_DIR:profile,WORKFLOW_TEST_MODE:"1",WORKFLOW_TEST_PROVIDER:fixture,WORKFLOW_TEST_RPC_EXE:executable,
+  WORKFLOW_TEST_INPUT_DIR:path.join(profile,"test-input"),CODEX_HOME:homes.codex,CLAUDE_CONFIG_DIR:homes.claude,COPILOT_HOME:homes.copilot};
 fs.mkdirSync(project); fs.writeFileSync(path.join(project,"sample.txt"),"synthetic project\n");
 fs.writeFileSync(path.join(project,"chat-terminal-fixture"),"");
 fs.writeFileSync(path.join(project,"chat-interaction-fixture"),"");
@@ -18,9 +25,7 @@ async function start() {
   control=null;
   fs.rmSync(path.join(profile,"test-control.json"),{force:true});
   // Exercise normal launch arguments; native window restoration is owned by Workflow.
-  child = cp.spawn(executable,[],{stdio:"ignore",env:{...process.env,WORKFLOW_DATA_DIR:profile,WORKFLOW_TEST_MODE:"1",
-    WORKFLOW_TEST_PROVIDER:fixture,WORKFLOW_TEST_RPC_EXE:executable,WORKFLOW_TEST_INPUT_DIR:path.join(profile,"test-input"),
-    CODEX_HOME:homes.codex,CLAUDE_CONFIG_DIR:homes.claude,COPILOT_HOME:homes.copilot}});
+  child = cp.spawn(executable,[],{stdio:"ignore",env:nativeEnvironment});
   control = await until(()=>fs.existsSync(path.join(profile,"test-control.json"))&&JSON.parse(fs.readFileSync(path.join(profile,"test-control.json"))),"test startup",30000).catch(error=>{child.kill("SIGTERM");throw error;});
   await until(()=>evaluate("!!window.workflow"),"native renderer startup");
 }
@@ -43,7 +48,7 @@ async function clipboard(action,args={}) {
   const wire=JSON.stringify({action,...args})+"\n";
   if(Buffer.byteLength(wire)>maxClipboardWire)throw Error("clipboard request exceeds restoration budget");
   if(!clipboardChild){
-    const helper=cp.spawn(executable,["--clipboard-test-helper"],{env:{...process.env,WORKFLOW_DATA_DIR:profile,WORKFLOW_TEST_MODE:"1"},stdio:["pipe","pipe","ignore"]});
+    const helper=cp.spawn(executable,["--clipboard-test-helper"],{env:nativeEnvironment,stdio:["pipe","pipe","ignore"]});
     clipboardChild=helper;
     helper.stdout.setEncoding("utf8");
     helper.stdout.on("data",data=>{
@@ -120,7 +125,7 @@ async function main() {
     const before=await api("terminal","attach",{id:session.id});assert.equal(before.exited,true);assert(!before.pid);
     const started=await api("terminal","start",{id:session.id});session.run=started;
     const lease=path.join(profile,"leases",session.id+".json");
-    const rpc=cp.spawnSync(executable,["mcp",lease],{input:[{jsonrpc:"2.0",id:1,method:"initialize",params:{}},{jsonrpc:"2.0",id:2,method:"tools/list",params:{}},{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"session_catalog",arguments:{}}}].map(row=>JSON.stringify(row)).join("\n")+"\n",encoding:"utf8",timeout:10000,stdio:["pipe","pipe","ignore"]});
+    const rpc=cp.spawnSync(executable,["mcp",lease],{env:nativeEnvironment,input:[{jsonrpc:"2.0",id:1,method:"initialize",params:{}},{jsonrpc:"2.0",id:2,method:"tools/list",params:{}},{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"session_catalog",arguments:{}}}].map(row=>JSON.stringify(row)).join("\n")+"\n",encoding:"utf8",timeout:10000,stdio:["pipe","pipe","ignore"]});
     assert.equal(rpc.status,0);const responses=rpc.stdout.trim().split("\n").map(line=>JSON.parse(line));
     assert.equal(responses[0].result.serverInfo.name,"workflow");
     assert(responses[1].result.tools.some(tool=>tool.name==="teams_send_message"));
@@ -199,6 +204,14 @@ async function main() {
   assert(picked.selector);assert(picked.screenshot);passed("WKWebView element selection captures context and image");
   const proof=await api("browser","assert",{pageId:browser.id,check:"text_contains",expected:"Native browser fixture"});assert.equal(proof.passed,true);
   const rejected=await api("browser","assert",{pageId:browser.id,check:"text_contains",expected:"not present",timeoutMs:0});assert.equal(rejected.passed,false);passed("browser assertions distinguish pass and failure");
+  // Chrome needs the OS GUI context. Only this vendor process receives it;
+  // Workflow/providers keep synthetic homes and no inherited credential env.
+  const chromeDirectory=path.join(profile,"chrome-profiles",sessions[0].id);
+  fs.mkdirSync(chromeDirectory,{recursive:true,mode:0o700});
+  isolatedChromeChild=cp.spawn("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    ["--remote-debugging-address=127.0.0.1","--remote-debugging-port=0","--no-first-run","--no-default-browser-check","--user-data-dir="+chromeDirectory,"about:blank"],
+    {env:{PATH:"/usr/bin:/bin:/usr/sbin:/sbin",HOME:guiHome,TMPDIR:nativeEnvironment.TMPDIR,LANG:"en_US.UTF-8",LC_ALL:"en_US.UTF-8",SHELL:"/bin/sh"},stdio:"ignore",detached:true});
+  await until(()=>fs.existsSync(path.join(chromeDirectory,"DevToolsActivePort")),"isolated OS-context Chrome endpoint");
   const chrome=await api("browser","open",{sessionId:sessions[0].id,url:address+"/?chrome",mode:"chrome",newTab:true});
   const chromeRead=()=>api("browser","read",{pageId:chrome.id});
   const chromeState=await until(async()=>{const state=await chromeRead();return state.text.includes("Native browser fixture")&&state;},"isolated Chrome fixture loaded");
@@ -324,6 +337,7 @@ async function main() {
 }
 main().catch(e=>{console.error("FAIL macOS integration: "+e.message);process.exitCode=1;}).finally(async()=>{
   if(child)await request("quit").catch(()=>{});
+  if(isolatedChromeChild&&isolatedChromeChild.exitCode===null&&isolatedChromeChild.signalCode===null){try{process.kill(-isolatedChromeChild.pid,"SIGTERM");}catch{}}
   if(independent){independent.kill();}
   if(server)server.close();
   if(clipboardModified&&clipboardBackup&&clipboardLast){
@@ -344,7 +358,7 @@ main().catch(e=>{console.error("FAIL macOS integration: "+e.message);process.exi
     catch{helper.kill();console.error("FAIL clipboard helper did not exit cleanly");process.exitCode=1;}
     if(clipboardRestored){
       try{
-        const response=JSON.parse(cp.execFileSync(executable,["--clipboard-test-helper"],{input:JSON.stringify({action:"snapshot"})+"\n",encoding:"utf8",timeout:10000,maxBuffer:maxClipboardWire,env:{...process.env,WORKFLOW_DATA_DIR:profile,WORKFLOW_TEST_MODE:"1"},stdio:["pipe","pipe","ignore"]}));
+        const response=JSON.parse(cp.execFileSync(executable,["--clipboard-test-helper"],{input:JSON.stringify({action:"snapshot"})+"\n",encoding:"utf8",timeout:10000,maxBuffer:maxClipboardWire,env:nativeEnvironment,stdio:["pipe","pipe","ignore"]}));
         // Never expose captured clipboard data through assertions or child errors.
         if(response.ok!==true||JSON.stringify(clipboardSnapshot(response.value).items)!==JSON.stringify(clipboardBackup.items))throw Error("clipboard restore mismatch");
         console.log("PASS original clipboard restored (all captured items and types, after helper exit)");

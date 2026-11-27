@@ -31,7 +31,7 @@ fn isolated(session: &Value) -> bool {
     matches!(session["workspaceKind"].as_str(), Some("copy" | "worktree"))
 }
 
-fn directory_inside_slot(
+pub(crate) fn directory_inside_slot(
     data: &Path,
     id: &str,
     archived: bool,
@@ -42,17 +42,69 @@ fn directory_inside_slot(
     let original_spelling = data.join(data_slot).join(id).join("files");
     let worktree = expected.join("files");
     let directory = external_path(Path::new(directory));
+    if !directory.is_absolute() || directory.components().any(|part| part == Component::ParentDir) {
+        bail!("Oturum klasörü Workflow çalışma alanında değil.");
+    }
     let relative = directory
         .strip_prefix(external_path(&worktree))
         .or_else(|_| directory.strip_prefix(external_path(&original_spelling)))
-        .context("Oturum klasörü Workflow çalışma alanında değil.")?;
+        .map(Path::to_path_buf)
+        .or_else(|_| -> Result<PathBuf> {
+            let canonical_data = dunce::canonicalize(data)?;
+            for files in directory.ancestors() {
+                let Some(slot) = files.parent() else { continue; };
+                let Some(bucket) = slot.parent() else { continue; };
+                let Some(profile) = bucket.parent() else { continue; };
+                if files.file_name() == Some(std::ffi::OsStr::new("files"))
+                    && slot.file_name() == Some(std::ffi::OsStr::new(id))
+                    && bucket.file_name() == Some(std::ffi::OsStr::new(data_slot))
+                    && dunce::canonicalize(profile)? == canonical_data
+                {
+                    // The target may not exist during unarchive or cleanup
+                    // recovery. Prove its exact registered path from the real
+                    // profile root, never from an arbitrary surviving ancestor.
+                    return Ok(directory.strip_prefix(files)?.to_path_buf());
+                }
+            }
+            // Existing journals may retain another spelling of the same real
+            // directory across launches. This fallback requires existing files.
+            let root = dunce::canonicalize(&worktree)?;
+            Ok(dunce::canonicalize(&directory)?.strip_prefix(root)
+                .context("Oturum klasörü Workflow çalışma alanında değil.")?.to_path_buf())
+        })?;
     if !relative
         .components()
         .all(|part| matches!(part, Component::Normal(_)))
     {
         bail!("Oturum klasörü Workflow çalışma alanında değil.");
     }
-    Ok(relative.to_path_buf())
+    Ok(relative)
+}
+
+#[cfg(all(test, unix))]
+mod path_tests {
+    use super::*;
+    #[test]
+    fn aliases_require_the_exact_registered_profile_bucket_and_id_even_for_missing_targets() {
+        let root = std::env::temp_dir().join(format!("workflow-archive-alias-{}", uuid::Uuid::new_v4()));
+        let data = root.join("data");
+        fs::create_dir_all(&data).unwrap();
+        let alias = root.join("profile-alias");
+        std::os::unix::fs::symlink(&data, &alias).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let expected = safe_path(&data, &format!("workspaces/{id}")).unwrap();
+        for (profile, recorded) in [(&data, &alias), (&alias, &data)] {
+            let recorded = recorded.join("workspaces").join(&id).join("files");
+            assert_eq!(directory_inside_slot(profile, &id, false, &expected, recorded.to_str().unwrap()).unwrap(), PathBuf::new());
+            assert_eq!(directory_inside_slot(profile, &id, false, &expected, recorded.join("nested").to_str().unwrap()).unwrap(), PathBuf::from("nested"));
+            assert!(directory_inside_slot(profile, &id, false, &expected, recorded.join("../files").to_str().unwrap()).is_err());
+        }
+        for recorded in [alias.join("archive").join(&id).join("files"), alias.join("workspaces").join(uuid::Uuid::new_v4().to_string()).join("files"), root.join("other/workspaces").join(&id).join("files")] {
+            assert!(directory_inside_slot(&data, &id, false, &expected, recorded.to_str().unwrap()).is_err());
+        }
+        assert!(directory_inside_slot(&data, &id, false, &expected, "relative/workspaces/files").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 struct GitWorktree<'a> {
@@ -303,15 +355,20 @@ pub(crate) fn set(core: &Core, id: &str, mut patch: Value) -> Result<Value> {
         &from,
         string(&session, "directory")?,
     )?;
-    let directory = if archive {
-        json!(external_path(&to.join("files").join(&relative)))
-    } else {
+    if !archive {
         let original = string(&session, "archivedFromDirectory")?;
         if directory_inside_slot(&core.directory, id, false, &to, original)? != relative {
             bail!("Oturum klasörü Workflow çalışma alanında değil.");
         }
-        json!(original)
+    }
+    // Historical aliases only prove the relative location. Persist the managed
+    // slot itself so retargeting an old alias cannot redirect a future CLI cwd.
+    let managed = |slot: &Path| {
+        let root = slot.join("files");
+        if relative.as_os_str().is_empty() { root } else { root.join(&relative) }
     };
+    let directory = json!(external_path(&managed(&to)));
+    let original = json!(external_path(&managed(&from)));
     let from_root = safe_path(&from, "files")?;
     let from_directory = safe_path(&from_root, &relative.to_string_lossy())?;
     if !from_directory.is_dir() {
@@ -337,7 +394,7 @@ pub(crate) fn set(core: &Core, id: &str, mut patch: Value) -> Result<Value> {
         }
         patch["directory"] = directory;
         patch["archivedFromDirectory"] = if archive {
-            session["directory"].clone()
+            original
         } else {
             Value::Null
         };

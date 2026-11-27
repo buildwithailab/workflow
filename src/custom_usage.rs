@@ -294,7 +294,7 @@ pub(crate) fn read(core: &Arc<Core>, args: &Value, profile: &Profile, setting: &
             let text=if kind=="provider" {
                 let exe=executable.as_ref().context(FAILED)?;
                 terminal::usage_probe(core,provider,profile,exe,&directory,command,&reserved)?
-            }else{shell(provider,profile,&directory,command,&reserved)?};
+            }else{shell(provider,profile,&directory,command,&reserved,executable.as_deref())?};
             let mut value=parse(&text)?;
             if configured(core,provider).as_ref()!=Some(setting){bail!(FAILED);}
             if usage::executable(core,provider)!=executable || core.db.lock().unwrap()["providers"][provider]["executable"]!=configured_executable {bail!(FAILED);}
@@ -347,6 +347,7 @@ fn shell(
     directory: &Path,
     script: &str,
     reserved: &Registration<'_>,
+    _provider_executable: Option<&Path>,
 ) -> Result<String> {
     #[cfg(windows)]
     let mut command = {
@@ -382,6 +383,10 @@ fn shell(
         command
     };
     profile.apply(&mut command);
+    #[cfg(target_os = "macos")]
+    command.env("PATH", crate::platform::macos::child_path(
+        _provider_executable.unwrap_or_else(|| Path::new("/bin/sh")),
+    )?);
     provider_network::prepare(provider, profile)?.apply(&mut command);
     for (key, _) in std::env::vars() {
         if terminal::internal_variable(&key) {

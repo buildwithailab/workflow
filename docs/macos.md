@@ -37,6 +37,7 @@ target/devtools/node_modules/.bin/tauri build --debug --bundles app --features c
 mkdir -p target/test-tools
 rustc tests/provider-fixture.rs -o target/test-tools/provider-fixture
 node tests/macos.cjs
+node tests/macos-features.cjs
 ```
 
 `WORKFLOW_MAC_TEST_EXE` may select another debug test application. The suite uses temporary project and provider profiles, controlled CLI fixtures, authenticated local MCP routing, real WKWebView input, and the real system Pasteboard. It preserves the original clipboard items and types and stops if they cannot be safely restored. Test data and captures must stay in ignored or temporary storage.
@@ -44,6 +45,10 @@ node tests/macos.cjs
 The test bridge requires both a debug build and the explicit feature, plus test mode and an isolated profile at runtime. A release build with `desktop-tests` must fail to compile. Never distribute the test application.
 
 Controlled providers verify application mechanics; they do not establish that an installed, signed-in CLI works. Separately test Codex, Claude Code, and GitHub Copilot CLI with their own accounts, current model capabilities, conversation resumption, approval cards, custom question replies, and file/image attachments. Attaching a view, changing tabs, and reading history must not start providers or send input. Closing the app must stop only its owned processes; reopening must not automatically restart them.
+
+`macos-features.cjs` exercises shared model-context caching, custom quota commands, measured session usage and settings, editable native question replies, the verification MCP boundary, and safe data maintenance with all three controlled providers. Workflow children receive only an explicit environment allowlist and generated homes. Test commands and journals are generated at runtime. Native cleanup checks include macOS path aliases and GitHub CLI configuration precedence, including redirected or not-yet-created account directories. Individual groups can be selected with `path`, `models`, `quota`, `usage`, `verification`, `questions`, `maintenance`, `github`, `network`, `deadlines`, `storage` or `memory`.
+
+The browser suite launches the installed Google Chrome with its ordinary OS GUI home and a new private user-data directory, then connects Workflow to that fixture profile. The Workflow and provider processes retain synthetic homes. It does not copy an existing Chrome profile or change browser security flags. Both the real system clipboard contents and only the test-owned Chrome process are restored or stopped during cleanup.
 
 Also verify Finder file and image drops, screenshot paste in both Terminal and Chat, Dock and popup behavior while minimized/backgrounded, and application close/quit paths. Teams requires a signed-in Mac Teams Web connection and an explicitly authorized destination and message. Do not send a real message merely to satisfy a fixture test.
 

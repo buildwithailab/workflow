@@ -276,15 +276,10 @@ fn inspect(
         bail!("Oturumun arşiv taşıma işlemi tamamlanmadı.");
     }
     let files = safe_path(slot, "files")?;
-    let relative = external_path(&session.directory)
-        .strip_prefix(external_path(&files))
-        .context("Oturumun kayıtlı çalışma klasörü yönetilen alanın dışında.")?;
-    if !relative
-        .components()
-        .all(|c| matches!(c, Component::Normal(_)))
-    {
-        bail!("Oturumun kayıtlı çalışma klasörü doğrulanamadı.");
-    }
+    let relative = workspace_archive::directory_inside_slot(
+        data, &session.id, session.archived, slot,
+        session.directory.to_str().context("Oturumun kayıtlı çalışma klasörü doğrulanamadı.")?,
+    )?;
     let remaining_wrapper = !files.try_exists()?;
     if remaining_wrapper {
         if !session.cleanup_pending
@@ -433,6 +428,7 @@ fn inventory(
     if is_link(&fs::symlink_metadata(data)?) {
         bail!("Workflow veri klasörü bir dosya sistemi bağlantısı.");
     }
+    let original_data = data;
     let data = dunce::canonicalize(data)?;
     let mut plan = Plan {
         targets: Vec::new(),
@@ -508,7 +504,7 @@ fn inventory(
                 let project = projects
                     .get(&session.project)
                     .context("Oturumun ana proje kaydı bulunamadı.")?;
-                let target = inspect(&data, &slot, session, project, &mut budget)?;
+                let target = inspect(original_data, &slot, session, project, &mut budget)?;
                 if let Some(admin) = &target.admin {
                     outside_accounts(admin, &plan.account_locations)?;
                 }
@@ -522,6 +518,17 @@ fn inventory(
         }
     }
     Ok(plan)
+}
+
+// Match gh's configuration directory precedence, including a not-yet-created
+// account directory. Both preview and final removal use this same inventory.
+fn github_config_directory(environment: impl Fn(&str) -> Option<std::ffi::OsString>, home: &Path) -> PathBuf {
+    let value = |key| environment(key).filter(|value| !value.is_empty()).map(PathBuf::from);
+    if let Some(directory) = value("GH_CONFIG_DIR") { return directory; }
+    if let Some(directory) = value("XDG_CONFIG_HOME") { return directory.join("gh"); }
+    #[cfg(windows)]
+    if let Some(directory) = value("APPDATA") { return directory.join("GitHub CLI"); }
+    home.join(".config/gh")
 }
 
 pub(crate) fn plan(core: &Core) -> Result<Plan> {
@@ -571,9 +578,7 @@ pub(crate) fn plan(core: &Core) -> Result<Plan> {
         }
     }
     let mut accounts = vec![core.directory.join("accounts")];
-    if let Some(directory)=std::env::var_os("GH_CONFIG_DIR") {
-        accounts.push(directory.into());
-    }
+    accounts.push(github_config_directory(|key| std::env::var_os(key), &crate::core::home()));
     for provider in ["codex", "claude", "copilot"] {
         accounts.push(
             crate::accounts::Profile::for_history(core, provider, &Value::Null)?.config_dir(),
@@ -684,6 +689,25 @@ fn remove_verified(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn github_cli_configuration_precedence_keeps_default_and_future_accounts_protected() {
+        let home = PathBuf::from("synthetic-home");
+        let configured = |gh: Option<&str>, xdg: Option<&str>, appdata: Option<&str>| {
+            github_config_directory(|key| match key {
+                "GH_CONFIG_DIR" => gh,
+                "XDG_CONFIG_HOME" => xdg,
+                "APPDATA" => appdata,
+                _ => None,
+            }.map(std::ffi::OsString::from), &home)
+        };
+        assert_eq!(configured(Some("explicit"), Some("xdg"), Some("appdata")), PathBuf::from("explicit"));
+        assert_eq!(configured(Some(""), Some("xdg"), Some("appdata")), PathBuf::from("xdg").join("gh"));
+        #[cfg(windows)]
+        assert_eq!(configured(None, None, Some("appdata")), PathBuf::from("appdata").join("GitHub CLI"));
+        #[cfg(not(windows))]
+        assert_eq!(configured(None, None, Some("appdata")), home.join(".config/gh"));
+        assert_eq!(configured(None, Some(""), Some("")), home.join(".config/gh"));
+    }
 
     struct Fixture {
         root: PathBuf,
