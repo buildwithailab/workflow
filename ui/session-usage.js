@@ -192,6 +192,10 @@ async function saveSessionUsagePreferences(values) {
   renderSessionUsage();
   scheduleSessionUsage(true);
 }
+function openSessionUsageSettings() {
+  modal(tr("Oturum kullanımı"),sessionUsageSettings());
+  $("#dialog-footer button").textContent=tr("Kapat");
+}
 function sessionUsageSettings() {
   const box=el("section","session-usage-settings");box.id="session-usage-settings";
   const visible=el("input");visible.type="checkbox";visible.id="session-usage-visible";visible.checked=db.preferences?.sessionUsageVisible!==false;
@@ -212,7 +216,7 @@ function sessionUsageSettings() {
     await saveSessionUsagePreferences({usageTokenWarning:tokenValue,usageContextWarning:contextValue});
     status.textContent=tr("Uyarı eşikleri kaydedildi.");
   });
-  box.append(el("strong","",tr("Oturum kullanımı")),toggle,field(tr("Oturum toplam token eşiği"),tokens),field(tr("Bağlam doluluk eşiği (%)"),context),
+  box.append(toggle,field(tr("Oturum toplam token eşiği"),tokens),field(tr("Bağlam doluluk eşiği (%)"),context),
     el("p","help",tr("Boş alanlar uyarı üretmez. Ölçülen değerlerden biri eşiğini aşarsa oturumda uyarı görünür. Göstergeyi gizlemek bu uyarıları kapatmaz.")),saveButton,status);
   return box;
 }

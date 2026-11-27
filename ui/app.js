@@ -2696,7 +2696,7 @@ $("#app-settings").onclick = () => {
   modal(tr("Ayarlar"), [
     field(tr("Arayüz dili"), language),
     notificationSettings(),
-    sessionUsageSettings(),
+    button(tr("Oturum kullanımı"),openSessionUsageSettings),
     button(tr("Veri yönetimi"),openDataManagement),
     button(tr("Sağlayıcı kurulumu"), () => openProviderSetup()),
     button(tr("Hakkında ve güncellemeler"), openAbout),

@@ -2106,6 +2106,8 @@ async function testSessionUsage() {
   await page.evaluate(async id=>{await window.workflow.refresh();await window.workflow.selectSession(id,true);},sessions[0].id);
   assert.equal((await api('app','state')).active.length,0,'Reading usage never starts providers');
   await page.locator('#app-settings').click();
+  assert.equal(await page.locator('#session-usage-settings').count(),0,'Usage fields stay out of the main Settings window');
+  await page.locator('#dialog').getByRole('button',{name:'Session usage',exact:true}).click();
   assert.equal(await page.locator('#usage-token-warning').inputValue(),'');
   assert.equal(await page.locator('#usage-context-warning').inputValue(),'');
   assert(await page.locator('#session-usage-visible').isChecked());
@@ -2125,6 +2127,7 @@ async function testSessionUsage() {
     await until(async()=>!(await api('app','state')).preferences.sessionUsageVisible,'usage hidden preference');
     assert(await chatMeter.isHidden());
     await page.locator('#app-settings').click();
+    await page.locator('#dialog').getByRole('button',{name:'Session usage',exact:true}).click();
     await page.locator('#session-usage-visible').check();
     await page.locator('#usage-token-warning').fill('200');
     await page.locator('#usage-context-warning').fill('');
