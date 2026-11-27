@@ -52,7 +52,11 @@ function newSessionUsageButton(id) {
   meter.type = "button"; meter.dataset.sessionUsage = id;
   meter.setAttribute("aria-haspopup","dialog");
   meter.setAttribute("aria-controls","session-usage-popover");
-  meter.append(el("span","usage-warning-icon","⚠"),el("span","usage-meter-label"),el("span","usage-meter-track"),el("span","usage-meter-value"));
+  const icon=document.createElementNS("http://www.w3.org/2000/svg","svg");
+  icon.setAttribute("class","usage-meter-icon");icon.setAttribute("viewBox","0 0 16 16");icon.setAttribute("aria-hidden","true");
+  const layers=document.createElementNS(icon.namespaceURI,"path");
+  layers.setAttribute("d","m8 2 6 3-6 3-6-3 6-3ZM2 8l6 3 6-3M2 11l6 3 6-3");icon.append(layers);
+  meter.append(icon,el("span","usage-warning-icon","⚠"),el("span","usage-meter-label"),el("span","usage-meter-track"),el("span","usage-meter-value"));
   meter.querySelector(".usage-meter-track").append(el("span","usage-meter-fill"));
   meter.querySelector(".usage-warning-icon").setAttribute("aria-hidden","true");
   meter.querySelector(".usage-meter-track").setAttribute("aria-hidden","true");
@@ -78,6 +82,7 @@ function renderSessionUsage() {
     const label=warning ? tr(warnings.tokens && warnings.context ? "Kullanım eşikleri aşıldı" : warnings.tokens ? "Token eşiği aşıldı" : "Bağlam eşiği aşıldı")
       : tr(percent!==null ? "Bağlam" : used!==null ? (data.context.basis==="last-request-input" ? "Son girdi" : "Bağlam") : total!==null ? "Tokenlar" : "Kullanım");
     const tokenWarning=warnings.tokens && !warnings.context;
+    meter.classList.toggle("usage-has-context",percent!==null && !tokenWarning);
     const value=tokenWarning?usageCompact(total):percent!==null ? "%"+usageExact(percent) : usageCompact(used ?? total);
     meter.querySelector(".usage-meter-label").textContent=label;
     meter.querySelector(".usage-meter-value").textContent=value;

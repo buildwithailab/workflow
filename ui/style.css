@@ -1629,17 +1629,20 @@ body.no-left .sidebar {
 }
 .chat-model-controls {
   display: flex;
-  flex: 1 1 auto;
-  flex-wrap: wrap;
+  flex: 1 1 0;
+  align-items: center;
+  flex-wrap: nowrap;
   gap: 3px;
   min-width: 0;
 }
 #chat-attach-image {
+  flex: none;
   padding: 3px 8px;
   font-size: 17px;
   line-height: 1;
 }
 #chat-approval {
+  min-width: 0;
   width: auto;
   max-width: min(100%, 162px);
   padding: 5px 6px;
@@ -1670,6 +1673,7 @@ body.no-left .sidebar {
   align-items: center;
   gap: 7px;
   max-width: 100%;
+  min-width: 0;
   padding: 5px 8px;
   border-color: transparent;
   color: var(--muted);
@@ -3170,15 +3174,19 @@ dialog::backdrop {
 .cleanup-targets { max-height: 200px; overflow: auto; padding-inline-start: 20px; }
 .cleanup-targets li { margin: 8px 0; }
 .cleanup-targets small { display: block; color: var(--muted); overflow-wrap: anywhere; }
-.session-usage-meter { display:inline-flex; align-items:center; gap:6px; padding:2px 5px; border:0; background:transparent; color:var(--muted); border-radius:5px; font-size:11px; font-variant-numeric:tabular-nums; white-space:nowrap; flex:none; }
-.session-usage-meter:hover { color:var(--text); background:var(--raised); }
-.usage-meter-track { width:42px; height:4px; border-radius:3px; background:var(--line); overflow:hidden; }
+.session-usage-meter { display:inline-flex; align-items:center; justify-content:center; gap:6px; min-height:26px; box-sizing:border-box; padding:4px 7px; border:1px solid var(--line); background:transparent; color:var(--muted); border-radius:6px; font-size:11px; line-height:1; font-variant-numeric:tabular-nums; white-space:nowrap; flex:none; }
+.session-usage-meter:is(:hover,[aria-expanded="true"]) { color:var(--text); background:var(--raised); }
+.session-usage-meter:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+.usage-meter-icon { width:14px; height:14px; flex:none; fill:none; stroke:currentColor; stroke-width:1.3; stroke-linecap:round; stroke-linejoin:round; }
+.usage-has-context .usage-meter-icon,.usage-warning .usage-meter-icon,.usage-meter-label { display:none; }
+.usage-meter-value { line-height:1; }
+.usage-meter-track { width:24px; height:3px; border-radius:3px; background:var(--line); overflow:hidden; }
 .usage-meter-fill { display:block; width:var(--session-context-percent,0%); height:100%; border-radius:inherit; background:var(--accent); }
 .usage-warning-icon, .usage-threshold-notice { color:#dfb45b; }
 .usage-context-warning .usage-meter-fill { background:#dfb45b; }
-.usage-warning .usage-meter-label { color:#dfb45b; }
+.session-usage-meter.usage-warning { color:#dfb45b; }
 .usage-warning-only :is(.usage-meter-track,.usage-meter-value) { display:none; }
-.usage-warning .usage-meter-label { max-width:145px; overflow:hidden; text-overflow:ellipsis; }
+#chat-session-usage { display:inline-flex; align-items:center; align-self:center; flex:none; }
 .session-usage-popover { position:fixed; inset:auto; width:290px; max-width:calc(100vw - 20px); max-height:calc(100vh - 20px); overflow:auto; padding:14px; background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:10px; box-shadow:0 12px 32px #0005; font-size:12px; }
 .session-usage-popover::backdrop { background:transparent; }
 .usage-detail-head { display:flex; justify-content:space-between; gap:10px; align-items:center; margin-bottom:10px; }
@@ -3192,5 +3200,4 @@ dialog::backdrop {
 .session-usage-settings { border-top:1px solid var(--line); padding-top:14px; margin-top:8px; display:grid; gap:10px; }
 .session-usage-settings .help { padding:0; }
 .session-usage-settings > button { justify-self:start; }
-.card-footer .session-usage-meter { font-size:10px; gap:4px; }
-@media(max-width:650px) { .session-usage-meter:not(.usage-warning) .usage-meter-label { display:none; } .usage-warning .usage-meter-label { max-width:110px; } }
+.card-footer .session-usage-meter { min-height:22px; padding:3px 5px; font-size:10px; gap:4px; }
