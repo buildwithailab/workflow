@@ -2,6 +2,16 @@
 
 // Turkish source text is the default. Translate only messages authored by Workflow.
 const english = {
+  "Görünüm": "Appearance",
+  "Tema": "Theme",
+  "Koyu": "Dark",
+  "Sistem": "System",
+  "Sakin ve odaklı": "Calm and focused",
+  "Aydınlık ve yalın": "Bright and simple",
+  "Cihazının görünümünü izle": "Follow your device appearance",
+  "Görünüm anında uygulanır. Açık oturumlar aynı şekilde devam eder.": "Appearance changes immediately. Open sessions continue uninterrupted.",
+  "Görünüm değişti ancak tercih kaydedilemedi. Uygulamayı yeniden açınca tekrar seçmen gerekebilir.": "Appearance changed, but the preference could not be saved. You may need to select it again after reopening the app.",
+  "Açık tema": "Light",
   "Mesajın teslim teyidi bekleniyor. Terminalde taslak varsa kontrol edip Enter ile gönderebilirsin. Aynı doğrulama isteği açık kalır.": "Waiting for delivery confirmation. If the Terminal contains a draft, review it and press Enter to send. The same verification request remains open.",
   "Bağlantılar": "Connections",
   "Jira ve Confluence Data Center bağlantıları yalnızca okuma ve arama içindir.": "Jira and Confluence Data Center connections support reading and searching only.",

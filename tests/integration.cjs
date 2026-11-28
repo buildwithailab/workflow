@@ -2734,6 +2734,10 @@ async function test() {
     );
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  if (process.env.WORKFLOW_TEST_THEME_ONLY === "1") {
+    await require("./theme-integration.cjs")({start,stop,api,until,sleep,page:()=>page,pages:()=>browser.contexts().flatMap(c=>c.pages()),temporary,data});
+    return;
+  }
   if (process.env.WORKFLOW_TEST_APPROVALS_ONLY === "1") {
     await require("./chat-approvals.cjs")({start,stop,api,until,sleep,page:()=>page,temporary,data});
     return;

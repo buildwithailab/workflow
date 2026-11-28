@@ -1184,6 +1184,7 @@ function disposeTerminalView(id, keepCard = false) {
   clearTimeout(v.activityTimer);
   clearTimeout(v.resizeTimer);
   v.observer.disconnect();
+  v.releaseTheme();
   v.term.dispose();
   if (!keepCard) v.card.remove();
   views.delete(id);
@@ -1574,12 +1575,8 @@ function createCard(s, index) {
       cursorBlink: true,
       scrollback: 2000,
       allowProposedApi: false,
-      theme: {
-        background: "#0c1015",
-        foreground: "#dbe4ee",
-        cursor: "#beec91",
-        selectionBackground: "#41576c",
-      },
+      theme: workflowTheme.terminalTheme(),
+      minimumContrastRatio: document.documentElement.dataset.theme === "light" ? 4.5 : 1,
     }),
     fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
@@ -1588,6 +1585,7 @@ function createCard(s, index) {
   host.prepend(holder);
   term.open(holder);
   const v = {
+    releaseTheme: workflowTheme.bindTerminal(term),
     card,
     head,
     title,
@@ -2717,6 +2715,7 @@ $("#app-settings").onclick = () => {
   };
   modal(tr("Ayarlar"), [
     field(tr("Arayüz dili"), language),
+    button(tr("Görünüm"), openAppearance),
     notificationSettings(),
     button(tr("Oturum kullanımı"),openSessionUsageSettings),
     button(tr("Kota sorgulama"),openUsageCommands),
@@ -2727,6 +2726,47 @@ $("#app-settings").onclick = () => {
   ]);
   $("#dialog-footer button").textContent = tr("Kapat");
 };
+
+function openAppearance() {
+  const box = el("fieldset", "appearance-options");
+  box.append(el("legend", "", tr("Tema")));
+  const note = el("p", "help", tr("Görünüm anında uygulanır. Açık oturumlar aynı şekilde devam eder."));
+  note.setAttribute("role", "status");
+  const options = [
+    ["dark", "Koyu", "Sakin ve odaklı", "M19 15.5A8 8 0 0 1 8.5 5 8 8 0 1 0 19 15.5Z"],
+    ["light", "Açık tema", "Aydınlık ve yalın", "M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0"],
+    ["system", "Sistem", "Cihazının görünümünü izle", "M3 4h18v13H3ZM8 21h8m-4-4v4"],
+  ];
+  for (const [value, name, description, path] of options) {
+    const label = el("label", "appearance-option");
+    label.dataset.appearance = value;
+    const radio = document.createElement("input");
+    radio.type = "radio"; radio.name = "appearance"; radio.value = value;
+    radio.checked = workflowTheme.getPreference() === value;
+    const preview = el("span", "appearance-preview");
+    preview.setAttribute("aria-hidden", "true");
+    preview.append(el("span", "appearance-preview-rail"), el("span", "appearance-preview-content"));
+    const title = el("span", "appearance-title");
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("aria-hidden", "true");
+    const shape = document.createElementNS(svg.namespaceURI, "path");
+    shape.setAttribute("d", path); svg.append(shape);
+    title.append(svg, el("strong", "", tr(name)));
+    label.append(radio, preview, title, el("span", "help", tr(description)));
+    radio.onchange = () => {
+      const saved = workflowTheme.setPreference(value);
+      note.textContent = tr(saved ? "Görünüm anında uygulanır. Açık oturumlar aynı şekilde devam eder." : "Görünüm değişti ancak tercih kaydedilemedi. Uygulamayı yeniden açınca tekrar seçmen gerekebilir.");
+    };
+    box.append(label);
+  }
+  modal(tr("Görünüm"), [box, note]);
+  $("#dialog-footer button").textContent = tr("Kapat");
+  const refresh = () => {
+    for (const input of box.querySelectorAll("input")) input.checked = input.value === workflowTheme.getPreference();
+  };
+  window.addEventListener("workflow-theme-change", refresh);
+  $("#dialog").addEventListener("close", () => window.removeEventListener("workflow-theme-change", refresh), { once: true });
+}
 
 async function openUsageCommands() {
   const settings = await api("app", "usage_commands_read");
@@ -3168,11 +3208,13 @@ async function openProviderLogin(provider, accountId = defaultAccount) {
   const term = new Terminal({
     cursorBlink: true,
     scrollback: 2000,
-    theme: { background: "#0c1015", foreground: "#dbe4ee" },
+    theme: workflowTheme.terminalTheme(),
+    minimumContrastRatio: document.documentElement.dataset.theme === "light" ? 4.5 : 1,
   });
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
   term.open(host);
+  const releaseTheme = workflowTheme.bindTerminal(term);
   terminalClipboard(term, host, () => !closed && !ended ? runId : null, (data) => {
     if (!/^\x1b\[[?0-9;]*[Rc]$/.test(data)) return call("write", { data });
   });
@@ -3184,6 +3226,7 @@ async function openProviderLogin(provider, accountId = defaultAccount) {
     () => {
       closed = true;
       clearTimeout(timer);
+      releaseTheme();
       term.dispose();
       if (runId) call("close").catch(error);
     },
@@ -4748,7 +4791,7 @@ async function loadHistory(context = ctx(), token = panelGeneration) {
   from.onchange = () => selectCommits(to.value, from.value).catch(error);
   swap.onclick = () => selectCommits(from.value, to.value).catch(error);
   let lanes = [];
-  const colors = ["#a6d47e", "#a4bbee", "#d2a0de", "#e4bd78", "#77c6bc"];
+  const colors = ["var(--accent)", "var(--project-0-ink)", "var(--project-1-ink)", "var(--project-2-ink)", "var(--project-3-ink)"];
   for (const commit of history) {
     const previous = [...lanes];
     let lane = lanes.indexOf(commit.hash);

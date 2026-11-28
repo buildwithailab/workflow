@@ -157,4 +157,5 @@ async function main(){
   if(selected==="all"||selected==="delivery")await delivery();
   console.log("PASS native Chat permissions and verification: "+checks+" provider groups; controlled CLI fixtures only");
 }
-main().catch(error=>{const line=/(chat-approvals|verification-delivery)\.cjs:(\d+)/.exec(error.stack||"");console.error("FAIL native Chat permission acceptance at "+(timeoutStage||error.nativeAction||stage)+(line?" "+line[1]+" line "+line[2]:"")+" ("+error.name+"); raw payload omitted");console.error(String(error.message).replace(/\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/gi,"<id>").replace(/\/(?:Users|private|var|tmp)\/\S+/g,"<fixture>").slice(0,180));process.exitCode=1;}).finally(async()=>{for(const h of fixtures)await h.teardown();});
+module.exports={Native,until,sleep,page,bind};
+if(require.main===module)main().catch(error=>{const line=/(chat-approvals|verification-delivery)\.cjs:(\d+)/.exec(error.stack||"");console.error("FAIL native Chat permission acceptance at "+(timeoutStage||error.nativeAction||stage)+(line?" "+line[1]+" line "+line[2]:"")+" ("+error.name+"); raw payload omitted");console.error(String(error.message).replace(/\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/gi,"<id>").replace(/\/(?:Users|private|var|tmp)\/\S+/g,"<fixture>").slice(0,180));process.exitCode=1;}).finally(async()=>{for(const h of fixtures)await h.teardown();});
