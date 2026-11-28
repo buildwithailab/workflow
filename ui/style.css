@@ -3207,4 +3207,10 @@ dialog::backdrop {
 .quota-command-provider textarea { width:100%; resize:vertical; font-family:var(--mono, monospace); }
 .quota-command-help summary { cursor:pointer; color:var(--muted); }
 .quota-command-help pre { white-space:pre-wrap; font-size:12px; }
+.atlassian-connections { display:grid; gap:14px; }
+.atlassian-connections > .help { padding:0; margin:0; }
+.atlassian-connection { display:grid; gap:10px; border:1px solid var(--line); border-radius:10px; padding:14px; }
+.atlassian-connection .help, .atlassian-connection .dialog-error { margin:0; padding:0; }
+.atlassian-actions { display:flex; flex-wrap:wrap; gap:8px; }
+.chat-choices button .chat-choice-description { display:block; margin-top:4px; text-align:start; white-space:normal; }
 .card-footer .session-usage-meter { min-height:22px; padding:3px 5px; font-size:10px; gap:4px; }

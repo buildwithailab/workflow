@@ -92,23 +92,25 @@ pub(crate) fn http_client(
                 }
             }
         }
-        let urls = vec![clean_endpoint(address)?];
-        let routes = windows::cached(&urls)?;
-        return match routes.first() {
-            Some(Some(proxy)) => Ok(builder.no_proxy().proxy(
-                reqwest::Proxy::all(proxy)
-                    .map_err(|_| anyhow::anyhow!(INVALID))?
-                    .no_proxy(reqwest::NoProxy::from_env()),
-            )),
-            Some(None) => Ok(builder.no_proxy()),
-            None => bail!(INVALID),
-        };
+        return system_http_client(builder,address);
     }
     #[cfg(not(windows))]
     {
         let _ = (address, profile);
         Ok(builder)
     }
+}
+
+// Direct integrations use the OS route without another provider's account settings.
+pub(crate) fn system_http_client(builder:reqwest::blocking::ClientBuilder,address:&str)->Result<reqwest::blocking::ClientBuilder> {
+    #[cfg(windows)] {
+        let url=url::Url::parse(address).map_err(|_|anyhow::anyhow!(INVALID))?;
+        if url.host_str().is_some_and(|host|host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip|ip.is_loopback())) {return Ok(builder.no_proxy());}
+        if explicit_proxy(){return Ok(builder);}
+        let routes=windows::cached(&[clean_endpoint(address)?])?;
+        return match routes.first(){Some(Some(proxy))=>Ok(builder.no_proxy().proxy(reqwest::Proxy::all(proxy).map_err(|_|anyhow::anyhow!(INVALID))?.no_proxy(reqwest::NoProxy::from_env()))),Some(None)=>Ok(builder.no_proxy()),None=>bail!(INVALID)};
+    }
+    #[cfg(not(windows))] {let _=address;Ok(builder)}
 }
 
 #[cfg(windows)]

@@ -274,7 +274,14 @@ function paintChatComposer(selected, chat) {
       for (const [index, label] of menu.choices.entries()) {
         const button = el("button", "", `${index + 1} · ${label}`);
         button.type = "button";
-        if (menu.descriptions?.[index]) button.title = menu.descriptions[index];
+        button.setAttribute("aria-label", String(index + 1) + " · " + label);
+        if (menu.descriptions?.[index]) {
+          button.title = menu.descriptions[index];
+          const description = el("span", "chat-choice-description", menu.descriptions[index]);
+          description.id = "chat-approval-description-" + index;
+          button.setAttribute("aria-describedby", description.id);
+          button.append(description);
+        }
         button.onclick = () => answerTerminalChoice(id, choiceKey, { choice: index + 1 }).catch(error);
         choiceArea.append(button);
       }

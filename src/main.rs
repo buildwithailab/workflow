@@ -11,6 +11,8 @@ mod clipboard;
 #[path = "platform/macos/clipboard.rs"]
 mod clipboard;
 mod core;
+mod credential_store;
+mod atlassian;
 mod custom_usage;
 mod data_management;
 mod files;
@@ -113,6 +115,7 @@ async fn dispatch(
 fn route(core: &Arc<Core>, domain: &str, action: &str, args: &Value) -> Result<Value> {
     match domain {
         "app" => app_action(core, action, args),
+        "atlassian" => atlassian::dispatch(core, action, args),
         "data_management" => data_management::dispatch(core, action, args),
         "session_usage" if action == "read" => session_usage::snapshot(core,string(args,"id")?),
         "terminal" => terminal::dispatch(core, action, args),

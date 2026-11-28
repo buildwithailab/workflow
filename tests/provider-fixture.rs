@@ -282,6 +282,10 @@ fn chat_terminal(provider: &str) -> io::Result<()> {
     }
     let folder = PathBuf::from(env::var_os("WORKFLOW_TEST_INPUT_DIR").unwrap());
     fs::create_dir_all(&folder)?;
+    if env::current_dir()?.join("approval-permission-fixture").is_file() {
+        drop(input);
+        return approval_permission_terminal(provider, &folder);
+    }
     let interaction = env::current_dir()?
         .join("chat-interaction-fixture")
         .is_file();
@@ -289,8 +293,8 @@ fn chat_terminal(provider: &str) -> io::Result<()> {
     fs::write(folder.join(format!("{provider}-{output}.bin")), bytes)?;
     if interaction {
         let approval = match provider {
-            "claude" => "Do you want to proceed?\r\nRead the sample notes\r\n❯ 1. Yes\r\n  2. No\r\nEsc to cancel",
-            "copilot" => "Approval required\r\nRead the sample notes\r\n❯ 1. Yes\r\n  2. No, and tell Copilot what to do differently (Esc)",
+            "claude" => "Do you want to proceed?\r\n$ echo 'Read the sample notes'\r\n❯ 1. Yes\r\n  2. No\r\nEsc to cancel",
+            "copilot" => "Approval required\r\n$ echo 'Read the sample notes'\r\n❯ 1. Yes\r\n  2. No, and tell Copilot what to do differently (Esc)",
             _ => "Would you like to run the following command?\r\n$ echo 'Read the sample notes'\r\n› 1. Yes, proceed\r\n  2. No\r\nPress enter to confirm or esc to cancel",
         };
         let (heading, marker, hint) = match provider {
@@ -516,6 +520,97 @@ fn quota_terminal(provider:&str)->io::Result<()> {
 }
 
 #[cfg(any(windows, unix))]
+fn approval_permission_terminal(provider: &str, directory: &std::path::Path) -> io::Result<()> {
+    let inline_diff = env::current_dir()?.join("approval-inline-diff-fixture").is_file();
+    let path = |part: &str| directory.join(format!("{provider}-approval-{part}"));
+    let wait_for = |name: &str| -> io::Result<()> {
+        let signal = path(name);
+        let start = std::time::Instant::now();
+        while !signal.is_file() {
+            if start.elapsed() > std::time::Duration::from_secs(45) {
+                return Err(io::Error::other("approval fixture timed out waiting for test input"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        Ok(())
+    };
+    // Continue recording PTY bytes while the renderer deliberately withholds
+    // a selection redraw. This exposes eager arrow/Enter writes to the test.
+    let mut wire = fs::File::create(path("wire.bin"))?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stdin = io::stdin().lock();
+        let mut buffer = [0; 64];
+        while let Ok(size) = stdin.read(&mut buffer) {
+            if size == 0 || wire.write_all(&buffer[..size]).is_err() { break; }
+            for &byte in &buffer[..size] {
+                if sender.send(byte).is_err() { return; }
+            }
+        }
+    });
+    let byte = || receiver.recv().map_err(|_| io::Error::other("fixture input closed"));
+    let (labels, marker) = match provider {
+        "codex" => (["Yes, proceed", "Yes, and don't ask again for commands that start with `echo`",
+            "No, and tell Codex what to do differently"], '›'),
+        "claude" => (["Yes", "Yes, and don't ask again for: echo", "No"], '❯'),
+        "copilot" => (["Yes", "Yes, and approve `echo` for this session",
+            "No, and tell Copilot what to do differently (Esc)"], '❯'),
+        _ => return Err(io::Error::other("unsupported approval fixture provider")),
+    };
+    for round in 1..=4 {
+        if round > 1 { wait_for(&format!("open-{round}"))?; }
+        let mut selected = if round == 1 { 2 } else { 1 };
+        let mut target = format!("echo sample-{round}");
+        loop {
+            print!("\x1b[?2004h\x1b[2J\x1b[H");
+            match (provider, inline_diff) {
+                ("codex", true) => print!("Would you like to run the following command?\r\n$ echo fixed-sample\r\n- previous sample\r\n+ {target}\r\n"),
+                ("claude", true) => print!("- previous sample\r\n+ {target}\r\nDo you want to make this edit to sample.rs?\r\n"),
+                (_, true) => print!("Edit file\r\nsample.rs\r\n- previous sample\r\n+ {target}\r\nApproval required\r\n"),
+                ("codex", false) => print!("Would you like to run the following command?\r\n$ {target}\r\n"),
+                ("claude", false) => print!("Bash command\r\n  {target}\r\n\r\nDo you want to proceed?\r\n"),
+                _ => print!("Approval required\r\n$ {target}\r\n"),
+            }
+            for (index, label) in labels.iter().enumerate() {
+                print!("{} {}. {label}\r\n", if selected == index + 1 { marker } else { ' ' }, index + 1);
+                if index==1 {print!("    Only this tool and the displayed scope.\r\n");}
+            }
+            match provider {
+                "codex" => print!("Enter to confirm · Esc to cancel"),
+                "claude" => print!("Esc to cancel"),
+                _ => {} // Copilot puts the Esc hint in its final decision.
+            }
+            io::stdout().flush()?;
+            match byte()? {
+                b'\r' => {
+                    fs::write(path(&format!("decision-{round}")), selected.to_string())?;
+                    break;
+                }
+                b'\x1b' if byte()? == b'[' => {
+                    selected = match byte()? {
+                        b'A' if selected > 1 => selected - 1,
+                        b'B' if selected < labels.len() => selected + 1,
+                        _ => return Err(io::Error::other("invalid native selection movement")),
+                    };
+                    if round == 3 && selected == 2 { wait_for("release-redraw")?; }
+                    if round == 4 { target = "echo changed-target".to_owned(); }
+                }
+                _ => return Err(io::Error::other("unexpected native approval input")),
+            }
+        }
+        if provider == "codex" {
+            print!("\x1b[2J\x1b[H› Ask Codex to do anything\x1b[1;3H");
+        } else {
+            let footer = if provider == "claude" { "? for shortcuts" } else { "Interactive · Manual Approval" };
+            print!("\x1b[2J\x1b[H─────────\r\n❯ \r\n─────────\r\n{footer}");
+        }
+        io::stdout().flush()?;
+    }
+    while receiver.recv().is_ok() {}
+    Ok(())
+}
+
+#[cfg(any(windows, unix))]
 fn verification_terminal(provider: &str) -> io::Result<()> {
     let show = |draft: &str| {
         if provider == "codex" {
@@ -534,6 +629,8 @@ fn verification_terminal(provider: &str) -> io::Result<()> {
     let mut packet = [0; 1024];
     let mut bytes = Vec::new();
     let mut sequence = 0;
+    let delivery_fixture = env::current_dir()?.join("verification-delivery-fixture").is_file();
+    let delivery_mode = directory.join(format!("{provider}-delivery-mode"));
     let mut awaiting_tool_approval = false;
     let native_mcp = provider == "codex" && env::current_dir()?.join("codex-mcp-permission-fixture").is_file();
     let mut approval_selection: usize = 1;
@@ -555,7 +652,33 @@ fn verification_terminal(provider: &str) -> io::Result<()> {
         let size = input.read(&mut packet)?;
         if size == 0 { return Ok(()); }
         bytes.extend_from_slice(&packet[..size]);
-        let submitted = bytes.last() == Some(&b'\r');
+        let mut submitted = bytes.last() == Some(&b'\r');
+        if delivery_fixture {
+            fs::OpenOptions::new().create(true).append(true)
+                .open(directory.join(format!("{provider}-delivery-wire.bin")))?
+                .write_all(&packet[..size])?;
+            let mode = fs::read_to_string(&delivery_mode)?;
+            if !submitted && mode != "normal" {
+                if !bytes.ends_with(b"\x1b[201~") { continue; }
+                match mode.as_str() {
+                    // Consume the complete paste without echoing it in the composer.
+                    "consume" => submitted = true,
+                    // A real Enter from the Terminal view can submit the hidden draft.
+                    "hidden" => continue,
+                    // The test releases the echo after the application's observation deadline.
+                    "delayed" => {
+                        let start = std::time::Instant::now();
+                        while fs::read_to_string(&delivery_mode)? == "delayed" {
+                            if start.elapsed() > std::time::Duration::from_secs(30) {
+                                return Err(io::Error::other("fixture echo was never released"));
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                    }
+                    _ => return Err(io::Error::other("unknown delivery fixture mode")),
+                }
+            }
+        }
         if awaiting_tool_approval {
             approval_keys.extend_from_slice(&packet[..size]);
             if submitted {
@@ -579,11 +702,12 @@ fn verification_terminal(provider: &str) -> io::Result<()> {
             if sequence == 1 && env::current_dir()?.join("verification-tool-approval-fixture").is_file()
                 && !directory.join(format!("{provider}-tool-approval.bin")).is_file()
             {
+                approval_operation = draft.split_once("operation ").and_then(|(_,tail)|tail.split_whitespace().next()).unwrap_or("sample").to_owned();
                 if native_mcp {
-                    approval_operation = draft.split_once("operation ").and_then(|(_,tail)|tail.split_whitespace().next()).unwrap_or("sample").to_owned();
                     show_mcp(approval_selection,&approval_operation)?;
                 } else {
-                    print!("\x1b[?2004h\x1b[2J\x1b[HWorkflow tool: verification_propose\r\n› 1. Allow once\r\n  2. Deny\r\nConfirm selection\x1b[2;5H");
+                    let (heading,footer)=if provider=="claude" {("Do you want to proceed?","Esc to cancel")} else {("Permission request","Enter to select · Esc to cancel")};
+                    print!("\x1b[?2004h\x1b[2J\x1b[HMCP tool\r\nTool: workflow:verification_request\r\nArguments: operation={approval_operation}\r\n{heading}\r\n❯ 1. Allow once\r\n  2. Deny\r\n{footer}");
                     io::stdout().flush()?;
                 }
                 awaiting_tool_approval = true;

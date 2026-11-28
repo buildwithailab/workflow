@@ -188,6 +188,9 @@ function paintVerification(id, view) {
     error: "İstek ya da kapsam kontrolü tamamlanamadı. Yeniden denemeden önce Terminaldeki taslağı kontrol et.",
   }[phase];
   content.append(verificationNode("p", view.readError || tr(description || ""), "help verification-note"));
+  if (pending && state.delivery === "unconfirmed") content.append(verificationNode("p",
+    tr("Mesajın teslim teyidi bekleniyor. Terminalde taslak varsa kontrol edip Enter ile gönderebilirsin. Aynı doğrulama isteği açık kalır."),
+    "help verification-note"));
   const reason = {
     newMessage: "Neden: yeni bir geliştirme mesajı gönderildi.",
     sourceChanged: "Neden: kaynak dosyalar değişti.",

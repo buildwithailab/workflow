@@ -2720,6 +2720,7 @@ $("#app-settings").onclick = () => {
     notificationSettings(),
     button(tr("Oturum kullanımı"),openSessionUsageSettings),
     button(tr("Kota sorgulama"),openUsageCommands),
+    button(tr("Bağlantılar"),openAtlassianConnections),
     button(tr("Veri yönetimi"),openDataManagement),
     button(tr("Sağlayıcı kurulumu"), () => openProviderSetup()),
     button(tr("Hakkında ve güncellemeler"), openAbout),

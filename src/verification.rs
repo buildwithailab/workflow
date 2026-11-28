@@ -10,6 +10,19 @@ fn pending(state: &Value) -> bool {
     matches!(state["phase"].as_str(), Some("preparing" | "running"))
 }
 
+// Delivery acknowledgement is metadata, not a new verification request. A
+// concurrent acknowledgement must not invalidate a scan of the same scope.
+fn same_request(left: &Value, right: &Value) -> bool {
+    let clean=|value:&Value| {
+        let mut value=value.clone();
+        if let Some(fields)=value.as_object_mut() {
+            for key in ["delivery","receivedOperation","revision","updatedAt"] { fields.remove(key); }
+        }
+        value
+    };
+    clean(left)==clean(right)
+}
+
 pub(crate) fn recover(db: &mut Value) {
     if let Some(states) = db["verifications"].as_object_mut() {
         for state in states.values_mut().filter(|state| pending(state)) {
@@ -33,11 +46,15 @@ fn load(core: &Core, sid: &str) -> Value {
 // Compare-and-swap includes the operation and revision, so a late scan, failed
 // delivery or old callback cannot overwrite a subsequent edit/cancel/request.
 fn store(core: &Core, sid: &str, previous: &Value, mut state: Value) -> Result<Value> {
+    state["revision"] = json!(previous["revision"].as_u64().unwrap_or(0) + 1);
+    persist(core,sid,previous,state)
+}
+
+fn persist(core: &Core, sid: &str, previous: &Value, mut state: Value) -> Result<Value> {
     let mut db = core.db.lock().unwrap();
     if db["verifications"][sid] != *previous {
         bail!("Doğrulama değişti; güncel listeyi yeniden aç.");
     }
-    state["revision"] = json!(previous["revision"].as_u64().unwrap_or(0) + 1);
     state["updatedAt"] = json!(now());
     db["verifications"][sid] = state.clone();
     if let Err(error) = core.save_workspace(&db) {
@@ -175,8 +192,8 @@ fn checked_state(core: &Core, sid: &str, refresh: bool) -> Result<Value> {
     let digest = fingerprint(core,sid);
     let _guard = core.operations.lock().unwrap();
     let current = load(core,sid);
-    if current != previous { bail!("Doğrulama değişti; kapsamı yeniden kontrol et."); }
-    let mut state = previous.clone();
+    if !same_request(&current,&previous) { bail!("Doğrulama değişti; kapsamı yeniden kontrol et."); }
+    let mut state = current.clone();
     if check_live(core,sid,&state).is_err() { interrupt(&mut state,"interrupted","bindingChanged"); }
     else {
         match digest {
@@ -185,7 +202,7 @@ fn checked_state(core: &Core, sid: &str, refresh: bool) -> Result<Value> {
             Err(_) => interrupt(&mut state,"error","scopeUnavailable"),
         }
     }
-    if state != previous { store(core,sid,&previous,state) } else { Ok(state) }
+    if state != current { store(core,sid,&current,state) } else { Ok(state) }
 }
 
 fn text(value: &Value, limit: usize) -> Result<String> {
@@ -285,7 +302,7 @@ pub fn dispatch(core: &Core, action: &str, args: &Value) -> Result<Value> {
             }
             let operation = id();
             let phase = if action == "prepare" { "preparing" } else { "running" };
-            let mut state = json!({"phase":phase, "operation":operation, "runId":terminal.run_id,
+            let mut state = json!({"phase":phase, "operation":operation, "delivery":"sending", "runId":terminal.run_id,
                 "binding":scope, "digest":digest, "startedAt":now(), "items":[], "results":[]});
             if action == "start" { state["items"] = previous["items"].clone(); }
             let state = store(core, sid, &previous, state)?;
@@ -296,7 +313,8 @@ pub fn dispatch(core: &Core, action: &str, args: &Value) -> Result<Value> {
             let mut request = terminal.ticket;
             request["id"] = json!(sid);
             request["text"] = json!(prompt);
-            if let Err(error) = crate::terminal::send_verification(core, &request, &operation) {
+            let delivery=crate::terminal::send_verification(core, &request, &operation);
+            if let Err(error) = delivery {
                 let _guard = core.operations.lock().unwrap();
                 let current = load(core,sid);
                 // First binding can legitimately change the snapshot while
@@ -307,6 +325,19 @@ pub fn dispatch(core: &Core, action: &str, args: &Value) -> Result<Value> {
                     let _ = store(core, sid, &current, failed);
                 }
                 return Err(error);
+            }
+            {
+                let _guard=core.operations.lock().unwrap();
+                let current=load(core,sid);
+                if pending(&current) && current["operation"]==operation && current["runId"]==state["runId"]
+                    && current["delivery"]!="received" {
+                    let mut delivered=current.clone();
+                    delivered["delivery"]=json!(match delivery.unwrap() {
+                        crate::terminal::VerificationDelivery::Submitted=>"submitted",
+                        crate::terminal::VerificationDelivery::Unconfirmed=>"unconfirmed",
+                    });
+                    persist(core,sid,&current,delivered)?;
+                }
             }
             checked_state(core, sid, false)
         }
@@ -340,9 +371,22 @@ pub fn dispatch(core: &Core, action: &str, args: &Value) -> Result<Value> {
 }
 
 pub(crate) fn tool(core: &Core, sid: &str, run: &str, method: &str, args: &Value) -> Result<Value> {
-    let initial = load(core, sid);
-    if !pending(&initial) || initial["operation"] != string(args, "operation")? || initial["runId"] != run {
-        return Err(unavailable(&initial, run, string(args,"operation")?));
+    {
+        // The authenticated caller already consumed the delivery. Stop the
+        // terminal waiter before the potentially slow full source scan.
+        let _guard=core.operations.lock().unwrap();
+        let initial=load(core,sid);
+        let operation=string(args,"operation")?;
+        if !pending(&initial) || initial["operation"]!=operation || initial["runId"]!=run {
+            return Err(unavailable(&initial,run,operation));
+        }
+        check_live(core,sid,&initial)?;
+        crate::terminal::acknowledge_verification(core,sid,run,operation);
+        if initial["delivery"]!="received" {
+            let mut received=initial.clone();
+            received["delivery"]=json!("received");received["receivedOperation"]=json!(operation);
+            persist(core,sid,&initial,received)?;
+        }
     }
     let previous = checked_state(core, sid, true)?;
     if !pending(&previous) || previous["operation"] != string(args, "operation")?
@@ -352,8 +396,10 @@ pub(crate) fn tool(core: &Core, sid: &str, run: &str, method: &str, args: &Value
     match method {
         "verification_request" => {
             let _guard = core.operations.lock().unwrap();
-            check_live(core, sid, &previous)?;
-            if load(core,sid) != previous { bail!("Doğrulama isteği artık güncel değil."); }
+            let current=load(core,sid);
+            if !same_request(&current,&previous) { bail!("Doğrulama isteği artık güncel değil."); }
+            check_live(core, sid, &current)?;
+            let previous=current;
             Ok(json!({"operation":previous["operation"], "phase":previous["phase"],
             "items":previous["items"], "instructions":if previous["phase"] == "preparing" {
                 "Use the current conversation's requested development and project to propose 1–20 concrete, relevant acceptance checks via verification_propose, in the conversation's language. Each item needs title and check (procedure and expected result). Include applicable regression, failure and provider coverage. Do NOT run checks, modify files or start verification. Wait for the user's separate Start approval after proposing. Do not include credentials, private account data or conversation transcripts."
@@ -369,7 +415,9 @@ pub(crate) fn tool(core: &Core, sid: &str, run: &str, method: &str, args: &Value
             // final binding check and mutation; scans above never hold this lock.
             let _guard = core.operations.lock().unwrap();
             check_live(core, sid, &previous)?;
-            let state = store(core, sid, &previous, state)?;
+            let current=load(core,sid);
+            if !same_request(&current,&previous) {bail!("Doğrulama isteği artık güncel değil.");}
+            let state = store(core, sid, &current, state)?;
             Ok(json!({"phase":"ready", "count":state["items"].as_array().map_or(0,Vec::len)}))
         }
         "verification_report" if previous["phase"] == "running" => {
@@ -378,7 +426,9 @@ pub(crate) fn tool(core: &Core, sid: &str, run: &str, method: &str, args: &Value
             state["operation"] = Value::Null;
             let _guard = core.operations.lock().unwrap();
             check_live(core, sid, &previous)?;
-            let state = store(core, sid, &previous, state)?;
+            let current=load(core,sid);
+            if !same_request(&current,&previous) {bail!("Doğrulama isteği artık güncel değil.");}
+            let state = store(core, sid, &current, state)?;
             Ok(json!({"phase":"reported", "count":state["results"].as_array().map_or(0,Vec::len)}))
         }
         _ => bail!("Bu doğrulama aşamasında işlem kullanılamıyor."),
@@ -404,6 +454,19 @@ fn unavailable(state: &Value, run: &str, operation: &str) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn delivery_metadata_does_not_replace_request_scope_or_approval() {
+        let current=json!({"phase":"preparing","operation":id(),"runId":id(),
+            "binding":{"root":"synthetic","conversation":id()},"digest":id(),"items":[],"revision":3,"delivery":"sending"});
+        let mut received=current.clone();
+        received["delivery"]=json!("received");received["receivedOperation"]=current["operation"].clone();
+        received["updatedAt"]=json!(now());received["revision"]=json!(4);
+        assert!(same_request(&current,&received));
+        for field in ["phase","operation","runId","binding","digest","items"] {
+            let mut changed=received.clone();changed[field]=Value::Null;
+            assert!(!same_request(&current,&changed),"request guard field {field}");
+        }
+    }
     #[test]
     fn invalidation_explains_its_cause_only_to_the_owning_operation() {
         for reason in ["newMessage","sourceChanged","expired","cancelled","scopeUnavailable","stopped"] {

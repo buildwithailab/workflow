@@ -252,6 +252,7 @@ pub struct Core {
     pub(crate) session_usage: Mutex<crate::session_usage::Cache>,
     pub(crate) model_catalog: crate::models::CatalogCache,
     pub(crate) custom_usage: crate::custom_usage::Queries,
+    pub(crate) atlassian: crate::atlassian::State,
     pub(crate) notifications: Mutex<crate::notifications::Notifications>,
     pub browsers: Mutex<BrowserState>,
     #[cfg(any(windows, target_os = "macos"))]
@@ -306,6 +307,7 @@ impl Core {
             session_usage: Mutex::new(crate::session_usage::Cache::default()),
             model_catalog: crate::models::CatalogCache::default(),
             custom_usage: crate::custom_usage::Queries::default(),
+            atlassian: crate::atlassian::State::default(),
             notifications: Mutex::new(crate::notifications::Notifications::default()),
             browsers: Mutex::new(BrowserState::default()),
             #[cfg(any(windows, target_os = "macos"))]

@@ -417,8 +417,15 @@ async function testVerification() {
       await until(()=>fs.existsSync(path.join(data,"test-input",provider+"-tool-approval.bin")),"native MCP choice captured");
       assert.equal(fs.readFileSync(path.join(data,"test-input",provider+"-tool-approval.bin"),"utf8"),"\x1b[B\r","the exact session-scoped choice is submitted once");
     } else {
-      await until(async () => Buffer.from((await api("terminal", "attach", { id: s.id })).data,"base64").toString().includes("Confirm selection"), "unrecognized tool permission menu");
-      await api("terminal", "write", { id: s.id, runId: terminal.runId, data: "\r" });
+      await page.locator("#session-chat-view").click();
+      const permission=page.locator("#chat-terminal-prompt");
+      await permission.getByText("Approval required",{exact:true}).waitFor();
+      await permission.getByRole("button",{name:"1 · Allow once",exact:true}).waitFor();
+      assert(await page.locator("#chat-terminal-output").isHidden(),"native MCP approval does not require Terminal output");
+      await permission.getByRole("button",{name:"1 · Allow once",exact:true}).click();
+      await permission.waitFor({state:"hidden"});
+      await until(()=>fs.existsSync(path.join(data,"test-input",provider+"-tool-approval.bin")),"native MCP approval captured");
+      assert.equal(fs.readFileSync(path.join(data,"test-input",provider+"-tool-approval.bin"),"utf8"),"\r","native MCP approval is sent once from Chat");
     }
     await ready(s.id);
     assert.equal((await state(s.id)).operation, prepared.operation, "permission Enter keeps the preparation valid");
@@ -1240,10 +1247,10 @@ async function testPendingChatInteraction() {
     await api("notifications", "seen", { id: approvalNotice.id });
     assert((await attentionEntries()).some(entry => entry.id === approvalNotice.id), "opening the session does not resolve approval");
     assert.match(await card.locator("pre").textContent(), /Read the sample notes/);
-    assert.match(await card.textContent(), provider === "codex" ? /2 · No/ : /2\. No/);
+    assert.match(await card.textContent(), /2 · No/);
     const live = await api("chat", "read", { id: s.id });
     assert.equal(live.ticket, null);
-    assert.equal(!!live.terminalPrompt.menu, provider === "codex");
+    assert.equal(!!live.terminalPrompt.menu, true);
     if (live.terminalPrompt.menu) await assert.rejects(api("chat", "answer_prompt", { id: s.id, runId, ...live.terminalPrompt.menu, text: "Skip this operation" }), /özel yanıtı/);
     await input.fill("Keep this separate draft.");
     assert(await send.isDisabled());
@@ -2727,6 +2734,18 @@ async function test() {
     );
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  if (process.env.WORKFLOW_TEST_APPROVALS_ONLY === "1") {
+    await require("./chat-approvals.cjs")({start,stop,api,until,sleep,page:()=>page,temporary,data});
+    return;
+  }
+  if (process.env.WORKFLOW_TEST_VERIFICATION_DELIVERY_ONLY === "1") {
+    await require("./verification-delivery.cjs")({start,stop,api,mcp,until,sleep,page:()=>page,temporary,data});
+    return;
+  }
+  if (process.env.WORKFLOW_TEST_ATLASSIAN_ONLY === "1") {
+    await require("./atlassian-integration.cjs")({start,stop,api,mcp,until,getPage:()=>page,temporary,data,project});
+    return;
+  }
   if (process.env.WORKFLOW_TEST_CUSTOM_USAGE_ONLY === "1") {
     await testCustomUsage();
     return;

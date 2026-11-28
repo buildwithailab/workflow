@@ -180,7 +180,19 @@ struct TerminalInput {
     answered_prompt: Option<AnsweredPrompt>,
     ordinary_draft: bool,
     ordinary_chars: usize,
+    verification_draft: Option<VerificationDraft>,
 }
+
+struct VerificationDraft { operation: String, revision: u64 }
+
+#[derive(Debug)]
+struct VerificationDeliveryUnconfirmed;
+impl std::fmt::Display for VerificationDeliveryUnconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("Doğrulama mesajının teslimi henüz teyit edilmedi.") }
+}
+impl std::error::Error for VerificationDeliveryUnconfirmed {}
+
+pub(crate) enum VerificationDelivery { Submitted, Unconfirmed }
 
 struct AnsweredPrompt {
     key: String,
@@ -1016,6 +1028,7 @@ fn spawn_terminal(
             answered_prompt: None,
             ordinary_draft: false,
             ordinary_chars: 0,
+            verification_draft: None,
         }),
         chat_thread: Mutex::new(None),
         provider: provider.to_owned(),
@@ -1696,6 +1709,8 @@ fn terminal_menu(lines: &[&str], footer: &str, kind: &str, provider: &str) -> Op
             footer.contains("tab/arrow keys to navigate") || enter_hint("select")
         }
         ("question", "copilot") => enter_hint("select"),
+        ("approval", "claude") => enter_hint("confirm") || enter_hint("select") || footer.contains("esc to cancel"),
+        ("approval", "copilot") => enter_hint("confirm") || enter_hint("select") || footer.contains("(esc)") || footer.contains("esc to cancel"),
         ("approval", _) => enter_hint("confirm"),
         _ => false,
     };
@@ -1915,6 +1930,80 @@ fn codex_mcp_prompt(screen: &vt100::Screen, rows: &[String], start: usize, end: 
     Some(TerminalPrompt {kind:"approval",text:rows[header..end].join("\n").trim().to_owned(),menu,first_row:header,end_row:end})
 }
 
+fn native_approval_heading(line:&str,provider:&str)->bool {
+        let line=line.trim_matches(|c:char|c.is_whitespace()||"│╭╮╰╯".contains(c)).to_ascii_lowercase();
+        match provider {
+            "claude"=>line=="do you want to proceed?" || line=="do you want to make this edit?"
+                || (line.starts_with("do you want to make this edit to ") && line.ends_with('?'))
+                || (line.starts_with("do you want to create ") && line.ends_with('?'))
+                || line=="would you like to run the following command?"
+                || line=="permission request" || line=="approval required",
+            "copilot"=>line=="approval required" || line=="this command requires approval" || line=="permission request"
+                || line=="do you want to proceed?" || line=="would you like to run the following command?"
+                || line=="do you want to approve this tool?" || line=="do you want to allow this tool?",
+            _=>false,
+        }
+}
+
+fn native_approval_menu(screen:&vt100::Screen,provider:&str,rows:&[String],start:usize,end:usize)->Option<TerminalMenu> {
+    if !matches!(provider,"claude"|"copilot") || !screen.bracketed_paste() {return None;}
+    let lines=rows.get(start..end)?.iter().map(String::as_str).collect::<Vec<_>>();
+    let heading=|line:&str|native_approval_heading(line,provider);
+    let header=lines.iter().rposition(|line|heading(line))?;
+    let first=header+1+lines[header+1..].iter().position(|line|menu_line(line).is_some())?;
+    let section_title=|line:&str| {
+        let line=line.trim_matches(|c:char|c.is_whitespace()||"│╭╮╰╯".contains(c)).to_ascii_lowercase();
+        ["bash command","shell command","powershell command","read file","edit file","update file","create file","write file","delete file","mcp tool","tool:"]
+            .iter().any(|title|line==*title || line.strip_prefix(title).is_some_and(|tail|tail.starts_with([' ',':'])))
+            || line.ends_with("(mcp)")
+            || ["bash(","read(","edit(","update(","create(","write(","delete(","webfetch("].iter().any(|prefix|line.starts_with(prefix))
+    };
+    let section=lines[..header].iter().enumerate()
+        .find(|(index,line)|section_title(line)
+            && !lines[*index..header].iter().any(|line|menu_line(line).is_some()||question_footer(line)))
+        .map(|(index,_)|index);
+    let commands=lines[..header].iter().enumerate().filter(|(_,line)|line.trim_start().starts_with("$ ")).map(|(index,_)|index).collect::<Vec<_>>();
+    let inline_target=lines[header].trim().to_ascii_lowercase();
+    let inline_target=(inline_target.starts_with("do you want to make this edit to ") || inline_target.starts_with("do you want to create "))
+        && inline_target.ends_with('?');
+    let scope_start=if inline_target {0}
+        else if let Some(section)=section {section}
+        else if commands.len()==1 && !lines[commands[0]..header].iter().any(|line|menu_line(line).is_some()||question_footer(line)) {commands[0]}
+        else {header};
+    let scope=&lines[scope_start..];
+    if scope.iter().any(|line|line.contains('…')||line.contains("...")) {return None;}
+    let section_body=section.is_some_and(|section|lines[section+1..header].iter().any(|line|!heading(line)&&!section_title(line)&&line.chars().any(|c|c.is_alphanumeric())));
+    let explicit_target=lines[scope_start..first].iter().any(|line| {
+        let line=line.trim_matches(|c:char|c.is_whitespace()||"│╭╮╰╯".contains(c));
+        let lower=line.to_ascii_lowercase();
+        ["$ ","tool: ","file: ","path: "].iter().any(|prefix|lower.strip_prefix(prefix).is_some_and(|value|!value.trim().is_empty()))
+            || ["bash(","read(","edit(","update(","create(","write(","delete(","webfetch("].iter().any(|prefix|lower.starts_with(prefix)&&lower.ends_with(')')&&lower.len()>prefix.len()+1)
+    });
+    if !inline_target && !section_body && !explicit_target {return None;}
+    let last_option=lines[first..].iter().rposition(|line|menu_line(line).is_some())?+first;
+    let tail=&lines[last_option..];
+    if tail.iter().any(|line| {
+        let lower=line.to_ascii_lowercase();
+        ["esc to interrupt","ctrl+c to interrupt","ctrl-c to interrupt","working…","working ("].iter().any(|hint|lower.contains(hint))
+    }) {return None;}
+    let footer_end=tail.iter().position(|line|question_footer(line)||line.to_ascii_lowercase().contains("(esc)"))?;
+    if tail[footer_end+1..].iter().any(|line|!line.trim().chars().all(|c|"─│╭╮╰╯ ".contains(c))) {return None;}
+    let footer=lines[lines.len().saturating_sub(5)..].join(" | ").to_ascii_lowercase();
+    let mut menu=terminal_menu(&lines[first..],&footer,"approval",provider)?;
+    menu.question=lines[scope_start..first].join("\n").trim().to_owned();
+    menu.key=format!("{:x}",Sha256::digest(format!("{}\n{}",menu.question,menu.key).as_bytes()));
+    let decision=|label:&str| {
+        let label=label.to_ascii_lowercase();
+        ["yes","no","allow","deny","cancel"].iter().any(|prefix|label==*prefix
+            || label.strip_prefix(prefix).is_some_and(|tail|tail.starts_with([',',' ','.','('])))
+    };
+    if !menu.choices.iter().all(|label|decision(label))
+        || !menu.choices.iter().any(|label|{let l=label.to_ascii_lowercase();l.starts_with("yes")||l.starts_with("allow")})
+        || !menu.choices.iter().any(|label|{let l=label.to_ascii_lowercase();l.starts_with("no")||l.starts_with("deny")||l.starts_with("cancel")})
+    {return None;}
+    Some(menu)
+}
+
 fn terminal_prompt(screen: &vt100::Screen, provider: &str) -> Option<TerminalPrompt> {
     let rows = screen.rows(0, screen.size().1).collect::<Vec<_>>();
     let end = rows.iter().rposition(|line| !line.trim().is_empty())? + 1;
@@ -1966,6 +2055,7 @@ fn terminal_prompt(screen: &vt100::Screen, provider: &str) -> Option<TerminalPro
         ]
         .iter()
         .any(|prefix| line.starts_with(prefix))
+            || native_approval_heading(line,provider)
             || line.ends_with("needs your approval.")
     });
     let decisions = cues
@@ -2031,6 +2121,11 @@ fn terminal_prompt(screen: &vt100::Screen, provider: &str) -> Option<TerminalPro
                 })
                 && !target.clone().any(|line| line.contains('…'))
         });
+    let menu=if kind=="approval" && provider!="codex" {
+        native_approval_menu(screen,provider,&rows,display_start,end)
+    } else {
+        can_choose.then(||terminal_menu(&lines,&menu_footer,kind,provider)).flatten()
+    };
     Some(TerminalPrompt {
         kind,
         text: if kind == "approval" {
@@ -2040,9 +2135,7 @@ fn terminal_prompt(screen: &vt100::Screen, provider: &str) -> Option<TerminalPro
         }
         .trim()
         .to_owned(),
-        menu: can_choose
-            .then(|| terminal_menu(&lines, &menu_footer, kind, provider))
-            .flatten(),
+        menu,
         first_row: if kind == "approval" {
             display_start
         } else {
@@ -2679,8 +2772,25 @@ pub(crate) fn send_chat(core: &Core, args: &Value) -> Result<Value> {
     send_chat_for(core, args, None)
 }
 
-pub(crate) fn send_verification(core: &Core, args: &Value, operation: &str) -> Result<Value> {
-    send_chat_for(core, args, Some(operation))
+pub(crate) fn send_verification(core: &Core, args: &Value, operation: &str) -> Result<VerificationDelivery> {
+    match send_chat_for(core, args, Some(operation)) {
+        Ok(_) => Ok(VerificationDelivery::Submitted),
+        Err(error) if error.is::<VerificationDeliveryUnconfirmed>() => Ok(VerificationDelivery::Unconfirmed),
+        Err(error) => Err(error),
+    }
+}
+
+// A run-authenticated getter proves that the provider consumed this request.
+// Called with core.operations held; never writes input or starts a provider.
+pub(crate) fn acknowledge_verification(core: &Core, sid: &str, run: &str, operation: &str) {
+    let terminal=core.terms.lock().unwrap().get(sid).cloned();
+    if let Some(terminal)=terminal.filter(|terminal|terminal.run_id==run) {
+        let mut input=terminal.input.lock().unwrap();
+        if input.verification_draft.as_ref().is_some_and(|draft|draft.operation==operation) {
+            input.verification_draft=None;
+            terminal.submitted.fetch_add(1,Ordering::Relaxed);
+        }
+    }
 }
 
 fn send_chat_for(core: &Core, args: &Value, operation: Option<&str>) -> Result<Value> {
@@ -2834,7 +2944,12 @@ fn submit_chat_input(
     // application-delivered message and its later provider permission dialogs.
     input.ordinary_draft = false;
     input.ordinary_chars = 0;
-    input.write(data.as_bytes())?;
+    input.verification_draft=operation.map(|operation|VerificationDraft {operation:operation.to_owned(),revision:input.revision+1});
+    // write_all/flush can fail after some bytes reached the provider. Never
+    // classify a write attempt as proof that no request was delivered.
+    if let Err(error)=input.write(data.as_bytes()) {
+        return Err(if operation.is_some() {error.context(VerificationDeliveryUnconfirmed)} else {error});
+    }
     input.chat_pasting = true;
     let pasted_revision = input.revision;
     drop(input);
@@ -2844,7 +2959,7 @@ fn submit_chat_input(
     let result = submit_chat_draft(core, args, id, text, indent, pasted_revision, operation)
         .and_then(|revision| confirm(&terminal, revision));
     terminal.input.lock().unwrap().chat_pasting = false;
-    result
+    result.map_err(|error|if operation.is_some() {error.context(VerificationDeliveryUnconfirmed)} else {error})
 }
 
 fn submit_chat_draft(
@@ -2870,6 +2985,9 @@ fn submit_chat_draft(
             let current = get(core, args)?;
             let screen = current.screen.lock().unwrap();
             let input = &mut *current.input.lock().unwrap();
+            if operation.is_some() && input.verification_draft.is_none() && input.revision==pasted_revision {
+                return Ok(input.revision);
+            }
             if current.exited.load(Ordering::SeqCst)
                 || input.revision != pasted_revision
                 || input.thread_uncertain
@@ -2894,6 +3012,7 @@ fn submit_chat_draft(
                     crate::verification::authorize_delivery(core, id, &current.run_id, operation)?;
                 }
                 input.write(b"\r")?;
+                input.verification_draft=None;
                 current.submitted.fetch_add(1, Ordering::Relaxed);
                 input.chat_pending = true;
                 return Ok(input.revision);
@@ -2977,26 +3096,45 @@ pub fn dispatch(core: &Arc<Core>, action: &str, args: &Value) -> Result<Value> {
                     })
                     .flatten();
                 let mut input = terminal.input.lock().unwrap();
+                let owned_verification=input.verification_draft.as_ref().is_some_and(|draft|draft.revision==input.revision);
+                let no_question=terminal_prompt(screen.screen(),&terminal.provider).is_none()
+                    && wrapped_question_preview(screen.screen(),&terminal.provider).is_none();
+                let payload=data.strip_prefix(b"\x1b[200~").and_then(|v|v.strip_suffix(b"\x1b[201~")).unwrap_or(data);
+                let edits=!payload.contains(&0x1b) && std::str::from_utf8(payload).is_ok_and(|text|text.chars().any(|c|!c.is_control()))
+                    || matches!(data,b"\x08"|b"\x7f"|b"\x1b[3~"|b"\x15"|b"\x17"|b"\x0b");
+                if owned_verification && no_question && edits {
+                    input.ordinary_draft=true;
+                    input.ordinary_chars=terminal_composer_draft(screen.screen(),&terminal.provider).map_or(1,|draft|draft.chars().count().max(1));
+                }
                 if terminal.provider == "copilot"
                     && ((composer_empty && matches!(data, b"\x1b[D" | b"\t"))
                         || data.starts_with(b"\x1b[<0;"))
                 {
                     input.thread_uncertain = true;
                 }
-                if input.records_message_submission(screen.screen(), &terminal.provider, data) {
+                let verification_enter=matches!(data,b"\r"|b"\n")
+                    && no_question
+                    && input.verification_draft.as_ref().is_some_and(|draft| draft.revision==input.revision
+                        && crate::verification::authorize_delivery(core,string(args,"id").unwrap_or(""),&terminal.run_id,&draft.operation).is_ok());
+                if input.records_message_submission(screen.screen(), &terminal.provider, data) && !verification_enter {
                     crate::verification::invalidate(core, string(args, "id")?, "newMessage")?;
                 }
+                let navigation=owned_verification && no_question && matches!(data,b"\x1b[D"|b"\x1b[C"|b"\x1b[H"|b"\x1b[F"|b"\x1b[I"|b"\x1b[O");
+                let mut retained=if navigation {input.verification_draft.take()} else {None};
+                input.verification_draft=None;
                 input.write_from_terminal(data, composer_empty, visible_draft.as_deref())?;
+                if let Some(ref mut draft)=retained {draft.revision=input.revision;}
+                input.verification_draft=retained;
                 if matches!(data, b"\r" | b"\n" | b"\x1b" | b"\x03")
                     && terminal_prompt(screen.screen(), &terminal.provider).is_some()
                 {
                     terminal.prompt_answers.fetch_add(1, Ordering::Relaxed);
                 }
-                if !data.starts_with(b"\x1b[200~")
+                if verification_enter || (!data.starts_with(b"\x1b[200~")
                     && visible_draft.as_deref().is_some_and(|draft| {
                         !draft.is_empty() && draft != CODEX_EMPTY_PROMPT && !draft.starts_with('/')
                     })
-                    && terminal_prompt(screen.screen(), &terminal.provider).is_none()
+                    && terminal_prompt(screen.screen(), &terminal.provider).is_none())
                 {
                     terminal.submitted.fetch_add(1, Ordering::Relaxed);
                 }
@@ -3041,7 +3179,7 @@ mod tests {
             display:Mutex::new(DisplayStream::default()),submitted:Default::default(),prompt_answers:Default::default(),
             unbound_finished:Default::default(),codex_status:Mutex::new(CodexStatus::default()),
             input:Mutex::new(TerminalInput { writer:Box::new(std::io::sink()),revision:0,chat_pasting:false,chat_pending:false,
-                terminal_slash:false,thread_uncertain:false,answered_prompt:None,ordinary_draft:false,ordinary_chars:0 }),
+                terminal_slash:false,thread_uncertain:false,answered_prompt:None,ordinary_draft:false,ordinary_chars:0,verification_draft:None }),
             chat_thread:Mutex::new(None),provider:provider.into(),master:Mutex::new(None),screen:Mutex::new(vt100::Parser::new(36,120,0)),
             #[cfg(not(target_os = "macos"))] killer:Mutex::new(Box::new(TestKiller)),
             #[cfg(windows)] job:Mutex::new(None),
@@ -3363,7 +3501,7 @@ mod tests {
         for provider in ["codex","claude","copilot"] {
             let mut input=TerminalInput {writer:Box::new(Vec::<u8>::new()),revision:0,
                 chat_pasting:false,chat_pending:false,terminal_slash:false,thread_uncertain:false,
-                answered_prompt:None,ordinary_draft:false,ordinary_chars:0};
+                answered_prompt:None,ordinary_draft:false,ordinary_chars:0,verification_draft:None};
             for choice in ["Allow once","Yalnızca bu kez izin ver","1. Allow once"] {
                 let mut menu=vt100::Parser::new(24,80,0);
                 menu.process(format!("\x1b[?2004hWorkflow tool\r\n› {choice}\r\nConfirm selection\x1b[2;5H").as_bytes());
@@ -3637,6 +3775,88 @@ mod tests {
     }
 
     #[test]
+    fn native_approvals_preserve_visible_targets_scopes_and_live_selection() {
+        for provider in ["claude","copilot"] {
+            let choices="❯ 1. Yes\r\n  2. Yes, allow this tool for this session\r\n  3. No";
+            let display=|target:&str,selected:usize| {
+                let header=if provider=="claude" {format!("Bash command\r\n  {target}\r\nDo you want to proceed?")}
+                    else {format!("Approval required\r\n$ {target}")};
+                let menu=choices.replace("❯ 1.","  1.").replace(&format!("  {selected}."),&format!("❯ {selected}."));
+                let hint=if provider=="claude" {"Esc to cancel"} else {"Enter to select · Esc to cancel"};
+                format!("\x1b[?2004h\x1b[2J\x1b[HPrevious answer\r\n1. A previous choice\r\n2. Another choice\r\n{header}\r\n{menu}\r\n{hint}")
+            };
+            let mut screen=vt100::Parser::new(30,140,0);
+            screen.process(display("echo sample",1).as_bytes());
+            let first=terminal_prompt(screen.screen(),provider).unwrap().menu.unwrap();
+            assert!(first.question.contains("echo sample"));
+            assert!(!first.question.contains("Previous answer"));
+            assert_eq!(first.choices[1],"Yes, allow this tool for this session");
+            screen.process(display("echo sample",2).as_bytes());
+            let moved=terminal_prompt(screen.screen(),provider).unwrap().menu.unwrap();
+            assert_eq!(moved.key,first.key);assert_eq!(moved.selected,2);
+            screen.process(display("echo changed-target",2).as_bytes());
+            assert_ne!(terminal_prompt(screen.screen(),provider).unwrap().menu.unwrap().key,first.key);
+            for bad in [
+                format!("Bash command\r\nDo you want to proceed?\r\n{choices}\r\nEsc to cancel"),
+                format!("MCP tool\r\nDo you want to proceed?\r\n{choices}\r\nEsc to cancel"),
+                format!("Approval required\r\nRead the sample notes\r\n{choices}\r\nEsc to cancel"),
+                format!("Previous answer\r\nApproval required\r\n{choices}\r\nEsc to cancel"),
+                format!("Approval required\r\n$ echo sample…\r\n{choices}\r\nEsc to cancel"),
+                format!("Approval required\r\n$ echo sample\r\n{}\r\nEsc to cancel",choices.replace("  2.","❯ 2.")),
+                format!("Approval required\r\n$ echo sample\r\n{}\r\nEsc to cancel",choices.replace("  2.","  4.")),
+                format!("Approval required\r\n$ echo sample\r\n{choices}\r\nSpace to toggle · Select multiple · Enter to confirm · Esc to cancel"),
+            ] {
+                screen.process(format!("\x1b[?2004h\x1b[2J\x1b[H{bad}").as_bytes());
+                assert!(terminal_prompt(screen.screen(),provider).is_some_and(|prompt|prompt.menu.is_none()),"{provider} ambiguous approval");
+            }
+        }
+    }
+
+    #[test]
+    fn native_inline_file_and_mcp_approvals_keep_the_actual_operation() {
+        for (provider,body) in [
+            ("claude","Do you want to make this edit to sample.rs?\r\n❯ 1. Yes\r\n  2. No\r\nEsc to cancel"),
+            ("claude","Do you want to create sample.rs?\r\n❯ 1. Yes\r\n  2. No\r\nEsc to cancel"),
+            ("copilot","MCP tool\r\nworkflow:verification_request\r\nPermission request\r\n❯ 1. Yes\r\n  2. No, and tell Copilot what to do differently (Esc)"),
+        ] {
+            let mut parser=vt100::Parser::new(30,140,0);
+            parser.process(format!("\x1b[?2004h{body}").as_bytes());
+            let menu=terminal_prompt(parser.screen(),provider).unwrap().menu.unwrap();
+            assert!(!menu.question.is_empty());assert_eq!(menu.selected,1);
+        }
+    }
+
+    #[test]
+    fn old_native_approvals_cannot_submit_a_new_composer_and_all_commands_define_identity() {
+        let choices="❯ 1. Yes\r\n  2. No\r\nEsc to cancel";
+        for provider in ["claude","copilot"] {
+            let header=if provider=="claude" {"Do you want to proceed?"} else {"Permission request"};
+            let display=|first:&str|format!("\x1b[?2004h\x1b[2J\x1b[HBash command\r\n$ {first}\r\n$ echo second\r\n{header}\r\n{choices}");
+            let mut parser=vt100::Parser::new(30,140,0);
+            parser.process(display("echo first").as_bytes());
+            let original=terminal_prompt(parser.screen(),provider).unwrap().menu.unwrap();
+            assert!(original.question.contains("echo first")&&original.question.contains("echo second"));
+            parser.process(display("echo different").as_bytes());
+            assert_ne!(terminal_prompt(parser.screen(),provider).unwrap().menu.unwrap().key,original.key);
+            let footer=if provider=="claude" {"? for shortcuts"} else {"Interactive · Manual Approval"};
+            parser.process(format!("\r\n────────────\r\n❯ An unrelated draft\r\n────────────\r\n{footer}").as_bytes());
+            assert!(terminal_prompt(parser.screen(),provider).is_none_or(|prompt|prompt.menu.is_none()));
+            parser.process(display("echo first").as_bytes());
+            parser.process(b"\r\nSearch files\r\n\xE2\x9D\xAF sample\r\nEsc to cancel");
+            assert!(terminal_prompt(parser.screen(),provider).is_none_or(|prompt|prompt.menu.is_none()));
+        }
+        let mut parser=vt100::Parser::new(30,140,0);
+        let show=|hunk:&str|format!("\x1b[?2004h\x1b[2J\x1b[H- old\r\n+ {hunk}\r\n $ echo sample\r\nDo you want to make this edit to sample.rs?\r\n{choices}");
+        parser.process(show("proposed A").as_bytes());
+        let first=terminal_prompt(parser.screen(),"claude").unwrap().menu.unwrap();
+        assert!(first.question.contains("proposed A"));
+        parser.process(show("proposed B").as_bytes());
+        let second=terminal_prompt(parser.screen(),"claude").unwrap().menu.unwrap();
+        assert!(second.question.contains("proposed B"));
+        assert_ne!(first.key,second.key);
+    }
+
+    #[test]
     fn native_choice_menu_requires_numbered_options_and_one_highlight() {
         let initial = [
             "Which should I change?",
@@ -3821,6 +4041,7 @@ mod tests {
             answered_prompt: None,
             ordinary_draft: false,
             ordinary_chars: 0,
+            verification_draft: None,
         };
         input.write_from_terminal(b"/", true, None).unwrap();
         input
